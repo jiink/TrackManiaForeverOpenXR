@@ -73,6 +73,9 @@ struct StereoResources {
     bool perspective = false;
     bool perspectivePassSeen = false;
     bool rightDrawFailureLogged = false;
+    uint32_t perspectiveDrawCandidates = 0;
+    uint32_t replayedDraws = 0;
+    uint64_t presentedFrames = 0;
     bool ready = false;
 } g_stereo;
 
@@ -150,6 +153,12 @@ void RestoreGameEye(IDirect3DDevice9* device) {
 HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* source, const RECT* destination,
                                       HWND window, const RGNDATA* dirtyRegion) {
     tmoxr::VrBridge::Instance().OnBeforePresent(device);
+    if (++g_stereo.presentedFrames % 180 == 0) {
+        tmoxr::log::Info("Native stereo replay diagnostic: perspective candidates=" + std::to_string(g_stereo.perspectiveDrawCandidates) +
+            ", replayed=" + std::to_string(g_stereo.replayedDraws) + ".");
+    }
+    g_stereo.perspectiveDrawCandidates = 0;
+    g_stereo.replayedDraws = 0;
     const HRESULT result = g_originalPresent(device, source, destination, window, dirtyRegion);
     // The next clear starts a new frame. Keep the completed right-eye 3D scene
     // intact when TrackMania subsequently clears its left-eye UI pass.
@@ -194,7 +203,9 @@ HRESULT STDMETHODCALLTYPE SetDepthStencilSurfaceHook(IDirect3DDevice9* device, I
 
 HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITIVETYPE type, UINT startVertex, UINT primitiveCount) {
     tmoxr::VrBridge::Instance().OnDraw(false);
+    if (g_stereo.perspective) ++g_stereo.perspectiveDrawCandidates;
     if (!CanReplayStereoDraw()) return g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
+    ++g_stereo.replayedDraws;
     SetEyeProjection(device, -0.032f);
     const HRESULT left = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
     BeginRightEye(device);
@@ -210,7 +221,9 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITI
 HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITIVETYPE type, INT baseVertex, UINT minVertex,
                                                     UINT vertexCount, UINT startIndex, UINT primitiveCount) {
     tmoxr::VrBridge::Instance().OnDraw(true);
+    if (g_stereo.perspective) ++g_stereo.perspectiveDrawCandidates;
     if (!CanReplayStereoDraw()) return g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
+    ++g_stereo.replayedDraws;
     SetEyeProjection(device, -0.032f);
     const HRESULT left = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
     BeginRightEye(device);
