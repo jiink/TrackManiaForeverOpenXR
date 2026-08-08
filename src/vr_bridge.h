@@ -10,6 +10,20 @@ struct HeadPose {
     uint64_t sample = 0;
 };
 
+struct EyeRenderConfiguration {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    float angleLeft = 0.0f;
+    float angleRight = 0.0f;
+    float angleDown = 0.0f;
+    float angleUp = 0.0f;
+};
+
+struct RenderConfiguration {
+    EyeRenderConfiguration eyes[2]{};
+    uint64_t sample = 0;
+};
+
 class VrBridge {
 public:
     static VrBridge& Instance();
@@ -23,6 +37,7 @@ public:
     void SetLeftEyeSurface(IDirect3DSurface9* surface);
     void SetRightEyeSurface(IDirect3DSurface9* surface);
     bool GetHeadPose(HeadPose& pose);
+    bool GetRenderConfiguration(RenderConfiguration& configuration);
     void Shutdown();
 
 private:

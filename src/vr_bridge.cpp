@@ -109,8 +109,10 @@ struct VrBridge::Impl {
     XrFovf gameFov{};
     XrPosef baseHeadPose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
     HeadPose headPose{};
+    RenderConfiguration renderConfiguration{};
     bool haveBaseHeadPose = false;
     bool haveHeadPose = false;
+    bool haveRenderConfiguration = false;
     bool perspectiveProjectionActive = false;
     D3DSURFACE_DESC activeTarget{};
     D3DSURFACE_DESC perspectiveTarget{};
@@ -167,7 +169,16 @@ struct VrBridge::Impl {
         const XrVector3f delta{center.position.x - baseHeadPose.position.x,
                               center.position.y - baseHeadPose.position.y,
                               center.position.z - baseHeadPose.position.z};
-        const XrVector3f relativePosition = Rotate(inverseBase, delta);
+        XrVector3f relativePosition = Rotate(inverseBase, delta);
+        if (std::sqrt(relativePosition.x * relativePosition.x + relativePosition.y * relativePosition.y +
+                      relativePosition.z * relativePosition.z) > 0.5f) {
+            // Some runtimes briefly report a valid zero position before switching
+            // to their local-space headset height. Treat that as an origin update,
+            // not a one-metre player movement.
+            baseHeadPose.position = center.position;
+            relativePosition = {};
+            log::Warn("OpenXR local-space position origin jumped by more than 0.5 m; positional tracking was recentered.");
+        }
         headPose.position[0] = relativePosition.x;
         headPose.position[1] = relativePosition.y;
         headPose.position[2] = relativePosition.z;
@@ -177,6 +188,20 @@ struct VrBridge::Impl {
         headPose.orientation[3] = relativeOrientation.w;
         ++headPose.sample;
         haveHeadPose = true;
+    }
+
+    void UpdateRenderConfiguration(const std::vector<XrView>& views) {
+        if (views.size() < 2 || viewConfigs.size() < 2) return;
+        for (uint32_t eye = 0; eye < 2; ++eye) {
+            renderConfiguration.eyes[eye].width = viewConfigs[eye].recommendedImageRectWidth;
+            renderConfiguration.eyes[eye].height = viewConfigs[eye].recommendedImageRectHeight;
+            renderConfiguration.eyes[eye].angleLeft = views[eye].fov.angleLeft;
+            renderConfiguration.eyes[eye].angleRight = views[eye].fov.angleRight;
+            renderConfiguration.eyes[eye].angleDown = views[eye].fov.angleDown;
+            renderConfiguration.eyes[eye].angleUp = views[eye].fov.angleUp;
+        }
+        ++renderConfiguration.sample;
+        haveRenderConfiguration = true;
     }
 
     void DestroySwapchains() {
@@ -208,6 +233,7 @@ struct VrBridge::Impl {
         sessionRunning = false;
         haveBaseHeadPose = false;
         haveHeadPose = false;
+        haveRenderConfiguration = false;
     }
 
     bool LoadFunctions() {
@@ -304,9 +330,8 @@ struct VrBridge::Impl {
             info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
             info.format = DXGI_FORMAT_B8G8R8A8_UNORM;
             info.sampleCount = 1;
-            // Keeping the same size makes the D3D9 readback/CPU upload lossless.
-            info.width = sourceWidth;
-            info.height = sourceHeight;
+            info.width = config.recommendedImageRectWidth;
+            info.height = config.recommendedImageRectHeight;
             info.faceCount = 1;
             info.arraySize = 1;
             info.mipCount = 1;
@@ -453,14 +478,32 @@ struct VrBridge::Impl {
             uint32_t viewCount = 0;
             if (Check(locateViews(session, &locate, &viewState, static_cast<uint32_t>(views.size()), &viewCount, views.data()), "xrLocateViews") && viewCount == swapchains.size()) {
                 UpdateHeadPose(views, viewState.viewStateFlags);
+                UpdateRenderConfiguration(views);
                 IDirect3DSurface9* gameBackbuffer = nullptr;
                 const HRESULT backBufferResult = device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &gameBackbuffer);
                 if (SUCCEEDED(backBufferResult)) {
                     projectionViews.resize(viewCount);
                     auto uploadEye = [&](uint32_t eye, IDirect3DSurface9* source, IDirect3DSurface9*& eyeReadback) {
                         if (!source) return false;
+                        D3DSURFACE_DESC sourceDescription{};
+                        if (FAILED(source->GetDesc(&sourceDescription))) return false;
+                        if (sourceDescription.Width != viewConfigs[eye].recommendedImageRectWidth ||
+                            sourceDescription.Height != viewConfigs[eye].recommendedImageRectHeight) {
+                            return false;
+                        }
+                        if (eyeReadback) {
+                            D3DSURFACE_DESC readbackDescription{};
+                            if (FAILED(eyeReadback->GetDesc(&readbackDescription)) ||
+                                readbackDescription.Width != sourceDescription.Width ||
+                                readbackDescription.Height != sourceDescription.Height ||
+                                readbackDescription.Format != sourceDescription.Format) {
+                                eyeReadback->Release();
+                                eyeReadback = nullptr;
+                            }
+                        }
                         if (!eyeReadback) {
-                            const HRESULT create = device->CreateOffscreenPlainSurface(sourceWidth, sourceHeight, D3DFMT_A8R8G8B8,
+                            const HRESULT create = device->CreateOffscreenPlainSurface(sourceDescription.Width, sourceDescription.Height,
+                                sourceDescription.Format,
                                 D3DPOOL_SYSTEMMEM, &eyeReadback, nullptr);
                             if (FAILED(create)) {
                                 log::Error("Could not create D3D9 system-memory readback surface: HRESULT=" + std::to_string(static_cast<long>(create)));
@@ -480,9 +523,9 @@ struct VrBridge::Impl {
                         constexpr UINT sampleRows = 24;
                         for (UINT y = 0; y < sampleRows; ++y) {
                             const auto* row = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(locked.pBits) +
-                                static_cast<size_t>(y) * sourceHeight / sampleRows * locked.Pitch);
+                                static_cast<size_t>(y) * sourceDescription.Height / sampleRows * locked.Pitch);
                             for (UINT x = 0; x < sampleColumns; ++x) {
-                                if ((row[x * sourceWidth / sampleColumns] & 0x00FFFFFFu) != 0) ++nonBlackSamples;
+                                if ((row[x * sourceDescription.Width / sampleColumns] & 0x00FFFFFFu) != 0) ++nonBlackSamples;
                             }
                         }
                         if (eye == 0) leftSourceSamples = nonBlackSamples;
@@ -499,10 +542,10 @@ struct VrBridge::Impl {
                             releaseImage(swapchains[eye], &release);
                             projectionViews[eye] = XrCompositionLayerProjectionView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
                             projectionViews[eye].pose = views[eye].pose;
-                            projectionViews[eye].fov = haveGameFov ? gameFov : views[eye].fov;
+                            projectionViews[eye].fov = views[eye].fov;
                             projectionViews[eye].subImage.swapchain = swapchains[eye];
-                            projectionViews[eye].subImage.imageRect.extent.width = static_cast<int32_t>(sourceWidth);
-                            projectionViews[eye].subImage.imageRect.extent.height = static_cast<int32_t>(sourceHeight);
+                            projectionViews[eye].subImage.imageRect.extent.width = static_cast<int32_t>(sourceDescription.Width);
+                            projectionViews[eye].subImage.imageRect.extent.height = static_cast<int32_t>(sourceDescription.Height);
                         }
                         eyeReadback->UnlockRect();
                         if (eye == 1 && frames % 180 == 0) {
@@ -621,6 +664,14 @@ bool VrBridge::GetHeadPose(HeadPose& pose) {
     std::scoped_lock lock(impl_->mutex);
     if (!impl_->haveHeadPose) return false;
     pose = impl_->headPose;
+    return true;
+}
+
+bool VrBridge::GetRenderConfiguration(RenderConfiguration& configuration) {
+    if (!impl_) return false;
+    std::scoped_lock lock(impl_->mutex);
+    if (!impl_->haveRenderConfiguration) return false;
+    configuration = impl_->renderConfiguration;
     return true;
 }
 
