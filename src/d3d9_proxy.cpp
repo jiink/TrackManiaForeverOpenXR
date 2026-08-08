@@ -126,15 +126,23 @@ void SetEyeProjection(IDirect3DDevice9* device, float eyeOffsetMeters) {
 }
 
 void BeginRightEye(IDirect3DDevice9* device) {
-    g_originalSetRenderTarget(device, 0, g_stereo.rightColor);
-    g_originalSetDepthStencilSurface(device, g_stereo.rightDepth);
+    // D3D9 validates color/depth multisample compatibility at each bind. Clear
+    // the old depth surface first so a valid right-eye pair cannot be rejected.
+    g_originalSetDepthStencilSurface(device, nullptr);
+    const HRESULT colorResult = g_originalSetRenderTarget(device, 0, g_stereo.rightColor);
+    const HRESULT depthResult = SUCCEEDED(colorResult) ? g_originalSetDepthStencilSurface(device, g_stereo.rightDepth) : colorResult;
+    if (FAILED(colorResult) || FAILED(depthResult)) {
+        tmoxr::log::Error("Right-eye render-target bind failed: color HRESULT=" + std::to_string(static_cast<long>(colorResult)) +
+            ", depth HRESULT=" + std::to_string(static_cast<long>(depthResult)));
+    }
     SetEyeProjection(device, +0.032f); // half a 64 mm IPD
 }
 
 void RestoreGameEye(IDirect3DDevice9* device) {
     g_originalSetTransform(device, D3DTS_PROJECTION, &g_stereo.projection);
-    g_originalSetDepthStencilSurface(device, g_stereo.leftDepth);
+    g_originalSetDepthStencilSurface(device, nullptr);
     g_originalSetRenderTarget(device, 0, g_stereo.leftColor);
+    g_originalSetDepthStencilSurface(device, g_stereo.leftDepth);
 }
 
 HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* source, const RECT* destination,
@@ -203,11 +211,13 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3D
 HRESULT STDMETHODCALLTYPE ClearHook(IDirect3DDevice9* device, DWORD count, const D3DRECT* rects, DWORD flags, D3DCOLOR color, float z, DWORD stencil) {
     const HRESULT left = g_originalClear(device, count, rects, flags, color, z, stencil);
     if (g_stereo.ready && g_stereo.activeColor == g_stereo.leftColor && g_stereo.activeDepth == g_stereo.leftDepth) {
+        g_originalSetDepthStencilSurface(device, nullptr);
         g_originalSetRenderTarget(device, 0, g_stereo.rightColor);
         g_originalSetDepthStencilSurface(device, g_stereo.rightDepth);
         g_originalClear(device, count, rects, flags, color, z, stencil);
-        g_originalSetDepthStencilSurface(device, g_stereo.leftDepth);
+        g_originalSetDepthStencilSurface(device, nullptr);
         g_originalSetRenderTarget(device, 0, g_stereo.leftColor);
+        g_originalSetDepthStencilSurface(device, g_stereo.leftDepth);
     }
     return left;
 }
