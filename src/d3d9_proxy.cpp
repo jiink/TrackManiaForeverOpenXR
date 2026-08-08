@@ -11,6 +11,7 @@
 #undef D3DPERF_SetOptions
 
 #include <atomic>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <filesystem>
@@ -91,6 +92,11 @@ struct StereoResources {
     uint32_t replayedDraws = 0;
     uint64_t presentedFrames = 0;
     bool customVertexShaderBound = false;
+    IDirect3DVertexShader9* vertexShader = nullptr;
+    IDirect3DVertexShader9* projectionShader = nullptr;
+    std::array<float, 16> shaderProjection{};
+    bool shaderProjectionValid = false;
+    bool shaderProjectionLogWritten = false;
     UINT primaryWidth = 0;
     UINT primaryHeight = 0;
     D3DFORMAT primaryFormat = D3DFMT_UNKNOWN;
@@ -203,6 +209,21 @@ void SetEyeProjection(IDirect3DDevice9* device, float eyeOffsetMeters) {
     g_originalSetTransform(device, D3DTS_PROJECTION, &projection);
 }
 
+void SetShaderEyeProjection(IDirect3DDevice9* device, float eyeOffsetMeters) {
+    // Diagnostics identified c15-c18 as TrackMania's non-transposed perspective
+    // matrix for its dominant scene vertex shader. _41 is the row-vector D3D9
+    // translation term; changing it yields depth-dependent horizontal parallax.
+    if (!g_stereo.shaderProjectionValid || !g_stereo.customVertexShaderBound ||
+        g_stereo.projectionShader != g_stereo.vertexShader) return;
+    auto projection = g_stereo.shaderProjection;
+    projection[12] += -eyeOffsetMeters * projection[0];
+    g_originalSetVertexShaderConstantF(device, 15, projection.data(), 4);
+    if (!g_stereo.shaderProjectionLogWritten) {
+        g_stereo.shaderProjectionLogWritten = true;
+        tmoxr::log::Info("Applying native stereo shader projection offset at c15-c18.");
+    }
+}
+
 void BeginRightEye(IDirect3DDevice9* device) {
     // D3D9 validates color/depth multisample compatibility at each bind. Clear
     // the old depth surface first so a valid right-eye pair cannot be rejected.
@@ -214,10 +235,14 @@ void BeginRightEye(IDirect3DDevice9* device) {
             ", depth HRESULT=" + std::to_string(static_cast<long>(depthResult)));
     }
     SetEyeProjection(device, +0.032f); // half a 64 mm IPD
+    SetShaderEyeProjection(device, +0.032f);
 }
 
 void RestoreGameEye(IDirect3DDevice9* device) {
     g_originalSetTransform(device, D3DTS_PROJECTION, &g_stereo.projection);
+    if (g_stereo.shaderProjectionValid && g_stereo.projectionShader == g_stereo.vertexShader) {
+        g_originalSetVertexShaderConstantF(device, 15, g_stereo.shaderProjection.data(), 4);
+    }
     g_originalSetDepthStencilSurface(device, nullptr);
     g_originalSetRenderTarget(device, 0, g_stereo.activeColor);
     g_originalSetDepthStencilSurface(device, g_stereo.leftDepth);
@@ -294,6 +319,7 @@ HRESULT STDMETHODCALLTYPE SetDepthStencilSurfaceHook(IDirect3DDevice9* device, I
 
 HRESULT STDMETHODCALLTYPE SetVertexShaderHook(IDirect3DDevice9* device, IDirect3DVertexShader9* shader) {
     g_stereo.customVertexShaderBound = shader != nullptr;
+    g_stereo.vertexShader = shader;
     return g_originalSetVertexShader(device, shader);
 }
 
@@ -319,6 +345,11 @@ HRESULT STDMETHODCALLTYPE SetVertexShaderConstantFHook(IDirect3DDevice9* device,
                 ++g_stereo.perspectiveMatrixCandidates[registerIndex];
                 g_stereo.perspectiveMatrixTransposed[registerIndex] = transposedPerspective;
             }
+            if (registerIndex == 15 && normalPerspective) {
+                std::copy_n(matrix, 16, g_stereo.shaderProjection.begin());
+                g_stereo.shaderProjectionValid = true;
+                g_stereo.projectionShader = g_stereo.vertexShader;
+            }
         }
     }
     return g_originalSetVertexShaderConstantF(device, startRegister, data, vectorCount);
@@ -333,6 +364,7 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITI
     if (!CanReplayStereoDraw(device)) return g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
     ++g_stereo.replayedDraws;
     SetEyeProjection(device, -0.032f);
+    SetShaderEyeProjection(device, -0.032f);
     const HRESULT left = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
     BeginRightEye(device);
     const HRESULT right = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
@@ -354,6 +386,7 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3D
     if (!CanReplayStereoDraw(device)) return g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
     ++g_stereo.replayedDraws;
     SetEyeProjection(device, -0.032f);
+    SetShaderEyeProjection(device, -0.032f);
     const HRESULT left = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
     BeginRightEye(device);
     const HRESULT right = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
