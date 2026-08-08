@@ -11,6 +11,7 @@
 #undef D3DPERF_SetOptions
 
 #include <atomic>
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <string>
@@ -85,6 +86,8 @@ struct StereoResources {
     uint32_t shaderPerspectiveCandidates = 0;
     uint32_t shaderProjectionConstantMatches = 0;
     UINT lastProjectionConstantRegister = 0;
+    std::array<uint32_t, 256> perspectiveMatrixCandidates{};
+    std::array<bool, 256> perspectiveMatrixTransposed{};
     uint32_t replayedDraws = 0;
     uint64_t presentedFrames = 0;
     bool customVertexShaderBound = false;
@@ -225,14 +228,26 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
     tmoxr::VrBridge::Instance().SetRightEyeSurface(g_stereo.rightColor);
     tmoxr::VrBridge::Instance().OnBeforePresent(device);
     if (++g_stereo.presentedFrames % 180 == 0) {
+        UINT likelyRegister = 0;
+        uint32_t likelyCount = 0;
+        for (UINT registerIndex = 0; registerIndex < g_stereo.perspectiveMatrixCandidates.size(); ++registerIndex) {
+            if (g_stereo.perspectiveMatrixCandidates[registerIndex] > likelyCount) {
+                likelyCount = g_stereo.perspectiveMatrixCandidates[registerIndex];
+                likelyRegister = registerIndex;
+            }
+        }
         tmoxr::log::Info("Native stereo replay diagnostic: perspective candidates=" + std::to_string(g_stereo.perspectiveDrawCandidates) +
             ", vertex-shader candidates=" + std::to_string(g_stereo.shaderPerspectiveCandidates) +
             ", projection-constant matches=" + std::to_string(g_stereo.shaderProjectionConstantMatches) +
             " (last c" + std::to_string(g_stereo.lastProjectionConstantRegister) + ")" +
+            ", likely shader projection=c" + std::to_string(likelyRegister) + " (uploads=" + std::to_string(likelyCount) +
+            ", transposed=" + std::to_string(g_stereo.perspectiveMatrixTransposed[likelyRegister]) + ")" +
             ", replayed=" + std::to_string(g_stereo.replayedDraws) + ".");
         g_stereo.perspectiveDrawCandidates = 0;
         g_stereo.shaderPerspectiveCandidates = 0;
         g_stereo.shaderProjectionConstantMatches = 0;
+        g_stereo.perspectiveMatrixCandidates.fill(0);
+        g_stereo.perspectiveMatrixTransposed.fill(false);
         g_stereo.replayedDraws = 0;
     }
     const HRESULT result = g_originalPresent(device, source, destination, window, dirtyRegion);
@@ -293,6 +308,16 @@ HRESULT STDMETHODCALLTYPE SetVertexShaderConstantFHook(IDirect3DDevice9* device,
             if (match) {
                 ++g_stereo.shaderProjectionConstantMatches;
                 g_stereo.lastProjectionConstantRegister = startRegister + vector;
+            }
+            const float* matrix = data + vector * 4;
+            const bool normalPerspective = std::abs(matrix[11]) > 0.75f && std::abs(matrix[15]) < 0.01f &&
+                std::abs(matrix[0]) > 0.1f && std::abs(matrix[5]) > 0.1f;
+            const bool transposedPerspective = std::abs(matrix[14]) > 0.75f && std::abs(matrix[15]) < 0.01f &&
+                std::abs(matrix[0]) > 0.1f && std::abs(matrix[5]) > 0.1f;
+            const UINT registerIndex = startRegister + vector;
+            if (registerIndex < g_stereo.perspectiveMatrixCandidates.size() && (normalPerspective || transposedPerspective)) {
+                ++g_stereo.perspectiveMatrixCandidates[registerIndex];
+                g_stereo.perspectiveMatrixTransposed[registerIndex] = transposedPerspective;
             }
         }
     }
