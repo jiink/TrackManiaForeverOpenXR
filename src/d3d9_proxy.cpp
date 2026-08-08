@@ -211,12 +211,13 @@ void SetEyeProjection(IDirect3DDevice9* device, float eyeOffsetMeters) {
 
 void SetShaderEyeProjection(IDirect3DDevice9* device, float eyeOffsetMeters) {
     // Diagnostics identified c15-c18 as TrackMania's non-transposed perspective
-    // matrix for its dominant scene vertex shader. _41 is the row-vector D3D9
-    // translation term; changing it yields depth-dependent horizontal parallax.
+    // matrix for its dominant scene vertex shader. The shader consumes the
+    // constant vectors as projection columns, so _41 is c15.w (not c18.x).
+    // Changing it yields depth-dependent horizontal parallax.
     if (!g_stereo.shaderProjectionValid || !g_stereo.customVertexShaderBound ||
         g_stereo.projectionShader != g_stereo.vertexShader) return;
     auto projection = g_stereo.shaderProjection;
-    projection[12] += -eyeOffsetMeters * projection[0];
+    projection[3] += -eyeOffsetMeters * projection[0];
     g_originalSetVertexShaderConstantF(device, 15, projection.data(), 4);
     if (!g_stereo.shaderProjectionLogWritten) {
         g_stereo.shaderProjectionLogWritten = true;
