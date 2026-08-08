@@ -88,6 +88,12 @@ struct VrBridge::Impl {
     bool sessionRunning = false;
     bool copyFailureLogged = false;
     uint64_t frames = 0;
+    uint32_t viewTransformsThisFrame = 0;
+    uint32_t projectionTransformsThisFrame = 0;
+    D3DMATRIX latestView{};
+    D3DMATRIX latestProjection{};
+    bool haveView = false;
+    bool haveProjection = false;
     std::mutex mutex;
 
     void DestroySwapchains() {
@@ -321,6 +327,14 @@ struct VrBridge::Impl {
 
     void Present() {
         ++frames;
+        if (frames % 180 == 0) {
+            log::Info("Stereo diagnostic: fixed-function transforms in last frame: view=" +
+                std::to_string(viewTransformsThisFrame) + ", projection=" + std::to_string(projectionTransformsThisFrame) +
+                (haveView ? "; view translation=(" + std::to_string(latestView._41) + "," + std::to_string(latestView._42) + "," + std::to_string(latestView._43) + ")" : "") +
+                (haveProjection ? "; projection=(" + std::to_string(latestProjection._11) + "," + std::to_string(latestProjection._22) + "," + std::to_string(latestProjection._31) + "," + std::to_string(latestProjection._32) + ")" : ""));
+        }
+        viewTransformsThisFrame = 0;
+        projectionTransformsThisFrame = 0;
         if (!Initialize()) return;
         PollEvents();
         if (!sessionRunning) return;
@@ -423,6 +437,20 @@ void VrBridge::OnBeforeReset() {
     std::scoped_lock lock(impl_->mutex);
     impl_->DestroyOpenXR();
     log::Info("OpenXR session and bridge resources released for device reset.");
+}
+
+void VrBridge::OnTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX& matrix) {
+    if (!impl_) return;
+    std::scoped_lock lock(impl_->mutex);
+    if (state == D3DTS_VIEW) {
+        ++impl_->viewTransformsThisFrame;
+        impl_->latestView = matrix;
+        impl_->haveView = true;
+    } else if (state == D3DTS_PROJECTION) {
+        ++impl_->projectionTransformsThisFrame;
+        impl_->latestProjection = matrix;
+        impl_->haveProjection = true;
+    }
 }
 
 void VrBridge::Shutdown() {

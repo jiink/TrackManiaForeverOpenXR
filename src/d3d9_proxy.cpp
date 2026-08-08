@@ -45,8 +45,10 @@ void LoadRealD3D9() {
 
 using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
 using ResetFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
+using SetTransformFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DTRANSFORMSTATETYPE, const D3DMATRIX*);
 PresentFn g_originalPresent = nullptr;
 ResetFn g_originalReset = nullptr;
+SetTransformFn g_originalSetTransform = nullptr;
 std::atomic<bool> g_hooked = false;
 
 HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* source, const RECT* destination,
@@ -61,24 +63,33 @@ HRESULT STDMETHODCALLTYPE ResetHook(IDirect3DDevice9* device, D3DPRESENT_PARAMET
     return g_originalReset(device, parameters);
 }
 
+HRESULT STDMETHODCALLTYPE SetTransformHook(IDirect3DDevice9* device, D3DTRANSFORMSTATETYPE state, const D3DMATRIX* matrix) {
+    if (matrix && (state == D3DTS_VIEW || state == D3DTS_PROJECTION)) {
+        tmoxr::VrBridge::Instance().OnTransform(state, *matrix);
+    }
+    return g_originalSetTransform(device, state, matrix);
+}
+
 bool InstallDeviceHooks(IDirect3DDevice9* device) {
     if (g_hooked.exchange(true)) return true;
     // IDirect3DDevice9 vtable indexes from the Direct3D 9 SDK: Reset=16, Present=17.
     auto table = *reinterpret_cast<void***>(device);
     DWORD oldProtect = 0;
-    if (!VirtualProtect(&table[16], sizeof(void*) * 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+    if (!VirtualProtect(&table[16], sizeof(void*) * 29, PAGE_EXECUTE_READWRITE, &oldProtect)) {
         tmoxr::log::Error("VirtualProtect on IDirect3DDevice9 vtable failed: " + std::to_string(GetLastError()));
         g_hooked = false;
         return false;
     }
     g_originalReset = reinterpret_cast<ResetFn>(table[16]);
     g_originalPresent = reinterpret_cast<PresentFn>(table[17]);
+    g_originalSetTransform = reinterpret_cast<SetTransformFn>(table[44]);
     table[16] = reinterpret_cast<void*>(&ResetHook);
     table[17] = reinterpret_cast<void*>(&PresentHook);
+    table[44] = reinterpret_cast<void*>(&SetTransformHook);
     DWORD ignored = 0;
-    VirtualProtect(&table[16], sizeof(void*) * 2, oldProtect, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), &table[16], sizeof(void*) * 2);
-    tmoxr::log::Info("Installed Direct3D 9 Present/Reset hooks.");
+    VirtualProtect(&table[16], sizeof(void*) * 29, oldProtect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), &table[16], sizeof(void*) * 29);
+    tmoxr::log::Info("Installed Direct3D 9 Present/Reset/SetTransform hooks.");
     return true;
 }
 

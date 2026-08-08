@@ -9,6 +9,7 @@ public:
     void OnDeviceCreated(IDirect3DDevice9* device, const D3DPRESENT_PARAMETERS& parameters);
     void OnBeforePresent(IDirect3DDevice9* device);
     void OnBeforeReset();
+    void OnTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX& matrix);
     void Shutdown();
 
 private:
