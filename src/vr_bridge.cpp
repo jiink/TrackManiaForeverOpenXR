@@ -10,7 +10,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cmath>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -88,13 +87,6 @@ struct VrBridge::Impl {
     bool permanentlyDisabled = false;
     bool sessionRunning = false;
     bool copyFailureLogged = false;
-    bool headLookEnabled = true;
-    bool havePreviousHeadPose = false;
-    float previousYaw = 0.0f;
-    float previousPitch = 0.0f;
-    float pendingMouseX = 0.0f;
-    float pendingMouseY = 0.0f;
-    XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
     uint64_t frames = 0;
     std::mutex mutex;
 
@@ -301,7 +293,6 @@ struct VrBridge::Impl {
         if (!Check(createReferenceSpace(session, &spaceInfo, &space), "xrCreateReferenceSpace")) { permanentlyDisabled = true; DestroyOpenXR(); return false; }
         if (!CreateSwapchains()) { permanentlyDisabled = true; DestroyOpenXR(); return false; }
         initialized = true;
-        log::Info("Head-look input is enabled. Press F10 in-game to toggle it.");
         log::Info("OpenXR initialization completed. Waiting for runtime to report session READY.");
         return true;
     }
@@ -311,7 +302,6 @@ struct VrBridge::Impl {
         while (pollEvent && pollEvent(instance, &event) == XR_SUCCESS) {
             if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
                 const auto* changed = reinterpret_cast<const XrEventDataSessionStateChanged*>(&event);
-                sessionState = changed->state;
                 log::Info("OpenXR session state changed to " + std::to_string(static_cast<int>(changed->state)) + ".");
                 if (changed->state == XR_SESSION_STATE_READY) {
                     XrSessionBeginInfo begin{XR_TYPE_SESSION_BEGIN_INFO};
@@ -326,55 +316,6 @@ struct VrBridge::Impl {
                 }
             }
             event = XrEventDataBuffer{XR_TYPE_EVENT_DATA_BUFFER};
-        }
-    }
-
-    static float WrapRadians(float radians) {
-        constexpr float pi = 3.14159265358979323846f;
-        while (radians > pi) radians -= 2.0f * pi;
-        while (radians < -pi) radians += 2.0f * pi;
-        return radians;
-    }
-
-    void ApplyHeadLook(const XrPosef& pose) {
-        if (GetAsyncKeyState(VK_F10) & 1) {
-            headLookEnabled = !headLookEnabled;
-            havePreviousHeadPose = false;
-            pendingMouseX = pendingMouseY = 0.0f;
-            log::Info(std::string("Head-look input ") + (headLookEnabled ? "enabled" : "disabled") + " by F10.");
-        }
-        if (!headLookEnabled || sessionState != XR_SESSION_STATE_FOCUSED) {
-            havePreviousHeadPose = false;
-            return;
-        }
-        const auto& q = pose.orientation;
-        const float yaw = std::atan2(2.0f * (q.w * q.y + q.x * q.z), 1.0f - 2.0f * (q.y * q.y + q.x * q.x));
-        const float pitch = std::asin(std::clamp(2.0f * (q.w * q.x - q.z * q.y), -1.0f, 1.0f));
-        if (!havePreviousHeadPose) {
-            previousYaw = yaw;
-            previousPitch = pitch;
-            havePreviousHeadPose = true;
-            log::Info("Head-look reference established.");
-            return;
-        }
-        constexpr float radiansToDegrees = 57.2957795131f;
-        constexpr float mouseCountsPerDegree = 8.0f;
-        pendingMouseX += WrapRadians(yaw - previousYaw) * radiansToDegrees * mouseCountsPerDegree;
-        pendingMouseY -= WrapRadians(pitch - previousPitch) * radiansToDegrees * mouseCountsPerDegree;
-        previousYaw = yaw;
-        previousPitch = pitch;
-        const LONG moveX = static_cast<LONG>(std::trunc(pendingMouseX));
-        const LONG moveY = static_cast<LONG>(std::trunc(pendingMouseY));
-        pendingMouseX -= static_cast<float>(moveX);
-        pendingMouseY -= static_cast<float>(moveY);
-        if (moveX == 0 && moveY == 0) return;
-        INPUT input{};
-        input.type = INPUT_MOUSE;
-        input.mi.dx = moveX;
-        input.mi.dy = moveY;
-        input.mi.dwFlags = MOUSEEVENTF_MOVE;
-        if (SendInput(1, &input, sizeof(input)) != 1) {
-            log::Warn("SendInput could not deliver headset head-look mouse movement: Windows error=" + std::to_string(GetLastError()));
         }
     }
 
@@ -401,7 +342,6 @@ struct VrBridge::Impl {
             XrViewState viewState{XR_TYPE_VIEW_STATE};
             uint32_t viewCount = 0;
             if (Check(locateViews(session, &locate, &viewState, static_cast<uint32_t>(views.size()), &viewCount, views.data()), "xrLocateViews") && viewCount == swapchains.size()) {
-                ApplyHeadLook(views[0].pose);
                 IDirect3DSurface9* gameBackbuffer = nullptr;
                 const HRESULT backBufferResult = device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &gameBackbuffer);
                 if (SUCCEEDED(backBufferResult)) {
