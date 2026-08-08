@@ -72,6 +72,7 @@ struct StereoResources {
     D3DMATRIX projection{};
     bool perspective = false;
     bool perspectivePassSeen = false;
+    bool rightDrawFailureLogged = false;
     bool ready = false;
 } g_stereo;
 
@@ -197,7 +198,11 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITI
     SetEyeProjection(device, -0.032f);
     const HRESULT left = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
     BeginRightEye(device);
-    g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
+    const HRESULT right = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
+    if (FAILED(right) && !g_stereo.rightDrawFailureLogged) {
+        g_stereo.rightDrawFailureLogged = true;
+        tmoxr::log::Error("Right-eye DrawPrimitive replay failed: HRESULT=" + std::to_string(static_cast<long>(right)));
+    }
     RestoreGameEye(device);
     return left;
 }
@@ -209,7 +214,11 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3D
     SetEyeProjection(device, -0.032f);
     const HRESULT left = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
     BeginRightEye(device);
-    g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
+    const HRESULT right = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
+    if (FAILED(right) && !g_stereo.rightDrawFailureLogged) {
+        g_stereo.rightDrawFailureLogged = true;
+        tmoxr::log::Error("Right-eye DrawIndexedPrimitive replay failed: HRESULT=" + std::to_string(static_cast<long>(right)));
+    }
     RestoreGameEye(device);
     return left;
 }
