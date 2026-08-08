@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -90,8 +91,11 @@ struct VrBridge::Impl {
     uint64_t frames = 0;
     uint32_t viewTransformsThisFrame = 0;
     uint32_t projectionTransformsThisFrame = 0;
+    uint32_t perspectiveProjectionsThisFrame = 0;
     D3DMATRIX latestView{};
     D3DMATRIX latestProjection{};
+    D3DMATRIX latestPerspectiveView{};
+    D3DMATRIX latestPerspectiveProjection{};
     bool haveView = false;
     bool haveProjection = false;
     std::mutex mutex;
@@ -331,10 +335,14 @@ struct VrBridge::Impl {
             log::Info("Stereo diagnostic: fixed-function transforms in last frame: view=" +
                 std::to_string(viewTransformsThisFrame) + ", projection=" + std::to_string(projectionTransformsThisFrame) +
                 (haveView ? "; view translation=(" + std::to_string(latestView._41) + "," + std::to_string(latestView._42) + "," + std::to_string(latestView._43) + ")" : "") +
-                (haveProjection ? "; projection=(" + std::to_string(latestProjection._11) + "," + std::to_string(latestProjection._22) + "," + std::to_string(latestProjection._31) + "," + std::to_string(latestProjection._32) + ")" : ""));
+                (haveProjection ? "; last projection=(" + std::to_string(latestProjection._11) + "," + std::to_string(latestProjection._22) + "," + std::to_string(latestProjection._33) + "," + std::to_string(latestProjection._34) + ")" : "") +
+                "; perspective=" + std::to_string(perspectiveProjectionsThisFrame) +
+                (perspectiveProjectionsThisFrame ? "; perspective view translation=(" + std::to_string(latestPerspectiveView._41) + "," + std::to_string(latestPerspectiveView._42) + "," + std::to_string(latestPerspectiveView._43) +
+                    "), projection=(" + std::to_string(latestPerspectiveProjection._11) + "," + std::to_string(latestPerspectiveProjection._22) + "," + std::to_string(latestPerspectiveProjection._33) + "," + std::to_string(latestPerspectiveProjection._34) + ")" : ""));
         }
         viewTransformsThisFrame = 0;
         projectionTransformsThisFrame = 0;
+        perspectiveProjectionsThisFrame = 0;
         if (!Initialize()) return;
         PollEvents();
         if (!sessionRunning) return;
@@ -450,6 +458,13 @@ void VrBridge::OnTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX& matrix)
         ++impl_->projectionTransformsThisFrame;
         impl_->latestProjection = matrix;
         impl_->haveProjection = true;
+        // D3D9 left/right-handed perspective matrices put +/-1 in _34. UI
+        // orthographic projections leave it at zero, so they are not camera candidates.
+        if (std::abs(matrix._34) > 0.5f) {
+            ++impl_->perspectiveProjectionsThisFrame;
+            impl_->latestPerspectiveProjection = matrix;
+            impl_->latestPerspectiveView = impl_->latestView;
+        }
     }
 }
 
