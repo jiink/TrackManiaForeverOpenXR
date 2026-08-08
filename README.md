@@ -4,6 +4,8 @@ This is a minimal, headset-only VR bridge for the 32-bit Steam release of TrackM
 
 The minimal mode intentionally mirrors the final Direct3D 9 frame to both eyes. It is useful as a large, stable seated headset display, but it is **not native stereoscopic TrackMania** and it does not alter the game's camera from headset movement. Camera-memory reverse engineering is deliberately outside this safe first version.
 
+Head rotation is sent through TrackMania's existing relative-mouse input, so the game camera follows your headset while driving remains entirely on the Xbox controller. Press **F10** to toggle head-look. This is rotational tracking only; it does not yet provide positional tracking or per-eye game rendering.
+
 ## Build
 
 Install Visual Studio Build Tools with the C++ desktop workload, then open an **x86 Native Tools Command Prompt** and run:
