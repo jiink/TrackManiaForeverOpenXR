@@ -374,9 +374,9 @@ Matrix4 HeadViewMatrix(float eyeOffsetMeters) {
         }
     }
     float cameraPosition[3] = {
-        g_stereo.haveHeadPose ? g_stereo.headPose.position[0] : 0.0f,
-        g_stereo.haveHeadPose ? -g_stereo.headPose.position[1] : 0.0f,
-        g_stereo.haveHeadPose ? g_stereo.headPose.position[2] : 0.0f};
+        g_stereo.haveHeadPose ? -g_stereo.headPose.position[0] : 0.0f,
+        g_stereo.haveHeadPose ? g_stereo.headPose.position[1] : 0.0f,
+        g_stereo.haveHeadPose ? -g_stereo.headPose.position[2] : 0.0f};
     // The eye offset is local to the headset and therefore rotates with it.
     for (UINT row = 0; row < 3; ++row) cameraPosition[row] += rotation[row][0] * eyeOffsetMeters;
 
