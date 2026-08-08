@@ -46,9 +46,15 @@ void LoadRealD3D9() {
 using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
 using ResetFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
 using SetTransformFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DTRANSFORMSTATETYPE, const D3DMATRIX*);
+using SetRenderTargetFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
+using DrawPrimitiveFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT);
+using DrawIndexedPrimitiveFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT);
 PresentFn g_originalPresent = nullptr;
 ResetFn g_originalReset = nullptr;
 SetTransformFn g_originalSetTransform = nullptr;
+SetRenderTargetFn g_originalSetRenderTarget = nullptr;
+DrawPrimitiveFn g_originalDrawPrimitive = nullptr;
+DrawIndexedPrimitiveFn g_originalDrawIndexedPrimitive = nullptr;
 std::atomic<bool> g_hooked = false;
 
 HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* source, const RECT* destination,
@@ -70,12 +76,28 @@ HRESULT STDMETHODCALLTYPE SetTransformHook(IDirect3DDevice9* device, D3DTRANSFOR
     return g_originalSetTransform(device, state, matrix);
 }
 
+HRESULT STDMETHODCALLTYPE SetRenderTargetHook(IDirect3DDevice9* device, DWORD index, IDirect3DSurface9* surface) {
+    if (index == 0 && surface) tmoxr::VrBridge::Instance().OnRenderTarget(surface);
+    return g_originalSetRenderTarget(device, index, surface);
+}
+
+HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITIVETYPE type, UINT startVertex, UINT primitiveCount) {
+    tmoxr::VrBridge::Instance().OnDraw(false);
+    return g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
+}
+
+HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITIVETYPE type, INT baseVertex, UINT minVertex,
+                                                    UINT vertexCount, UINT startIndex, UINT primitiveCount) {
+    tmoxr::VrBridge::Instance().OnDraw(true);
+    return g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
+}
+
 bool InstallDeviceHooks(IDirect3DDevice9* device) {
     if (g_hooked.exchange(true)) return true;
     // IDirect3DDevice9 vtable indexes from the Direct3D 9 SDK: Reset=16, Present=17.
     auto table = *reinterpret_cast<void***>(device);
     DWORD oldProtect = 0;
-    if (!VirtualProtect(&table[16], sizeof(void*) * 29, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+    if (!VirtualProtect(&table[16], sizeof(void*) * 67, PAGE_EXECUTE_READWRITE, &oldProtect)) {
         tmoxr::log::Error("VirtualProtect on IDirect3DDevice9 vtable failed: " + std::to_string(GetLastError()));
         g_hooked = false;
         return false;
@@ -83,13 +105,19 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
     g_originalReset = reinterpret_cast<ResetFn>(table[16]);
     g_originalPresent = reinterpret_cast<PresentFn>(table[17]);
     g_originalSetTransform = reinterpret_cast<SetTransformFn>(table[44]);
+    g_originalSetRenderTarget = reinterpret_cast<SetRenderTargetFn>(table[37]);
+    g_originalDrawPrimitive = reinterpret_cast<DrawPrimitiveFn>(table[81]);
+    g_originalDrawIndexedPrimitive = reinterpret_cast<DrawIndexedPrimitiveFn>(table[82]);
     table[16] = reinterpret_cast<void*>(&ResetHook);
     table[17] = reinterpret_cast<void*>(&PresentHook);
     table[44] = reinterpret_cast<void*>(&SetTransformHook);
+    table[37] = reinterpret_cast<void*>(&SetRenderTargetHook);
+    table[81] = reinterpret_cast<void*>(&DrawPrimitiveHook);
+    table[82] = reinterpret_cast<void*>(&DrawIndexedPrimitiveHook);
     DWORD ignored = 0;
-    VirtualProtect(&table[16], sizeof(void*) * 29, oldProtect, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), &table[16], sizeof(void*) * 29);
-    tmoxr::log::Info("Installed Direct3D 9 Present/Reset/SetTransform hooks.");
+    VirtualProtect(&table[16], sizeof(void*) * 67, oldProtect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), &table[16], sizeof(void*) * 67);
+    tmoxr::log::Info("Installed D3D9 Present/Reset/transform/render-pass diagnostic hooks.");
     return true;
 }
 

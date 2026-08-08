@@ -10,6 +10,8 @@ public:
     void OnBeforePresent(IDirect3DDevice9* device);
     void OnBeforeReset();
     void OnTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX& matrix);
+    void OnRenderTarget(IDirect3DSurface9* surface);
+    void OnDraw(bool indexed);
     void Shutdown();
 
 private:

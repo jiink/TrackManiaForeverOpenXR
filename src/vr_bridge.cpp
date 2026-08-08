@@ -92,12 +92,19 @@ struct VrBridge::Impl {
     uint32_t viewTransformsThisFrame = 0;
     uint32_t projectionTransformsThisFrame = 0;
     uint32_t perspectiveProjectionsThisFrame = 0;
+    uint32_t perspectiveDrawsThisFrame = 0;
+    uint32_t perspectiveIndexedDrawsThisFrame = 0;
     D3DMATRIX latestView{};
     D3DMATRIX latestProjection{};
     D3DMATRIX latestPerspectiveView{};
     D3DMATRIX latestPerspectiveProjection{};
     bool haveView = false;
     bool haveProjection = false;
+    bool perspectiveProjectionActive = false;
+    D3DSURFACE_DESC activeTarget{};
+    D3DSURFACE_DESC perspectiveTarget{};
+    bool haveActiveTarget = false;
+    bool havePerspectiveTarget = false;
     std::mutex mutex;
 
     void DestroySwapchains() {
@@ -337,12 +344,17 @@ struct VrBridge::Impl {
                 (haveView ? "; view translation=(" + std::to_string(latestView._41) + "," + std::to_string(latestView._42) + "," + std::to_string(latestView._43) + ")" : "") +
                 (haveProjection ? "; last projection=(" + std::to_string(latestProjection._11) + "," + std::to_string(latestProjection._22) + "," + std::to_string(latestProjection._33) + "," + std::to_string(latestProjection._34) + ")" : "") +
                 "; perspective=" + std::to_string(perspectiveProjectionsThisFrame) +
+                ", draws=" + std::to_string(perspectiveDrawsThisFrame) + " (indexed=" + std::to_string(perspectiveIndexedDrawsThisFrame) + ")" +
                 (perspectiveProjectionsThisFrame ? "; perspective view translation=(" + std::to_string(latestPerspectiveView._41) + "," + std::to_string(latestPerspectiveView._42) + "," + std::to_string(latestPerspectiveView._43) +
-                    "), projection=(" + std::to_string(latestPerspectiveProjection._11) + "," + std::to_string(latestPerspectiveProjection._22) + "," + std::to_string(latestPerspectiveProjection._33) + "," + std::to_string(latestPerspectiveProjection._34) + ")" : ""));
+                    "), projection=(" + std::to_string(latestPerspectiveProjection._11) + "," + std::to_string(latestPerspectiveProjection._22) + "," + std::to_string(latestPerspectiveProjection._33) + "," + std::to_string(latestPerspectiveProjection._34) + ")" : "") +
+                (havePerspectiveTarget ? "; perspective target=" + std::to_string(perspectiveTarget.Width) + "x" + std::to_string(perspectiveTarget.Height) + ", format=" + std::to_string(perspectiveTarget.Format) : ""));
         }
         viewTransformsThisFrame = 0;
         projectionTransformsThisFrame = 0;
         perspectiveProjectionsThisFrame = 0;
+        perspectiveDrawsThisFrame = 0;
+        perspectiveIndexedDrawsThisFrame = 0;
+        havePerspectiveTarget = false;
         if (!Initialize()) return;
         PollEvents();
         if (!sessionRunning) return;
@@ -464,7 +476,31 @@ void VrBridge::OnTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX& matrix)
             ++impl_->perspectiveProjectionsThisFrame;
             impl_->latestPerspectiveProjection = matrix;
             impl_->latestPerspectiveView = impl_->latestView;
+            impl_->perspectiveProjectionActive = true;
+        } else {
+            impl_->perspectiveProjectionActive = false;
         }
+    }
+}
+
+void VrBridge::OnRenderTarget(IDirect3DSurface9* surface) {
+    if (!impl_) return;
+    D3DSURFACE_DESC description{};
+    if (FAILED(surface->GetDesc(&description))) return;
+    std::scoped_lock lock(impl_->mutex);
+    impl_->activeTarget = description;
+    impl_->haveActiveTarget = true;
+}
+
+void VrBridge::OnDraw(bool indexed) {
+    if (!impl_) return;
+    std::scoped_lock lock(impl_->mutex);
+    if (!impl_->perspectiveProjectionActive) return;
+    ++impl_->perspectiveDrawsThisFrame;
+    if (indexed) ++impl_->perspectiveIndexedDrawsThisFrame;
+    if (impl_->haveActiveTarget) {
+        impl_->perspectiveTarget = impl_->activeTarget;
+        impl_->havePerspectiveTarget = true;
     }
 }
 
