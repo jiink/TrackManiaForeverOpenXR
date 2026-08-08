@@ -263,7 +263,9 @@ void BeginRightEye(IDirect3DDevice9* device) {
         tmoxr::log::Error("Right-eye render-target bind failed: color HRESULT=" + std::to_string(static_cast<long>(colorResult)) +
             ", depth HRESULT=" + std::to_string(static_cast<long>(depthResult)));
     }
-    SetEyeProjection(device, +0.032f); // half a 64 mm IPD
+    // The game render is retained as the unmodified left eye. Move only the
+    // replayed eye by the full IPD so TrackMania's shadow/lighting passes remain intact.
+    SetEyeProjection(device, +0.064f);
 }
 
 void RestoreGameEye(IDirect3DDevice9* device) {
@@ -433,11 +435,9 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITI
     AnalyzeVertexShader(g_stereo.vertexShader);
     const ShaderEyeState shaderEye = CaptureShaderEyeState(device);
     ++g_stereo.replayedDraws;
-    SetEyeProjection(device, -0.032f);
-    ApplyShaderEyeState(device, shaderEye, -0.032f);
     const HRESULT left = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
     BeginRightEye(device);
-    ApplyShaderEyeState(device, shaderEye, +0.032f);
+    ApplyShaderEyeState(device, shaderEye, +0.064f);
     const HRESULT right = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
     if (FAILED(right) && !g_stereo.rightDrawFailureLogged) {
         g_stereo.rightDrawFailureLogged = true;
@@ -459,11 +459,9 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3D
     AnalyzeVertexShader(g_stereo.vertexShader);
     const ShaderEyeState shaderEye = CaptureShaderEyeState(device);
     ++g_stereo.replayedDraws;
-    SetEyeProjection(device, -0.032f);
-    ApplyShaderEyeState(device, shaderEye, -0.032f);
     const HRESULT left = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
     BeginRightEye(device);
-    ApplyShaderEyeState(device, shaderEye, +0.032f);
+    ApplyShaderEyeState(device, shaderEye, +0.064f);
     const HRESULT right = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
     if (FAILED(right) && !g_stereo.rightDrawFailureLogged) {
         g_stereo.rightDrawFailureLogged = true;
