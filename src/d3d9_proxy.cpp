@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <sstream>
 #include <string>
@@ -78,6 +79,7 @@ std::atomic<bool> g_hooked = false;
 
 struct StereoResources {
     struct ColorPair { IDirect3DSurface9* source; IDirect3DSurface9* right; };
+    struct ShaderPositionInfo { IDirect3DVertexShader9* shader; UINT baseRegister; };
     IDirect3DSurface9* leftColor = nullptr;
     IDirect3DSurface9* leftDepth = nullptr;
     IDirect3DSurface9* depthSource = nullptr;
@@ -100,11 +102,9 @@ struct StereoResources {
     uint64_t presentedFrames = 0;
     bool customVertexShaderBound = false;
     IDirect3DVertexShader9* vertexShader = nullptr;
-    IDirect3DVertexShader9* projectionShader = nullptr;
     std::vector<IDirect3DVertexShader9*> analyzedShaders;
-    std::array<float, 16> shaderProjection{};
-    bool shaderProjectionValid = false;
-    bool shaderProjectionLogWritten = false;
+    std::vector<ShaderPositionInfo> shaderPositionInfo;
+    bool shaderPositionLogWritten = false;
     UINT primaryWidth = 0;
     UINT primaryHeight = 0;
     D3DFORMAT primaryFormat = D3DFMT_UNKNOWN;
@@ -217,20 +217,40 @@ void SetEyeProjection(IDirect3DDevice9* device, float eyeOffsetMeters) {
     g_originalSetTransform(device, D3DTS_PROJECTION, &projection);
 }
 
-void SetShaderEyeProjection(IDirect3DDevice9* device, float eyeOffsetMeters) {
-    // Diagnostics identified c15-c18 as TrackMania's non-transposed perspective
-    // matrix for its dominant scene vertex shader. The shader consumes the
-    // constant vectors as projection columns, so _41 is c15.w (not c18.x).
-    // Changing it yields depth-dependent horizontal parallax.
-    if (!g_stereo.shaderProjectionValid || !g_stereo.customVertexShaderBound ||
-        g_stereo.projectionShader != g_stereo.vertexShader) return;
-    auto projection = g_stereo.shaderProjection;
-    projection[3] += -eyeOffsetMeters * projection[0];
-    g_originalSetVertexShaderConstantF(device, 15, projection.data(), 4);
-    if (!g_stereo.shaderProjectionLogWritten) {
-        g_stereo.shaderProjectionLogWritten = true;
-        tmoxr::log::Info("Applying native stereo shader projection offset at c15-c18.");
+struct ShaderEyeState {
+    UINT baseRegister = 0;
+    std::array<float, 16> original{};
+    bool active = false;
+};
+
+ShaderEyeState CaptureShaderEyeState(IDirect3DDevice9* device) {
+    ShaderEyeState state;
+    if (!g_stereo.vertexShader) return state;
+    for (const auto& info : g_stereo.shaderPositionInfo) {
+        if (info.shader != g_stereo.vertexShader) continue;
+        state.baseRegister = info.baseRegister;
+        state.active = SUCCEEDED(device->GetVertexShaderConstantF(info.baseRegister, state.original.data(), 4));
+        return state;
     }
+    return state;
+}
+
+void ApplyShaderEyeState(IDirect3DDevice9* device, const ShaderEyeState& state, float eyeOffsetMeters) {
+    if (!state.active) return;
+    auto matrix = state.original;
+    // The shaders calculate oPos.x as dp4(vertex, cN). Therefore cN.w is
+    // the homogeneous clip-X translation term for the combined WVP matrix.
+    matrix[3] += -eyeOffsetMeters * g_stereo.projection._11;
+    g_originalSetVertexShaderConstantF(device, state.baseRegister, matrix.data(), 4);
+    if (!g_stereo.shaderPositionLogWritten) {
+        g_stereo.shaderPositionLogWritten = true;
+        tmoxr::log::Info("Applying native stereo to shader oPos matrix at c" + std::to_string(state.baseRegister) + "-c" +
+            std::to_string(state.baseRegister + 3) + ".");
+    }
+}
+
+void RestoreShaderEyeState(IDirect3DDevice9* device, const ShaderEyeState& state) {
+    if (state.active) g_originalSetVertexShaderConstantF(device, state.baseRegister, state.original.data(), 4);
 }
 
 void BeginRightEye(IDirect3DDevice9* device) {
@@ -244,14 +264,10 @@ void BeginRightEye(IDirect3DDevice9* device) {
             ", depth HRESULT=" + std::to_string(static_cast<long>(depthResult)));
     }
     SetEyeProjection(device, +0.032f); // half a 64 mm IPD
-    SetShaderEyeProjection(device, +0.032f);
 }
 
 void RestoreGameEye(IDirect3DDevice9* device) {
     g_originalSetTransform(device, D3DTS_PROJECTION, &g_stereo.projection);
-    if (g_stereo.shaderProjectionValid && g_stereo.projectionShader == g_stereo.vertexShader) {
-        g_originalSetVertexShaderConstantF(device, 15, g_stereo.shaderProjection.data(), 4);
-    }
     g_originalSetDepthStencilSurface(device, nullptr);
     g_originalSetRenderTarget(device, 0, g_stereo.activeColor);
     g_originalSetDepthStencilSurface(device, g_stereo.leftDepth);
@@ -279,6 +295,15 @@ void AnalyzeVertexShader(IDirect3DVertexShader9* shader) {
     if (FAILED(disassemble(bytecode.data(), FALSE, nullptr, &output)) || !output) return;
     const std::string disassembly(static_cast<const char*>(output->GetBufferPointer()), output->GetBufferSize());
     output->Release();
+
+    const auto positionInstruction = disassembly.find("dp4 oPos.x");
+    if (positionInstruction != std::string::npos) {
+        const auto constant = disassembly.find(", c", positionInstruction);
+        if (constant != std::string::npos) {
+            const UINT baseRegister = static_cast<UINT>(std::strtoul(disassembly.c_str() + constant + 3, nullptr, 10));
+            g_stereo.shaderPositionInfo.push_back({shader, baseRegister});
+        }
+    }
 
     std::istringstream lines(disassembly);
     std::string line;
@@ -393,11 +418,6 @@ HRESULT STDMETHODCALLTYPE SetVertexShaderConstantFHook(IDirect3DDevice9* device,
                 ++g_stereo.perspectiveMatrixCandidates[registerIndex];
                 g_stereo.perspectiveMatrixTransposed[registerIndex] = transposedPerspective;
             }
-            if (registerIndex == 15 && normalPerspective) {
-                std::copy_n(matrix, 16, g_stereo.shaderProjection.begin());
-                g_stereo.shaderProjectionValid = true;
-                g_stereo.projectionShader = g_stereo.vertexShader;
-            }
         }
     }
     return g_originalSetVertexShaderConstantF(device, startRegister, data, vectorCount);
@@ -411,16 +431,19 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITI
     }
     if (!CanReplayStereoDraw(device)) return g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
     AnalyzeVertexShader(g_stereo.vertexShader);
+    const ShaderEyeState shaderEye = CaptureShaderEyeState(device);
     ++g_stereo.replayedDraws;
     SetEyeProjection(device, -0.032f);
-    SetShaderEyeProjection(device, -0.032f);
+    ApplyShaderEyeState(device, shaderEye, -0.032f);
     const HRESULT left = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
     BeginRightEye(device);
+    ApplyShaderEyeState(device, shaderEye, +0.032f);
     const HRESULT right = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
     if (FAILED(right) && !g_stereo.rightDrawFailureLogged) {
         g_stereo.rightDrawFailureLogged = true;
         tmoxr::log::Error("Right-eye DrawPrimitive replay failed: HRESULT=" + std::to_string(static_cast<long>(right)));
     }
+    RestoreShaderEyeState(device, shaderEye);
     RestoreGameEye(device);
     return left;
 }
@@ -434,16 +457,19 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3D
     }
     if (!CanReplayStereoDraw(device)) return g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
     AnalyzeVertexShader(g_stereo.vertexShader);
+    const ShaderEyeState shaderEye = CaptureShaderEyeState(device);
     ++g_stereo.replayedDraws;
     SetEyeProjection(device, -0.032f);
-    SetShaderEyeProjection(device, -0.032f);
+    ApplyShaderEyeState(device, shaderEye, -0.032f);
     const HRESULT left = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
     BeginRightEye(device);
+    ApplyShaderEyeState(device, shaderEye, +0.032f);
     const HRESULT right = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
     if (FAILED(right) && !g_stereo.rightDrawFailureLogged) {
         g_stereo.rightDrawFailureLogged = true;
         tmoxr::log::Error("Right-eye DrawIndexedPrimitive replay failed: HRESULT=" + std::to_string(static_cast<long>(right)));
     }
+    RestoreShaderEyeState(device, shaderEye);
     RestoreGameEye(device);
     return left;
 }
