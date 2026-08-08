@@ -340,9 +340,12 @@ Matrix4 EyeProjection(bool rightEye) {
     const float vertical = tangentUp - tangentDown;
     if (horizontal < 0.001f || vertical < 0.001f) return gameProjection;
     Matrix4 projection{};
-    projection[0] = 2.0f / horizontal;
+    // TrackMania's camera projection has a negative horizontal scale. Preserve
+    // each original axis sign or one reflected axis reverses winding, mirrors
+    // the world, and makes ordinary backface culling appear inside-out.
+    projection[0] = std::copysign(2.0f / horizontal, gameProjection[0]);
     projection[2] = -(tangentRight + tangentLeft) / horizontal;
-    projection[5] = 2.0f / vertical;
+    projection[5] = std::copysign(2.0f / vertical, gameProjection[5]);
     projection[6] = -(tangentUp + tangentDown) / vertical;
     // Retain TrackMania's near/far depth mapping while replacing only FOV.
     projection[10] = gameProjection[10];
