@@ -64,6 +64,7 @@ std::atomic<bool> g_hooked = false;
 
 struct StereoResources {
     IDirect3DSurface9* leftColor = nullptr;
+    IDirect3DSurface9* colorSource = nullptr;
     IDirect3DSurface9* leftDepth = nullptr;
     IDirect3DSurface9* depthSource = nullptr;
     IDirect3DSurface9* rightColor = nullptr;
@@ -82,11 +83,33 @@ struct StereoResources {
 
 void ReleaseStereoResources() {
     tmoxr::VrBridge::Instance().SetRightEyeSurface(nullptr);
-    for (auto** resource : {&g_stereo.leftColor, &g_stereo.leftDepth, &g_stereo.depthSource, &g_stereo.rightColor, &g_stereo.rightDepth}) {
+    for (auto** resource : {&g_stereo.leftColor, &g_stereo.colorSource, &g_stereo.leftDepth, &g_stereo.depthSource, &g_stereo.rightColor, &g_stereo.rightDepth}) {
         if (*resource) (*resource)->Release();
         *resource = nullptr;
     }
     g_stereo = {};
+}
+
+bool EnsureRightEyeColor(IDirect3DDevice9* device) {
+    if (!g_stereo.activeColor) return false;
+    if (g_stereo.colorSource == g_stereo.activeColor && g_stereo.rightColor) return true;
+    if (g_stereo.colorSource) g_stereo.colorSource->Release();
+    if (g_stereo.rightColor) g_stereo.rightColor->Release();
+    g_stereo.colorSource = nullptr;
+    g_stereo.rightColor = nullptr;
+    D3DSURFACE_DESC color{};
+    if (FAILED(g_stereo.activeColor->GetDesc(&color)) ||
+        FAILED(device->CreateRenderTarget(color.Width, color.Height, color.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &g_stereo.rightColor, nullptr))) {
+        tmoxr::log::Warn("Native stereo skipped: could not mirror the currently bound scene color target.");
+        if (g_stereo.rightColor) g_stereo.rightColor->Release();
+        g_stereo.rightColor = nullptr;
+        return false;
+    }
+    g_stereo.activeColor->AddRef();
+    g_stereo.colorSource = g_stereo.activeColor;
+    tmoxr::VrBridge::Instance().SetRightEyeSurface(g_stereo.rightColor);
+    tmoxr::log::Info("Allocated right-eye color surface for active scene pass: " + std::to_string(color.Width) + "x" + std::to_string(color.Height) + ".");
+    return true;
 }
 
 bool EnsureRightEyeDepth(IDirect3DDevice9* device) {
@@ -125,11 +148,6 @@ bool CreateStereoResources(IDirect3DDevice9* device) {
         ReleaseStereoResources();
         return false;
     }
-    if (FAILED(device->CreateRenderTarget(color.Width, color.Height, color.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &g_stereo.rightColor, nullptr))) {
-        tmoxr::log::Warn("Native stereo unavailable: could not allocate a right-eye color target.");
-        ReleaseStereoResources();
-        return false;
-    }
     g_stereo.activeColor = g_stereo.leftColor;
     g_stereo.activeDepth = g_stereo.leftDepth;
     if (!EnsureRightEyeDepth(device)) {
@@ -137,14 +155,12 @@ bool CreateStereoResources(IDirect3DDevice9* device) {
         return false;
     }
     g_stereo.ready = true;
-    tmoxr::VrBridge::Instance().SetRightEyeSurface(g_stereo.rightColor);
-    tmoxr::log::Info("Experimental native stereo targets allocated: " + std::to_string(color.Width) + "x" + std::to_string(color.Height) + ".");
+    tmoxr::log::Info("Experimental native stereo resources initialized: " + std::to_string(color.Width) + "x" + std::to_string(color.Height) + ".");
     return true;
 }
 
 bool CanReplayStereoDraw(IDirect3DDevice9* device) {
-    return g_stereo.ready && g_stereo.perspective && g_stereo.activeColor == g_stereo.leftColor &&
-        EnsureRightEyeDepth(device);
+    return g_stereo.ready && g_stereo.perspective && EnsureRightEyeColor(device) && EnsureRightEyeDepth(device);
 }
 
 void SetEyeProjection(IDirect3DDevice9* device, float eyeOffsetMeters) {
@@ -171,7 +187,7 @@ void BeginRightEye(IDirect3DDevice9* device) {
 void RestoreGameEye(IDirect3DDevice9* device) {
     g_originalSetTransform(device, D3DTS_PROJECTION, &g_stereo.projection);
     g_originalSetDepthStencilSurface(device, nullptr);
-    g_originalSetRenderTarget(device, 0, g_stereo.leftColor);
+    g_originalSetRenderTarget(device, 0, g_stereo.activeColor);
     g_originalSetDepthStencilSurface(device, g_stereo.leftDepth);
 }
 
@@ -263,14 +279,14 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3D
 
 HRESULT STDMETHODCALLTYPE ClearHook(IDirect3DDevice9* device, DWORD count, const D3DRECT* rects, DWORD flags, D3DCOLOR color, float z, DWORD stencil) {
     const HRESULT left = g_originalClear(device, count, rects, flags, color, z, stencil);
-    if (g_stereo.ready && g_stereo.activeColor == g_stereo.leftColor && EnsureRightEyeDepth(device) &&
+    if (g_stereo.ready && EnsureRightEyeColor(device) && EnsureRightEyeDepth(device) &&
         (!g_stereo.perspectivePassSeen || g_stereo.perspective)) {
         g_originalSetDepthStencilSurface(device, nullptr);
         g_originalSetRenderTarget(device, 0, g_stereo.rightColor);
         g_originalSetDepthStencilSurface(device, g_stereo.rightDepth);
         g_originalClear(device, count, rects, flags, color, z, stencil);
         g_originalSetDepthStencilSurface(device, nullptr);
-        g_originalSetRenderTarget(device, 0, g_stereo.leftColor);
+        g_originalSetRenderTarget(device, 0, g_stereo.activeColor);
         g_originalSetDepthStencilSurface(device, g_stereo.leftDepth);
     }
     return left;
