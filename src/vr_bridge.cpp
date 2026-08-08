@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -94,6 +95,8 @@ struct VrBridge::Impl {
     uint32_t leftSourceSamples = 0;
     uint32_t rightSourceSamples = 0;
     uint64_t frames = 0;
+    uint64_t diagnosticStartFrame = 0;
+    std::chrono::steady_clock::time_point diagnosticStartTime = std::chrono::steady_clock::now();
     uint32_t viewTransformsThisFrame = 0;
     uint32_t projectionTransformsThisFrame = 0;
     uint32_t perspectiveProjectionsThisFrame = 0;
@@ -118,7 +121,22 @@ struct VrBridge::Impl {
     D3DSURFACE_DESC perspectiveTarget{};
     bool haveActiveTarget = false;
     bool havePerspectiveTarget = false;
+    XrFrameState activeFrameState{XR_TYPE_FRAME_STATE};
+    std::vector<XrView> activeViews;
+    bool frameBegun = false;
+    bool activeViewsLocated = false;
     std::mutex mutex;
+
+    void EndActiveFrameWithoutLayers() {
+        if (!frameBegun || !endFrame) return;
+        XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
+        end.displayTime = activeFrameState.predictedDisplayTime;
+        end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        endFrame(session, &end);
+        frameBegun = false;
+        activeViewsLocated = false;
+        activeViews.clear();
+    }
 
     static XrQuaternionf Normalize(const XrQuaternionf& value) {
         const float length = std::sqrt(value.x * value.x + value.y * value.y + value.z * value.z + value.w * value.w);
@@ -212,6 +230,7 @@ struct VrBridge::Impl {
     }
 
     void DestroyOpenXR() {
+        EndActiveFrameWithoutLayers();
         DestroySwapchains();
         if (space != XR_NULL_HANDLE && destroySpace) destroySpace(space);
         space = XR_NULL_HANDLE;
@@ -234,6 +253,7 @@ struct VrBridge::Impl {
         haveBaseHeadPose = false;
         haveHeadPose = false;
         haveRenderConfiguration = false;
+        activeFrameState = XrFrameState{XR_TYPE_FRAME_STATE};
     }
 
     bool LoadFunctions() {
@@ -426,6 +446,7 @@ struct VrBridge::Impl {
                     begin.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
                     sessionRunning = Check(beginSession(session, &begin), "xrBeginSession");
                 } else if (changed->state == XR_SESSION_STATE_STOPPING) {
+                    EndActiveFrameWithoutLayers();
                     endSession(session);
                     sessionRunning = false;
                 } else if (changed->state == XR_SESSION_STATE_EXITING || changed->state == XR_SESSION_STATE_LOSS_PENDING) {
@@ -437,9 +458,42 @@ struct VrBridge::Impl {
         }
     }
 
+    void BeginRenderFrame() {
+        if (frameBegun) return;
+        if (!Initialize()) return;
+        PollEvents();
+        if (!sessionRunning) return;
+        XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
+        activeFrameState = XrFrameState{XR_TYPE_FRAME_STATE};
+        if (!Check(waitFrame(session, &waitInfo, &activeFrameState), "xrWaitFrame")) return;
+        XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};
+        if (!Check(beginFrame(session, &begin), "xrBeginFrame")) return;
+        frameBegun = true;
+        activeViewsLocated = false;
+        activeViews.assign(swapchains.size(), XrView{XR_TYPE_VIEW});
+        if (!activeFrameState.shouldRender) return;
+        XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
+        locate.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        locate.displayTime = activeFrameState.predictedDisplayTime;
+        locate.space = space;
+        XrViewState viewState{XR_TYPE_VIEW_STATE};
+        uint32_t viewCount = 0;
+        if (Check(locateViews(session, &locate, &viewState, static_cast<uint32_t>(activeViews.size()),
+                              &viewCount, activeViews.data()), "xrLocateViews") &&
+            viewCount == swapchains.size()) {
+            activeViewsLocated = true;
+            UpdateHeadPose(activeViews, viewState.viewStateFlags);
+            UpdateRenderConfiguration(activeViews);
+        }
+    }
+
     void Present() {
         ++frames;
         if (frames % 180 == 0) {
+            const auto diagnosticNow = std::chrono::steady_clock::now();
+            const double diagnosticSeconds = std::chrono::duration<double>(diagnosticNow - diagnosticStartTime).count();
+            const double applicationRate = diagnosticSeconds > 0.0 ?
+                static_cast<double>(frames - diagnosticStartFrame) / diagnosticSeconds : 0.0;
             log::Info("Stereo diagnostic: fixed-function transforms in last frame: view=" +
                 std::to_string(viewTransformsThisFrame) + ", projection=" + std::to_string(projectionTransformsThisFrame) +
                 (haveView ? "; view translation=(" + std::to_string(latestView._41) + "," + std::to_string(latestView._42) + "," + std::to_string(latestView._43) + ")" : "") +
@@ -449,6 +503,14 @@ struct VrBridge::Impl {
                 (perspectiveProjectionsThisFrame ? "; perspective view translation=(" + std::to_string(latestPerspectiveView._41) + "," + std::to_string(latestPerspectiveView._42) + "," + std::to_string(latestPerspectiveView._43) +
                     "), projection=(" + std::to_string(latestPerspectiveProjection._11) + "," + std::to_string(latestPerspectiveProjection._22) + "," + std::to_string(latestPerspectiveProjection._33) + "," + std::to_string(latestPerspectiveProjection._34) + ")" : "") +
                 (havePerspectiveTarget ? "; perspective target=" + std::to_string(perspectiveTarget.Width) + "x" + std::to_string(perspectiveTarget.Height) + ", format=" + std::to_string(perspectiveTarget.Format) : ""));
+            if (frameBegun) {
+                log::Info("OpenXR timing: predicted display period=" +
+                    std::to_string(static_cast<double>(activeFrameState.predictedDisplayPeriod) / 1000000.0) +
+                    " ms, TrackMania Present rate=" + std::to_string(applicationRate) +
+                    " Hz; pose was located before scene rendering.");
+            }
+            diagnosticStartTime = diagnosticNow;
+            diagnosticStartFrame = frames;
         }
         viewTransformsThisFrame = 0;
         projectionTransformsThisFrame = 0;
@@ -456,29 +518,16 @@ struct VrBridge::Impl {
         perspectiveDrawsThisFrame = 0;
         perspectiveIndexedDrawsThisFrame = 0;
         havePerspectiveTarget = false;
-        if (!Initialize()) return;
-        PollEvents();
-        if (!sessionRunning) return;
-        XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
-        XrFrameState state{XR_TYPE_FRAME_STATE};
-        if (!Check(waitFrame(session, &waitInfo, &state), "xrWaitFrame")) return;
-        XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};
-        if (!Check(beginFrame(session, &begin), "xrBeginFrame")) return;
+        // BeginScene normally starts the OpenXR frame before TrackMania draws.
+        // Retain a fallback for unusual paths which present without BeginScene.
+        if (!frameBegun) BeginRenderFrame();
+        if (!frameBegun) return;
 
         std::vector<XrCompositionLayerProjectionView> projectionViews;
         XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
         const XrCompositionLayerBaseHeader* layers[] = {reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer)};
-        if (state.shouldRender) {
-            std::vector<XrView> views(swapchains.size(), XrView{XR_TYPE_VIEW});
-            XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
-            locate.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-            locate.displayTime = state.predictedDisplayTime;
-            locate.space = space;
-            XrViewState viewState{XR_TYPE_VIEW_STATE};
-            uint32_t viewCount = 0;
-            if (Check(locateViews(session, &locate, &viewState, static_cast<uint32_t>(views.size()), &viewCount, views.data()), "xrLocateViews") && viewCount == swapchains.size()) {
-                UpdateHeadPose(views, viewState.viewStateFlags);
-                UpdateRenderConfiguration(views);
+        if (activeFrameState.shouldRender && activeViewsLocated) {
+            const uint32_t viewCount = static_cast<uint32_t>(activeViews.size());
                 IDirect3DSurface9* gameBackbuffer = nullptr;
                 const HRESULT backBufferResult = device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &gameBackbuffer);
                 if (SUCCEEDED(backBufferResult)) {
@@ -541,8 +590,8 @@ struct VrBridge::Impl {
                             d3d11Context->UpdateSubresource(images[eye][imageIndex].texture, 0, nullptr, locked.pBits, locked.Pitch, 0);
                             releaseImage(swapchains[eye], &release);
                             projectionViews[eye] = XrCompositionLayerProjectionView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
-                            projectionViews[eye].pose = views[eye].pose;
-                            projectionViews[eye].fov = views[eye].fov;
+                            projectionViews[eye].pose = activeViews[eye].pose;
+                            projectionViews[eye].fov = activeViews[eye].fov;
                             projectionViews[eye].subImage.swapchain = swapchains[eye];
                             projectionViews[eye].subImage.imageRect.extent.width = static_cast<int32_t>(sourceDescription.Width);
                             projectionViews[eye].subImage.imageRect.extent.height = static_cast<int32_t>(sourceDescription.Height);
@@ -566,14 +615,16 @@ struct VrBridge::Impl {
                     log::Error("GetBackBuffer failed: HRESULT=" + std::to_string(static_cast<long>(backBufferResult)));
                     copyFailureLogged = true;
                 }
-            }
         }
         XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
-        end.displayTime = state.predictedDisplayTime;
+        end.displayTime = activeFrameState.predictedDisplayTime;
         end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
         end.layerCount = projectionViews.empty() ? 0u : 1u;
         end.layers = projectionViews.empty() ? nullptr : layers;
         Check(endFrame(session, &end), "xrEndFrame");
+        frameBegun = false;
+        activeViewsLocated = false;
+        activeViews.clear();
     }
 };
 
@@ -587,6 +638,12 @@ void VrBridge::OnDeviceCreated(IDirect3DDevice9* device, const D3DPRESENT_PARAME
     impl_->device = device;
     impl_->device->AddRef();
     impl_->present = parameters;
+}
+
+void VrBridge::OnBeginScene() {
+    if (!impl_) return;
+    std::scoped_lock lock(impl_->mutex);
+    impl_->BeginRenderFrame();
 }
 
 void VrBridge::OnBeforePresent(IDirect3DDevice9*) {

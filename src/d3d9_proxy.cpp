@@ -50,6 +50,7 @@ void LoadRealD3D9() {
 }
 
 using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
+using BeginSceneFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*);
 using ResetFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
 using SetTransformFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DTRANSFORMSTATETYPE, const D3DMATRIX*);
 using SetRenderTargetFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
@@ -66,6 +67,7 @@ struct ID3DXBuffer : public IUnknown {
 };
 using D3DXDisassembleShaderFn = HRESULT(WINAPI*)(const DWORD*, BOOL, LPCSTR, ID3DXBuffer**);
 PresentFn g_originalPresent = nullptr;
+BeginSceneFn g_originalBeginScene = nullptr;
 ResetFn g_originalReset = nullptr;
 SetTransformFn g_originalSetTransform = nullptr;
 SetRenderTargetFn g_originalSetRenderTarget = nullptr;
@@ -554,11 +556,6 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
     tmoxr::VrBridge::Instance().SetLeftEyeSurface(g_stereo.trackedLeftColor);
     tmoxr::VrBridge::Instance().SetRightEyeSurface(g_stereo.rightColor);
     tmoxr::VrBridge::Instance().OnBeforePresent(device);
-    g_stereo.haveHeadPose = tmoxr::VrBridge::Instance().GetHeadPose(g_stereo.headPose);
-    tmoxr::RenderConfiguration renderConfiguration{};
-    if (tmoxr::VrBridge::Instance().GetRenderConfiguration(renderConfiguration)) {
-        UpdateStereoRenderConfiguration(renderConfiguration);
-    }
     if (++g_stereo.presentedFrames % 180 == 0) {
         UINT likelyRegister = 0;
         uint32_t likelyCount = 0;
@@ -603,6 +600,16 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
     // intact when TrackMania subsequently clears its left-eye UI pass.
     g_stereo.perspectivePassSeen = false;
     return result;
+}
+
+HRESULT STDMETHODCALLTYPE BeginSceneHook(IDirect3DDevice9* device) {
+    tmoxr::VrBridge::Instance().OnBeginScene();
+    g_stereo.haveHeadPose = tmoxr::VrBridge::Instance().GetHeadPose(g_stereo.headPose);
+    tmoxr::RenderConfiguration renderConfiguration{};
+    if (tmoxr::VrBridge::Instance().GetRenderConfiguration(renderConfiguration)) {
+        UpdateStereoRenderConfiguration(renderConfiguration);
+    }
+    return g_originalBeginScene(device);
 }
 
 HRESULT STDMETHODCALLTYPE ResetHook(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* parameters) {
@@ -774,6 +781,7 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
     }
     g_originalReset = reinterpret_cast<ResetFn>(table[16]);
     g_originalPresent = reinterpret_cast<PresentFn>(table[17]);
+    g_originalBeginScene = reinterpret_cast<BeginSceneFn>(table[41]);
     g_originalSetTransform = reinterpret_cast<SetTransformFn>(table[44]);
     g_originalSetRenderTarget = reinterpret_cast<SetRenderTargetFn>(table[37]);
     g_originalSetDepthStencilSurface = reinterpret_cast<SetDepthStencilSurfaceFn>(table[39]);
@@ -784,6 +792,7 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
     g_originalDrawIndexedPrimitive = reinterpret_cast<DrawIndexedPrimitiveFn>(table[82]);
     table[16] = reinterpret_cast<void*>(&ResetHook);
     table[17] = reinterpret_cast<void*>(&PresentHook);
+    table[41] = reinterpret_cast<void*>(&BeginSceneHook);
     table[44] = reinterpret_cast<void*>(&SetTransformHook);
     table[37] = reinterpret_cast<void*>(&SetRenderTargetHook);
     table[39] = reinterpret_cast<void*>(&SetDepthStencilSurfaceHook);
@@ -795,7 +804,7 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
     DWORD ignored = 0;
     VirtualProtect(&table[16], sizeof(void*) * 79, oldProtect, &ignored);
     FlushInstructionCache(GetCurrentProcess(), &table[16], sizeof(void*) * 79);
-    tmoxr::log::Info("Installed D3D9 Present/Reset/transform/render-pass diagnostic hooks.");
+    tmoxr::log::Info("Installed D3D9 BeginScene/Present/Reset/transform/render-pass hooks.");
     return true;
 }
 
@@ -826,7 +835,9 @@ public:
     HRESULT STDMETHODCALLTYPE CreateDevice(UINT a,D3DDEVTYPE type,HWND window,DWORD flags,D3DPRESENT_PARAMETERS* parameters,IDirect3DDevice9** device) override {
         const HRESULT result = real_->CreateDevice(a,type,window,flags,parameters,device);
         if (SUCCEEDED(result) && device && *device) {
-            tmoxr::log::Info("D3D9 device created: " + std::to_string(parameters->BackBufferWidth) + "x" + std::to_string(parameters->BackBufferHeight));
+            tmoxr::log::Info("D3D9 device created: " + std::to_string(parameters->BackBufferWidth) + "x" +
+                std::to_string(parameters->BackBufferHeight) + ", windowed=" + std::to_string(parameters->Windowed != FALSE) +
+                ", presentation interval=" + std::to_string(parameters->PresentationInterval) + ".");
             if (InstallDeviceHooks(*device)) {
                 tmoxr::VrBridge::Instance().OnDeviceCreated(*device, *parameters);
                 CreateStereoResources(*device);
