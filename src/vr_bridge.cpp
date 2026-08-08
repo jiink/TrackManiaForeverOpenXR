@@ -104,6 +104,8 @@ struct VrBridge::Impl {
     D3DMATRIX latestPerspectiveProjection{};
     bool haveView = false;
     bool haveProjection = false;
+    bool haveGameFov = false;
+    XrFovf gameFov{};
     bool perspectiveProjectionActive = false;
     D3DSURFACE_DESC activeTarget{};
     D3DSURFACE_DESC perspectiveTarget{};
@@ -428,7 +430,7 @@ struct VrBridge::Impl {
                             releaseImage(swapchains[eye], &release);
                             projectionViews[eye] = XrCompositionLayerProjectionView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
                             projectionViews[eye].pose = views[eye].pose;
-                            projectionViews[eye].fov = views[eye].fov;
+                            projectionViews[eye].fov = haveGameFov ? gameFov : views[eye].fov;
                             projectionViews[eye].subImage.swapchain = swapchains[eye];
                             projectionViews[eye].subImage.imageRect.extent.width = static_cast<int32_t>(sourceWidth);
                             projectionViews[eye].subImage.imageRect.extent.height = static_cast<int32_t>(sourceHeight);
@@ -509,6 +511,19 @@ void VrBridge::OnTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX& matrix)
             impl_->perspectiveProjectionActive = false;
         }
     }
+}
+
+void VrBridge::OnGameProjection(const D3DMATRIX& matrix) {
+    if (!impl_) return;
+    std::scoped_lock lock(impl_->mutex);
+    if (std::abs(matrix._11) < 0.001f || std::abs(matrix._22) < 0.001f) return;
+    const float horizontalHalfAngle = std::atan(1.0f / std::abs(matrix._11));
+    const float verticalHalfAngle = std::atan(1.0f / std::abs(matrix._22));
+    impl_->gameFov.angleLeft = -horizontalHalfAngle;
+    impl_->gameFov.angleRight = horizontalHalfAngle;
+    impl_->gameFov.angleDown = -verticalHalfAngle;
+    impl_->gameFov.angleUp = verticalHalfAngle;
+    impl_->haveGameFov = true;
 }
 
 void VrBridge::SetRightEyeSurface(IDirect3DSurface9* surface) {

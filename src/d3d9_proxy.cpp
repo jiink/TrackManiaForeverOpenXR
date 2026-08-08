@@ -301,7 +301,10 @@ HRESULT STDMETHODCALLTYPE SetTransformHook(IDirect3DDevice9* device, D3DTRANSFOR
     if (state == D3DTS_PROJECTION && matrix) {
         g_stereo.projection = *matrix;
         g_stereo.perspective = std::abs(matrix->_34) > 0.5f;
-        if (g_stereo.perspective) g_stereo.perspectivePassSeen = true;
+        if (g_stereo.perspective) {
+            g_stereo.perspectivePassSeen = true;
+            tmoxr::VrBridge::Instance().OnGameProjection(*matrix);
+        }
     }
     return g_originalSetTransform(device, state, matrix);
 }
