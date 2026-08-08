@@ -15,6 +15,7 @@
 #include <array>
 #include <cmath>
 #include <filesystem>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -57,6 +58,12 @@ using SetDepthStencilSurfaceFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, 
 using ClearFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, DWORD, const D3DRECT*, DWORD, D3DCOLOR, float, DWORD);
 using SetVertexShaderFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, IDirect3DVertexShader9*);
 using SetVertexShaderConstantFFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, UINT, const float*, UINT);
+
+struct ID3DXBuffer : public IUnknown {
+    virtual LPVOID STDMETHODCALLTYPE GetBufferPointer() = 0;
+    virtual DWORD STDMETHODCALLTYPE GetBufferSize() = 0;
+};
+using D3DXDisassembleShaderFn = HRESULT(WINAPI*)(const DWORD*, BOOL, LPCSTR, ID3DXBuffer**);
 PresentFn g_originalPresent = nullptr;
 ResetFn g_originalReset = nullptr;
 SetTransformFn g_originalSetTransform = nullptr;
@@ -94,6 +101,7 @@ struct StereoResources {
     bool customVertexShaderBound = false;
     IDirect3DVertexShader9* vertexShader = nullptr;
     IDirect3DVertexShader9* projectionShader = nullptr;
+    std::vector<IDirect3DVertexShader9*> analyzedShaders;
     std::array<float, 16> shaderProjection{};
     bool shaderProjectionValid = false;
     bool shaderProjectionLogWritten = false;
@@ -249,6 +257,42 @@ void RestoreGameEye(IDirect3DDevice9* device) {
     g_originalSetDepthStencilSurface(device, g_stereo.leftDepth);
 }
 
+void AnalyzeVertexShader(IDirect3DVertexShader9* shader) {
+    if (!shader || std::find(g_stereo.analyzedShaders.begin(), g_stereo.analyzedShaders.end(), shader) != g_stereo.analyzedShaders.end()) return;
+    if (g_stereo.analyzedShaders.size() >= 16) return;
+    g_stereo.analyzedShaders.push_back(shader);
+
+    UINT byteCount = 0;
+    if (FAILED(shader->GetFunction(nullptr, &byteCount)) || byteCount == 0) return;
+    std::vector<DWORD> bytecode((byteCount + sizeof(DWORD) - 1) / sizeof(DWORD));
+    if (FAILED(shader->GetFunction(bytecode.data(), &byteCount))) return;
+
+    HMODULE d3dx = GetModuleHandleW(L"d3dx9_30.dll");
+    if (!d3dx) d3dx = LoadLibraryW(L"d3dx9_30.dll");
+    const auto disassemble = d3dx ? reinterpret_cast<D3DXDisassembleShaderFn>(GetProcAddress(d3dx, "D3DXDisassembleShader")) : nullptr;
+    if (!disassemble) {
+        tmoxr::log::Warn("D3DXDisassembleShader is unavailable; shader camera registers cannot be inspected.");
+        return;
+    }
+
+    ID3DXBuffer* output = nullptr;
+    if (FAILED(disassemble(bytecode.data(), FALSE, nullptr, &output)) || !output) return;
+    const std::string disassembly(static_cast<const char*>(output->GetBufferPointer()), output->GetBufferSize());
+    output->Release();
+
+    std::istringstream lines(disassembly);
+    std::string line;
+    std::string matrixInstructions;
+    while (std::getline(lines, line)) {
+        if (line.find("m4x") == std::string::npos && line.find("dp4") == std::string::npos) continue;
+        if (!matrixInstructions.empty()) matrixInstructions += " | ";
+        matrixInstructions += line;
+        if (matrixInstructions.size() >= 900) break;
+    }
+    tmoxr::log::Info("Perspective scene vertex shader matrix instructions: " +
+        (matrixInstructions.empty() ? std::string("none") : matrixInstructions));
+}
+
 HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* source, const RECT* destination,
                                       HWND window, const RGNDATA* dirtyRegion) {
     tmoxr::VrBridge::Instance().SetRightEyeSurface(g_stereo.rightColor);
@@ -366,6 +410,7 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITI
         if (g_stereo.customVertexShaderBound) ++g_stereo.shaderPerspectiveCandidates;
     }
     if (!CanReplayStereoDraw(device)) return g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
+    AnalyzeVertexShader(g_stereo.vertexShader);
     ++g_stereo.replayedDraws;
     SetEyeProjection(device, -0.032f);
     SetShaderEyeProjection(device, -0.032f);
@@ -388,6 +433,7 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3D
         if (g_stereo.customVertexShaderBound) ++g_stereo.shaderPerspectiveCandidates;
     }
     if (!CanReplayStereoDraw(device)) return g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
+    AnalyzeVertexShader(g_stereo.vertexShader);
     ++g_stereo.replayedDraws;
     SetEyeProjection(device, -0.032f);
     SetShaderEyeProjection(device, -0.032f);
