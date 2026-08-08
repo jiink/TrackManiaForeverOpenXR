@@ -105,6 +105,9 @@ struct StereoResources {
     std::array<uint32_t, 256> perspectiveMatrixCandidates{};
     std::array<bool, 256> perspectiveMatrixTransposed{};
     uint32_t replayedDraws = 0;
+    uint32_t transformedDraws = 0;
+    uint32_t untransformedShaderDraws = 0;
+    uint32_t fixedFunctionDraws = 0;
     uint64_t presentedFrames = 0;
     bool customVertexShaderBound = false;
     IDirect3DVertexShader9* vertexShader = nullptr;
@@ -293,13 +296,13 @@ Matrix4 HeadViewMatrix(float eyeOffsetMeters) {
     const float y = g_stereo.haveHeadPose ? g_stereo.headPose.orientation[1] : 0.0f;
     const float z = g_stereo.haveHeadPose ? g_stereo.headPose.orientation[2] : 0.0f;
     const float w = g_stereo.haveHeadPose ? g_stereo.headPose.orientation[3] : 1.0f;
-    // OpenXR is right-handed with -Z forward. Reflecting its rotation through Z
-    // produces TrackMania's D3D left-handed camera rotation.
+    // TrackMania's camera constants use a downward Y basis. Reflecting OpenXR
+    // through Y preserves pitch while correcting yaw and roll handedness.
     const float rightHanded[3][3] = {
         {1.0f - 2.0f * (y * y + z * z), 2.0f * (x * y - z * w), 2.0f * (x * z + y * w)},
         {2.0f * (x * y + z * w), 1.0f - 2.0f * (x * x + z * z), 2.0f * (y * z - x * w)},
         {2.0f * (x * z - y * w), 2.0f * (y * z + x * w), 1.0f - 2.0f * (x * x + y * y)}};
-    constexpr float reflection[3] = {1.0f, 1.0f, -1.0f};
+    constexpr float reflection[3] = {1.0f, -1.0f, 1.0f};
     float rotation[3][3]{};
     for (UINT row = 0; row < 3; ++row) {
         for (UINT column = 0; column < 3; ++column) {
@@ -308,8 +311,8 @@ Matrix4 HeadViewMatrix(float eyeOffsetMeters) {
     }
     float cameraPosition[3] = {
         g_stereo.haveHeadPose ? g_stereo.headPose.position[0] : 0.0f,
-        g_stereo.haveHeadPose ? g_stereo.headPose.position[1] : 0.0f,
-        g_stereo.haveHeadPose ? -g_stereo.headPose.position[2] : 0.0f};
+        g_stereo.haveHeadPose ? -g_stereo.headPose.position[1] : 0.0f,
+        g_stereo.haveHeadPose ? g_stereo.headPose.position[2] : 0.0f};
     // The eye offset is local to the headset and therefore rotates with it.
     for (UINT row = 0; row < 3; ++row) cameraPosition[row] += rotation[row][0] * eyeOffsetMeters;
 
@@ -419,7 +422,16 @@ void RestoreGameEye(IDirect3DDevice9* device) {
 
 void AnalyzeVertexShader(IDirect3DVertexShader9* shader) {
     if (!shader || std::find(g_stereo.analyzedShaders.begin(), g_stereo.analyzedShaders.end(), shader) != g_stereo.analyzedShaders.end()) return;
-    if (g_stereo.analyzedShaders.size() >= 16) return;
+    // TrackMania uses many material variants for the same scene. Every distinct
+    // vertex shader must be inspected or those materials remain head-locked.
+    if (g_stereo.analyzedShaders.size() >= 256) {
+        static bool capacityWarningWritten = false;
+        if (!capacityWarningWritten) {
+            capacityWarningWritten = true;
+            tmoxr::log::Warn("Vertex-shader camera analysis reached its 256-shader safety limit.");
+        }
+        return;
+    }
     g_stereo.analyzedShaders.push_back(shader);
 
     UINT byteCount = 0;
@@ -458,8 +470,10 @@ void AnalyzeVertexShader(IDirect3DVertexShader9* shader) {
         matrixInstructions += line;
         if (matrixInstructions.size() >= 900) break;
     }
-    tmoxr::log::Info("Perspective scene vertex shader matrix instructions: " +
-        (matrixInstructions.empty() ? std::string("none") : matrixInstructions));
+    if (g_stereo.analyzedShaders.size() <= 32) {
+        tmoxr::log::Info("Perspective scene vertex shader matrix instructions: " +
+            (matrixInstructions.empty() ? std::string("none") : matrixInstructions));
+    }
 }
 
 HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* source, const RECT* destination,
@@ -483,7 +497,12 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
             " (last c" + std::to_string(g_stereo.lastProjectionConstantRegister) + ")" +
             ", likely shader projection=c" + std::to_string(likelyRegister) + " (uploads=" + std::to_string(likelyCount) +
             ", transposed=" + std::to_string(g_stereo.perspectiveMatrixTransposed[likelyRegister]) + ")" +
-            ", replayed=" + std::to_string(g_stereo.replayedDraws) + ".");
+            ", replayed=" + std::to_string(g_stereo.replayedDraws) +
+            ", camera-transformed=" + std::to_string(g_stereo.transformedDraws) +
+            ", unmapped-shader=" + std::to_string(g_stereo.untransformedShaderDraws) +
+            ", fixed-function=" + std::to_string(g_stereo.fixedFunctionDraws) +
+            ", shaders analyzed/mapped=" + std::to_string(g_stereo.analyzedShaders.size()) + "/" +
+            std::to_string(g_stereo.shaderPositionInfo.size()) + ".");
         if (g_stereo.haveHeadPose) {
             tmoxr::log::Info("Tracked camera pose sample " + std::to_string(g_stereo.headPose.sample) +
                 ": position=(" + std::to_string(g_stereo.headPose.position[0]) + "," +
@@ -498,6 +517,9 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
         g_stereo.perspectiveMatrixCandidates.fill(0);
         g_stereo.perspectiveMatrixTransposed.fill(false);
         g_stereo.replayedDraws = 0;
+        g_stereo.transformedDraws = 0;
+        g_stereo.untransformedShaderDraws = 0;
+        g_stereo.fixedFunctionDraws = 0;
     }
     const HRESULT result = g_originalPresent(device, source, destination, window, dirtyRegion);
     // The next clear starts a new frame. Keep the completed right-eye 3D scene
@@ -591,6 +613,9 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITI
     AnalyzeVertexShader(g_stereo.vertexShader);
     const ShaderEyeState shaderEye = CaptureShaderEyeState(device);
     ++g_stereo.replayedDraws;
+    if (shaderEye.active) ++g_stereo.transformedDraws;
+    else if (g_stereo.vertexShader) ++g_stereo.untransformedShaderDraws;
+    else ++g_stereo.fixedFunctionDraws;
     const HRESULT game = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
     BeginTrackedEye(device, false);
     ApplyShaderEyeState(device, shaderEye, 0.0f);
@@ -618,6 +643,9 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3D
     AnalyzeVertexShader(g_stereo.vertexShader);
     const ShaderEyeState shaderEye = CaptureShaderEyeState(device);
     ++g_stereo.replayedDraws;
+    if (shaderEye.active) ++g_stereo.transformedDraws;
+    else if (g_stereo.vertexShader) ++g_stereo.untransformedShaderDraws;
+    else ++g_stereo.fixedFunctionDraws;
     const HRESULT game = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
     BeginTrackedEye(device, false);
     ApplyShaderEyeState(device, shaderEye, 0.0f);

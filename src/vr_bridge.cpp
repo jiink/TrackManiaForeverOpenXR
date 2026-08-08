@@ -149,7 +149,9 @@ struct VrBridge::Impl {
     }
 
     void UpdateHeadPose(const std::vector<XrView>& views, XrViewStateFlags flags) {
-        if (views.size() < 2 || !(flags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) return;
+        constexpr XrViewStateFlags requiredTracking =
+            XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
+        if (views.size() < 2 || (flags & requiredTracking) != requiredTracking) return;
         XrPosef center = views[0].pose;
         center.orientation = Normalize(center.orientation);
         center.position.x = (views[0].pose.position.x + views[1].pose.position.x) * 0.5f;
@@ -162,13 +164,10 @@ struct VrBridge::Impl {
         }
         const XrQuaternionf inverseBase = Conjugate(baseHeadPose.orientation);
         const XrQuaternionf relativeOrientation = Multiply(inverseBase, center.orientation);
-        XrVector3f relativePosition{};
-        if (flags & XR_VIEW_STATE_POSITION_VALID_BIT) {
-            const XrVector3f delta{center.position.x - baseHeadPose.position.x,
-                                  center.position.y - baseHeadPose.position.y,
-                                  center.position.z - baseHeadPose.position.z};
-            relativePosition = Rotate(inverseBase, delta);
-        }
+        const XrVector3f delta{center.position.x - baseHeadPose.position.x,
+                              center.position.y - baseHeadPose.position.y,
+                              center.position.z - baseHeadPose.position.z};
+        const XrVector3f relativePosition = Rotate(inverseBase, delta);
         headPose.position[0] = relativePosition.x;
         headPose.position[1] = relativePosition.y;
         headPose.position[2] = relativePosition.z;
