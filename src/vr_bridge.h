@@ -1,8 +1,15 @@
 #pragma once
 
 #include <d3d9.h>
+#include <cstdint>
 
 namespace tmoxr {
+struct HeadPose {
+    float position[3]{};
+    float orientation[4]{0.0f, 0.0f, 0.0f, 1.0f};
+    uint64_t sample = 0;
+};
+
 class VrBridge {
 public:
     static VrBridge& Instance();
@@ -13,7 +20,9 @@ public:
     void OnGameProjection(const D3DMATRIX& matrix);
     void OnRenderTarget(IDirect3DSurface9* surface);
     void OnDraw(bool indexed);
+    void SetLeftEyeSurface(IDirect3DSurface9* surface);
     void SetRightEyeSurface(IDirect3DSurface9* surface);
+    bool GetHeadPose(HeadPose& pose);
     void Shutdown();
 
 private:

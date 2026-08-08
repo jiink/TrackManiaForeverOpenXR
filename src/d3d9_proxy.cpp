@@ -78,17 +78,23 @@ SetVertexShaderConstantFFn g_originalSetVertexShaderConstantF = nullptr;
 std::atomic<bool> g_hooked = false;
 
 struct StereoResources {
-    struct ColorPair { IDirect3DSurface9* source; IDirect3DSurface9* right; };
+    struct ColorPair { IDirect3DSurface9* source; IDirect3DSurface9* left; IDirect3DSurface9* right; };
     struct ShaderPositionInfo { IDirect3DVertexShader9* shader; UINT baseRegister; };
     IDirect3DSurface9* leftColor = nullptr;
     IDirect3DSurface9* leftDepth = nullptr;
     IDirect3DSurface9* depthSource = nullptr;
+    IDirect3DSurface9* trackedLeftColor = nullptr;
+    IDirect3DSurface9* trackedLeftDepth = nullptr;
     IDirect3DSurface9* rightColor = nullptr;
     IDirect3DSurface9* rightDepth = nullptr;
     std::vector<ColorPair> colorPairs;
     IDirect3DSurface9* activeColor = nullptr;
     IDirect3DSurface9* activeDepth = nullptr;
     D3DMATRIX projection{};
+    D3DMATRIX view{};
+    tmoxr::HeadPose headPose{};
+    bool haveView = false;
+    bool haveHeadPose = false;
     bool perspective = false;
     bool perspectivePassSeen = false;
     bool rightDrawFailureLogged = false;
@@ -112,20 +118,23 @@ struct StereoResources {
 } g_stereo;
 
 void ReleaseStereoResources() {
+    tmoxr::VrBridge::Instance().SetLeftEyeSurface(nullptr);
     tmoxr::VrBridge::Instance().SetRightEyeSurface(nullptr);
     for (auto& pair : g_stereo.colorPairs) {
         pair.source->Release();
+        pair.left->Release();
         pair.right->Release();
     }
     g_stereo.colorPairs.clear();
-    for (auto** resource : {&g_stereo.leftColor, &g_stereo.leftDepth, &g_stereo.depthSource, &g_stereo.rightDepth}) {
+    for (auto** resource : {&g_stereo.leftColor, &g_stereo.leftDepth, &g_stereo.depthSource,
+                            &g_stereo.trackedLeftDepth, &g_stereo.rightDepth}) {
         if (*resource) (*resource)->Release();
         *resource = nullptr;
     }
     g_stereo = {};
 }
 
-bool EnsureRightEyeColor(IDirect3DDevice9* device) {
+bool EnsureStereoEyeColor(IDirect3DDevice9* device) {
     if (!g_stereo.activeColor) return false;
     D3DSURFACE_DESC color{};
     if (FAILED(g_stereo.activeColor->GetDesc(&color))) return false;
@@ -134,6 +143,7 @@ bool EnsureRightEyeColor(IDirect3DDevice9* device) {
     if (color.Width != g_stereo.primaryWidth || color.Height != g_stereo.primaryHeight || color.Format != g_stereo.primaryFormat) return false;
     for (const auto& pair : g_stereo.colorPairs) {
         if (pair.source == g_stereo.activeColor) {
+            g_stereo.trackedLeftColor = pair.left;
             g_stereo.rightColor = pair.right;
             return true;
         }
@@ -142,37 +152,47 @@ bool EnsureRightEyeColor(IDirect3DDevice9* device) {
         tmoxr::log::Warn("Native stereo skipped: scene color-target cache is full.");
         return false;
     }
+    IDirect3DSurface9* left = nullptr;
     IDirect3DSurface9* right = nullptr;
-    if (
+    if (FAILED(device->CreateRenderTarget(color.Width, color.Height, color.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &left, nullptr)) ||
         FAILED(device->CreateRenderTarget(color.Width, color.Height, color.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &right, nullptr))) {
-        tmoxr::log::Warn("Native stereo skipped: could not mirror the currently bound scene color target.");
+        if (left) left->Release();
+        if (right) right->Release();
+        tmoxr::log::Warn("Native stereo skipped: could not allocate private eye color targets.");
         return false;
     }
     g_stereo.activeColor->AddRef();
-    g_stereo.colorPairs.push_back({g_stereo.activeColor, right});
+    g_stereo.colorPairs.push_back({g_stereo.activeColor, left, right});
+    g_stereo.trackedLeftColor = left;
     g_stereo.rightColor = right;
-    tmoxr::log::Info("Allocated right-eye color surface for active scene pass: " + std::to_string(color.Width) + "x" + std::to_string(color.Height) + ".");
+    tmoxr::log::Info("Allocated private tracked stereo color targets for active scene pass: " +
+        std::to_string(color.Width) + "x" + std::to_string(color.Height) + ".");
     return true;
 }
 
-bool EnsureRightEyeDepth(IDirect3DDevice9* device) {
+bool EnsureStereoEyeDepth(IDirect3DDevice9* device) {
     if (!g_stereo.activeDepth) return false;
-    if (g_stereo.depthSource == g_stereo.activeDepth && g_stereo.rightDepth) return true;
+    if (g_stereo.depthSource == g_stereo.activeDepth && g_stereo.trackedLeftDepth && g_stereo.rightDepth) return true;
     if (g_stereo.depthSource) g_stereo.depthSource->Release();
     if (g_stereo.rightDepth) g_stereo.rightDepth->Release();
+    if (g_stereo.trackedLeftDepth) g_stereo.trackedLeftDepth->Release();
     g_stereo.depthSource = nullptr;
     g_stereo.rightDepth = nullptr;
+    g_stereo.trackedLeftDepth = nullptr;
     D3DSURFACE_DESC depth{};
     if (FAILED(g_stereo.activeDepth->GetDesc(&depth)) ||
+        FAILED(device->CreateDepthStencilSurface(depth.Width, depth.Height, depth.Format, D3DMULTISAMPLE_NONE, 0, TRUE, &g_stereo.trackedLeftDepth, nullptr)) ||
         FAILED(device->CreateDepthStencilSurface(depth.Width, depth.Height, depth.Format, D3DMULTISAMPLE_NONE, 0, TRUE, &g_stereo.rightDepth, nullptr))) {
-        tmoxr::log::Warn("Native stereo skipped: could not mirror the currently bound scene depth surface.");
+        tmoxr::log::Warn("Native stereo skipped: could not allocate private eye depth surfaces.");
+        if (g_stereo.trackedLeftDepth) g_stereo.trackedLeftDepth->Release();
         if (g_stereo.rightDepth) g_stereo.rightDepth->Release();
+        g_stereo.trackedLeftDepth = nullptr;
         g_stereo.rightDepth = nullptr;
         return false;
     }
     g_stereo.activeDepth->AddRef();
     g_stereo.depthSource = g_stereo.activeDepth;
-    tmoxr::log::Info("Allocated right-eye depth surface for active scene pass: " + std::to_string(depth.Width) + "x" + std::to_string(depth.Height) + ".");
+    tmoxr::log::Info("Allocated private tracked stereo depth surfaces: " + std::to_string(depth.Width) + "x" + std::to_string(depth.Height) + ".");
     return true;
 }
 
@@ -196,7 +216,7 @@ bool CreateStereoResources(IDirect3DDevice9* device) {
     g_stereo.primaryWidth = color.Width;
     g_stereo.primaryHeight = color.Height;
     g_stereo.primaryFormat = color.Format;
-    if (!EnsureRightEyeDepth(device)) {
+    if (!EnsureStereoEyeDepth(device)) {
         ReleaseStereoResources();
         return false;
     }
@@ -206,15 +226,139 @@ bool CreateStereoResources(IDirect3DDevice9* device) {
 }
 
 bool CanReplayStereoDraw(IDirect3DDevice9* device) {
-    return g_stereo.ready && g_stereo.perspective && EnsureRightEyeColor(device) && EnsureRightEyeDepth(device);
+    return g_stereo.ready && g_stereo.perspective && EnsureStereoEyeColor(device) && EnsureStereoEyeDepth(device);
 }
 
-void SetEyeProjection(IDirect3DDevice9* device, float eyeOffsetMeters) {
-    D3DMATRIX projection = g_stereo.projection;
-    // TrackMania submits camera-space vertices, so shifting the projection's
-    // fourth row creates the correct depth-dependent parallax for an eye offset.
-    projection._41 += -eyeOffsetMeters * projection._11;
-    g_originalSetTransform(device, D3DTS_PROJECTION, &projection);
+using Matrix4 = std::array<float, 16>;
+
+Matrix4 IdentityMatrix() {
+    return {1.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 1.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 1.0f};
+}
+
+Matrix4 MultiplyMatrix(const Matrix4& a, const Matrix4& b) {
+    Matrix4 result{};
+    for (UINT row = 0; row < 4; ++row) {
+        for (UINT column = 0; column < 4; ++column) {
+            for (UINT inner = 0; inner < 4; ++inner) {
+                result[row * 4 + column] += a[row * 4 + inner] * b[inner * 4 + column];
+            }
+        }
+    }
+    return result;
+}
+
+bool InvertMatrix(const Matrix4& input, Matrix4& inverse) {
+    float augmented[4][8]{};
+    for (UINT row = 0; row < 4; ++row) {
+        for (UINT column = 0; column < 4; ++column) augmented[row][column] = input[row * 4 + column];
+        augmented[row][row + 4] = 1.0f;
+    }
+    for (UINT column = 0; column < 4; ++column) {
+        UINT pivot = column;
+        for (UINT row = column + 1; row < 4; ++row) {
+            if (std::abs(augmented[row][column]) > std::abs(augmented[pivot][column])) pivot = row;
+        }
+        if (std::abs(augmented[pivot][column]) < 0.000001f) return false;
+        if (pivot != column) {
+            for (UINT item = 0; item < 8; ++item) std::swap(augmented[pivot][item], augmented[column][item]);
+        }
+        const float divisor = augmented[column][column];
+        for (UINT item = 0; item < 8; ++item) augmented[column][item] /= divisor;
+        for (UINT row = 0; row < 4; ++row) {
+            if (row == column) continue;
+            const float factor = augmented[row][column];
+            for (UINT item = 0; item < 8; ++item) augmented[row][item] -= factor * augmented[column][item];
+        }
+    }
+    for (UINT row = 0; row < 4; ++row) {
+        for (UINT column = 0; column < 4; ++column) inverse[row * 4 + column] = augmented[row][column + 4];
+    }
+    return true;
+}
+
+Matrix4 TransposedProjection() {
+    const float* source = &g_stereo.projection._11;
+    Matrix4 projection{};
+    for (UINT row = 0; row < 4; ++row) {
+        for (UINT column = 0; column < 4; ++column) projection[row * 4 + column] = source[column * 4 + row];
+    }
+    return projection;
+}
+
+Matrix4 HeadViewMatrix(float eyeOffsetMeters) {
+    const float x = g_stereo.haveHeadPose ? g_stereo.headPose.orientation[0] : 0.0f;
+    const float y = g_stereo.haveHeadPose ? g_stereo.headPose.orientation[1] : 0.0f;
+    const float z = g_stereo.haveHeadPose ? g_stereo.headPose.orientation[2] : 0.0f;
+    const float w = g_stereo.haveHeadPose ? g_stereo.headPose.orientation[3] : 1.0f;
+    // OpenXR is right-handed with -Z forward. Reflecting its rotation through Z
+    // produces TrackMania's D3D left-handed camera rotation.
+    const float rightHanded[3][3] = {
+        {1.0f - 2.0f * (y * y + z * z), 2.0f * (x * y - z * w), 2.0f * (x * z + y * w)},
+        {2.0f * (x * y + z * w), 1.0f - 2.0f * (x * x + z * z), 2.0f * (y * z - x * w)},
+        {2.0f * (x * z - y * w), 2.0f * (y * z + x * w), 1.0f - 2.0f * (x * x + y * y)}};
+    constexpr float reflection[3] = {1.0f, 1.0f, -1.0f};
+    float rotation[3][3]{};
+    for (UINT row = 0; row < 3; ++row) {
+        for (UINT column = 0; column < 3; ++column) {
+            rotation[row][column] = reflection[row] * rightHanded[row][column] * reflection[column];
+        }
+    }
+    float cameraPosition[3] = {
+        g_stereo.haveHeadPose ? g_stereo.headPose.position[0] : 0.0f,
+        g_stereo.haveHeadPose ? g_stereo.headPose.position[1] : 0.0f,
+        g_stereo.haveHeadPose ? -g_stereo.headPose.position[2] : 0.0f};
+    // The eye offset is local to the headset and therefore rotates with it.
+    for (UINT row = 0; row < 3; ++row) cameraPosition[row] += rotation[row][0] * eyeOffsetMeters;
+
+    Matrix4 view = IdentityMatrix();
+    for (UINT row = 0; row < 3; ++row) {
+        for (UINT column = 0; column < 3; ++column) view[row * 4 + column] = rotation[column][row];
+        view[row * 4 + 3] = -(rotation[0][row] * cameraPosition[0] +
+                               rotation[1][row] * cameraPosition[1] +
+                               rotation[2][row] * cameraPosition[2]);
+    }
+    return view;
+}
+
+Matrix4 ApplyHeadPoseToCombinedMatrix(const Matrix4& original, float eyeOffsetMeters) {
+    const Matrix4 projection = TransposedProjection();
+    Matrix4 inverseProjection{};
+    if (!InvertMatrix(projection, inverseProjection)) {
+        Matrix4 fallback = original;
+        fallback[3] += -eyeOffsetMeters * g_stereo.projection._11;
+        return fallback;
+    }
+    const Matrix4 clipAdjustment = MultiplyMatrix(MultiplyMatrix(projection, HeadViewMatrix(eyeOffsetMeters)), inverseProjection);
+    return MultiplyMatrix(clipAdjustment, original);
+}
+
+D3DMATRIX MultiplyD3DMatrix(const D3DMATRIX& a, const D3DMATRIX& b) {
+    D3DMATRIX result{};
+    const float* left = &a._11;
+    const float* right = &b._11;
+    float* output = &result._11;
+    for (UINT row = 0; row < 4; ++row) {
+        for (UINT column = 0; column < 4; ++column) {
+            for (UINT inner = 0; inner < 4; ++inner) output[row * 4 + column] += left[row * 4 + inner] * right[inner * 4 + column];
+        }
+    }
+    return result;
+}
+
+void SetFixedFunctionEyePose(IDirect3DDevice9* device, float eyeOffsetMeters) {
+    g_originalSetTransform(device, D3DTS_PROJECTION, &g_stereo.projection);
+    if (!g_stereo.haveView) return;
+    const Matrix4 headColumn = HeadViewMatrix(eyeOffsetMeters);
+    D3DMATRIX headRow{};
+    float* output = &headRow._11;
+    for (UINT row = 0; row < 4; ++row) {
+        for (UINT column = 0; column < 4; ++column) output[row * 4 + column] = headColumn[column * 4 + row];
+    }
+    const D3DMATRIX trackedView = MultiplyD3DMatrix(g_stereo.view, headRow);
+    g_originalSetTransform(device, D3DTS_VIEW, &trackedView);
 }
 
 struct ShaderEyeState {
@@ -237,10 +381,7 @@ ShaderEyeState CaptureShaderEyeState(IDirect3DDevice9* device) {
 
 void ApplyShaderEyeState(IDirect3DDevice9* device, const ShaderEyeState& state, float eyeOffsetMeters) {
     if (!state.active) return;
-    auto matrix = state.original;
-    // The shaders calculate oPos.x as dp4(vertex, cN). Therefore cN.w is
-    // the homogeneous clip-X translation term for the combined WVP matrix.
-    matrix[3] += -eyeOffsetMeters * g_stereo.projection._11;
+    const auto matrix = ApplyHeadPoseToCombinedMatrix(state.original, eyeOffsetMeters);
     g_originalSetVertexShaderConstantF(device, state.baseRegister, matrix.data(), 4);
     if (!g_stereo.shaderPositionLogWritten) {
         g_stereo.shaderPositionLogWritten = true;
@@ -253,23 +394,24 @@ void RestoreShaderEyeState(IDirect3DDevice9* device, const ShaderEyeState& state
     if (state.active) g_originalSetVertexShaderConstantF(device, state.baseRegister, state.original.data(), 4);
 }
 
-void BeginRightEye(IDirect3DDevice9* device) {
+void BeginTrackedEye(IDirect3DDevice9* device, bool rightEye) {
     // D3D9 validates color/depth multisample compatibility at each bind. Clear
     // the old depth surface first so a valid right-eye pair cannot be rejected.
     g_originalSetDepthStencilSurface(device, nullptr);
-    const HRESULT colorResult = g_originalSetRenderTarget(device, 0, g_stereo.rightColor);
-    const HRESULT depthResult = SUCCEEDED(colorResult) ? g_originalSetDepthStencilSurface(device, g_stereo.rightDepth) : colorResult;
+    IDirect3DSurface9* color = rightEye ? g_stereo.rightColor : g_stereo.trackedLeftColor;
+    IDirect3DSurface9* depth = rightEye ? g_stereo.rightDepth : g_stereo.trackedLeftDepth;
+    const HRESULT colorResult = g_originalSetRenderTarget(device, 0, color);
+    const HRESULT depthResult = SUCCEEDED(colorResult) ? g_originalSetDepthStencilSurface(device, depth) : colorResult;
     if (FAILED(colorResult) || FAILED(depthResult)) {
-        tmoxr::log::Error("Right-eye render-target bind failed: color HRESULT=" + std::to_string(static_cast<long>(colorResult)) +
+        tmoxr::log::Error(std::string(rightEye ? "Right" : "Left") + " tracked-eye render-target bind failed: color HRESULT=" + std::to_string(static_cast<long>(colorResult)) +
             ", depth HRESULT=" + std::to_string(static_cast<long>(depthResult)));
     }
-    // The game render is retained as the unmodified left eye. Move only the
-    // replayed eye by the full IPD so TrackMania's shadow/lighting passes remain intact.
-    SetEyeProjection(device, +0.064f);
+    SetFixedFunctionEyePose(device, rightEye ? +0.064f : 0.0f);
 }
 
 void RestoreGameEye(IDirect3DDevice9* device) {
     g_originalSetTransform(device, D3DTS_PROJECTION, &g_stereo.projection);
+    if (g_stereo.haveView) g_originalSetTransform(device, D3DTS_VIEW, &g_stereo.view);
     g_originalSetDepthStencilSurface(device, nullptr);
     g_originalSetRenderTarget(device, 0, g_stereo.activeColor);
     g_originalSetDepthStencilSurface(device, g_stereo.leftDepth);
@@ -322,8 +464,10 @@ void AnalyzeVertexShader(IDirect3DVertexShader9* shader) {
 
 HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* source, const RECT* destination,
                                       HWND window, const RGNDATA* dirtyRegion) {
+    tmoxr::VrBridge::Instance().SetLeftEyeSurface(g_stereo.trackedLeftColor);
     tmoxr::VrBridge::Instance().SetRightEyeSurface(g_stereo.rightColor);
     tmoxr::VrBridge::Instance().OnBeforePresent(device);
+    g_stereo.haveHeadPose = tmoxr::VrBridge::Instance().GetHeadPose(g_stereo.headPose);
     if (++g_stereo.presentedFrames % 180 == 0) {
         UINT likelyRegister = 0;
         uint32_t likelyCount = 0;
@@ -340,6 +484,14 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
             ", likely shader projection=c" + std::to_string(likelyRegister) + " (uploads=" + std::to_string(likelyCount) +
             ", transposed=" + std::to_string(g_stereo.perspectiveMatrixTransposed[likelyRegister]) + ")" +
             ", replayed=" + std::to_string(g_stereo.replayedDraws) + ".");
+        if (g_stereo.haveHeadPose) {
+            tmoxr::log::Info("Tracked camera pose sample " + std::to_string(g_stereo.headPose.sample) +
+                ": position=(" + std::to_string(g_stereo.headPose.position[0]) + "," +
+                std::to_string(g_stereo.headPose.position[1]) + "," + std::to_string(g_stereo.headPose.position[2]) +
+                "), orientation=(" + std::to_string(g_stereo.headPose.orientation[0]) + "," +
+                std::to_string(g_stereo.headPose.orientation[1]) + "," + std::to_string(g_stereo.headPose.orientation[2]) +
+                "," + std::to_string(g_stereo.headPose.orientation[3]) + ").");
+        }
         g_stereo.perspectiveDrawCandidates = 0;
         g_stereo.shaderPerspectiveCandidates = 0;
         g_stereo.shaderProjectionConstantMatches = 0;
@@ -377,6 +529,10 @@ HRESULT STDMETHODCALLTYPE SetTransformHook(IDirect3DDevice9* device, D3DTRANSFOR
             g_stereo.perspectivePassSeen = true;
             tmoxr::VrBridge::Instance().OnGameProjection(*matrix);
         }
+    }
+    if (state == D3DTS_VIEW && matrix) {
+        g_stereo.view = *matrix;
+        g_stereo.haveView = true;
     }
     return g_originalSetTransform(device, state, matrix);
 }
@@ -435,8 +591,11 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITI
     AnalyzeVertexShader(g_stereo.vertexShader);
     const ShaderEyeState shaderEye = CaptureShaderEyeState(device);
     ++g_stereo.replayedDraws;
+    const HRESULT game = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
+    BeginTrackedEye(device, false);
+    ApplyShaderEyeState(device, shaderEye, 0.0f);
     const HRESULT left = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
-    BeginRightEye(device);
+    BeginTrackedEye(device, true);
     ApplyShaderEyeState(device, shaderEye, +0.064f);
     const HRESULT right = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
     if (FAILED(right) && !g_stereo.rightDrawFailureLogged) {
@@ -445,7 +604,7 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITI
     }
     RestoreShaderEyeState(device, shaderEye);
     RestoreGameEye(device);
-    return left;
+    return game;
 }
 
 HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITIVETYPE type, INT baseVertex, UINT minVertex,
@@ -459,8 +618,11 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3D
     AnalyzeVertexShader(g_stereo.vertexShader);
     const ShaderEyeState shaderEye = CaptureShaderEyeState(device);
     ++g_stereo.replayedDraws;
+    const HRESULT game = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
+    BeginTrackedEye(device, false);
+    ApplyShaderEyeState(device, shaderEye, 0.0f);
     const HRESULT left = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
-    BeginRightEye(device);
+    BeginTrackedEye(device, true);
     ApplyShaderEyeState(device, shaderEye, +0.064f);
     const HRESULT right = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
     if (FAILED(right) && !g_stereo.rightDrawFailureLogged) {
@@ -469,17 +631,19 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3D
     }
     RestoreShaderEyeState(device, shaderEye);
     RestoreGameEye(device);
-    return left;
+    return game;
 }
 
 HRESULT STDMETHODCALLTYPE ClearHook(IDirect3DDevice9* device, DWORD count, const D3DRECT* rects, DWORD flags, D3DCOLOR color, float z, DWORD stencil) {
     const HRESULT left = g_originalClear(device, count, rects, flags, color, z, stencil);
-    if (g_stereo.ready && EnsureRightEyeColor(device) && EnsureRightEyeDepth(device) &&
+    if (g_stereo.ready && EnsureStereoEyeColor(device) && EnsureStereoEyeDepth(device) &&
         (!g_stereo.perspectivePassSeen || g_stereo.perspective)) {
-        g_originalSetDepthStencilSurface(device, nullptr);
-        g_originalSetRenderTarget(device, 0, g_stereo.rightColor);
-        g_originalSetDepthStencilSurface(device, g_stereo.rightDepth);
-        g_originalClear(device, count, rects, flags, color, z, stencil);
+        for (bool rightEye : {false, true}) {
+            g_originalSetDepthStencilSurface(device, nullptr);
+            g_originalSetRenderTarget(device, 0, rightEye ? g_stereo.rightColor : g_stereo.trackedLeftColor);
+            g_originalSetDepthStencilSurface(device, rightEye ? g_stereo.rightDepth : g_stereo.trackedLeftDepth);
+            g_originalClear(device, count, rects, flags, color, z, stencil);
+        }
         g_originalSetDepthStencilSurface(device, nullptr);
         g_originalSetRenderTarget(device, 0, g_stereo.activeColor);
         g_originalSetDepthStencilSurface(device, g_stereo.leftDepth);

@@ -80,6 +80,7 @@ struct VrBridge::Impl {
     IDirect3DDevice9* device = nullptr;
     IDirect3DSurface9* readback = nullptr;
     IDirect3DSurface9* rightReadback = nullptr;
+    IDirect3DSurface9* leftEyeSource = nullptr;
     IDirect3DSurface9* rightEyeSource = nullptr;
     ID3D11Device* d3d11Device = nullptr;
     ID3D11DeviceContext* d3d11Context = nullptr;
@@ -106,12 +107,78 @@ struct VrBridge::Impl {
     bool haveProjection = false;
     bool haveGameFov = false;
     XrFovf gameFov{};
+    XrPosef baseHeadPose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+    HeadPose headPose{};
+    bool haveBaseHeadPose = false;
+    bool haveHeadPose = false;
     bool perspectiveProjectionActive = false;
     D3DSURFACE_DESC activeTarget{};
     D3DSURFACE_DESC perspectiveTarget{};
     bool haveActiveTarget = false;
     bool havePerspectiveTarget = false;
     std::mutex mutex;
+
+    static XrQuaternionf Normalize(const XrQuaternionf& value) {
+        const float length = std::sqrt(value.x * value.x + value.y * value.y + value.z * value.z + value.w * value.w);
+        if (length < 0.000001f) return {0.0f, 0.0f, 0.0f, 1.0f};
+        return {value.x / length, value.y / length, value.z / length, value.w / length};
+    }
+
+    static XrQuaternionf Conjugate(const XrQuaternionf& value) {
+        return {-value.x, -value.y, -value.z, value.w};
+    }
+
+    static XrQuaternionf Multiply(const XrQuaternionf& a, const XrQuaternionf& b) {
+        return Normalize({
+            a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+            a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+            a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z});
+    }
+
+    static XrVector3f Rotate(const XrQuaternionf& rotation, const XrVector3f& value) {
+        const XrVector3f quaternion{rotation.x, rotation.y, rotation.z};
+        const XrVector3f twiceCross{
+            2.0f * (quaternion.y * value.z - quaternion.z * value.y),
+            2.0f * (quaternion.z * value.x - quaternion.x * value.z),
+            2.0f * (quaternion.x * value.y - quaternion.y * value.x)};
+        return {
+            value.x + rotation.w * twiceCross.x + quaternion.y * twiceCross.z - quaternion.z * twiceCross.y,
+            value.y + rotation.w * twiceCross.y + quaternion.z * twiceCross.x - quaternion.x * twiceCross.z,
+            value.z + rotation.w * twiceCross.z + quaternion.x * twiceCross.y - quaternion.y * twiceCross.x};
+    }
+
+    void UpdateHeadPose(const std::vector<XrView>& views, XrViewStateFlags flags) {
+        if (views.size() < 2 || !(flags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) return;
+        XrPosef center = views[0].pose;
+        center.orientation = Normalize(center.orientation);
+        center.position.x = (views[0].pose.position.x + views[1].pose.position.x) * 0.5f;
+        center.position.y = (views[0].pose.position.y + views[1].pose.position.y) * 0.5f;
+        center.position.z = (views[0].pose.position.z + views[1].pose.position.z) * 0.5f;
+        if (!haveBaseHeadPose) {
+            baseHeadPose = center;
+            haveBaseHeadPose = true;
+            log::Info("OpenXR head-pose origin captured; headset motion will now drive the stereo camera.");
+        }
+        const XrQuaternionf inverseBase = Conjugate(baseHeadPose.orientation);
+        const XrQuaternionf relativeOrientation = Multiply(inverseBase, center.orientation);
+        XrVector3f relativePosition{};
+        if (flags & XR_VIEW_STATE_POSITION_VALID_BIT) {
+            const XrVector3f delta{center.position.x - baseHeadPose.position.x,
+                                  center.position.y - baseHeadPose.position.y,
+                                  center.position.z - baseHeadPose.position.z};
+            relativePosition = Rotate(inverseBase, delta);
+        }
+        headPose.position[0] = relativePosition.x;
+        headPose.position[1] = relativePosition.y;
+        headPose.position[2] = relativePosition.z;
+        headPose.orientation[0] = relativeOrientation.x;
+        headPose.orientation[1] = relativeOrientation.y;
+        headPose.orientation[2] = relativeOrientation.z;
+        headPose.orientation[3] = relativeOrientation.w;
+        ++headPose.sample;
+        haveHeadPose = true;
+    }
 
     void DestroySwapchains() {
         if (destroySwapchain) for (auto swapchain : swapchains) destroySwapchain(swapchain);
@@ -140,6 +207,8 @@ struct VrBridge::Impl {
         d3d11Device = nullptr;
         initialized = false;
         sessionRunning = false;
+        haveBaseHeadPose = false;
+        haveHeadPose = false;
     }
 
     bool LoadFunctions() {
@@ -384,6 +453,7 @@ struct VrBridge::Impl {
             XrViewState viewState{XR_TYPE_VIEW_STATE};
             uint32_t viewCount = 0;
             if (Check(locateViews(session, &locate, &viewState, static_cast<uint32_t>(views.size()), &viewCount, views.data()), "xrLocateViews") && viewCount == swapchains.size()) {
+                UpdateHeadPose(views, viewState.viewStateFlags);
                 IDirect3DSurface9* gameBackbuffer = nullptr;
                 const HRESULT backBufferResult = device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &gameBackbuffer);
                 if (SUCCEEDED(backBufferResult)) {
@@ -442,7 +512,8 @@ struct VrBridge::Impl {
                         }
                         return acquired;
                     };
-                    const bool allEyesUploaded = uploadEye(0, gameBackbuffer, readback) && uploadEye(1, rightEyeSource, rightReadback);
+                    IDirect3DSurface9* leftSource = leftEyeSource ? leftEyeSource : gameBackbuffer;
+                    const bool allEyesUploaded = uploadEye(0, leftSource, readback) && uploadEye(1, rightEyeSource, rightReadback);
                     d3d11Context->Flush();
                     if (!allEyesUploaded) projectionViews.clear();
                     gameBackbuffer->Release();
@@ -534,6 +605,24 @@ void VrBridge::SetRightEyeSurface(IDirect3DSurface9* surface) {
     if (impl_->rightEyeSource) impl_->rightEyeSource->Release();
     impl_->rightEyeSource = surface;
     log::Info(surface ? "Right-eye native stereo source changed." : "Right-eye native stereo source detached.");
+}
+
+void VrBridge::SetLeftEyeSurface(IDirect3DSurface9* surface) {
+    if (!impl_) impl_ = new Impl;
+    std::scoped_lock lock(impl_->mutex);
+    if (impl_->leftEyeSource == surface) return;
+    if (surface) surface->AddRef();
+    if (impl_->leftEyeSource) impl_->leftEyeSource->Release();
+    impl_->leftEyeSource = surface;
+    log::Info(surface ? "Left-eye tracked stereo source changed." : "Left-eye tracked stereo source detached.");
+}
+
+bool VrBridge::GetHeadPose(HeadPose& pose) {
+    if (!impl_) return false;
+    std::scoped_lock lock(impl_->mutex);
+    if (!impl_->haveHeadPose) return false;
+    pose = impl_->headPose;
+    return true;
 }
 
 void VrBridge::OnRenderTarget(IDirect3DSurface9* surface) {
