@@ -156,9 +156,9 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
     if (++g_stereo.presentedFrames % 180 == 0) {
         tmoxr::log::Info("Native stereo replay diagnostic: perspective candidates=" + std::to_string(g_stereo.perspectiveDrawCandidates) +
             ", replayed=" + std::to_string(g_stereo.replayedDraws) + ".");
+        g_stereo.perspectiveDrawCandidates = 0;
+        g_stereo.replayedDraws = 0;
     }
-    g_stereo.perspectiveDrawCandidates = 0;
-    g_stereo.replayedDraws = 0;
     const HRESULT result = g_originalPresent(device, source, destination, window, dirtyRegion);
     // The next clear starts a new frame. Keep the completed right-eye 3D scene
     // intact when TrackMania subsequently clears its left-eye UI pass.
