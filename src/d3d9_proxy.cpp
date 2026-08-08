@@ -71,6 +71,7 @@ struct StereoResources {
     IDirect3DSurface9* activeDepth = nullptr;
     D3DMATRIX projection{};
     bool perspective = false;
+    bool perspectivePassSeen = false;
     bool ready = false;
 } g_stereo;
 
@@ -148,7 +149,11 @@ void RestoreGameEye(IDirect3DDevice9* device) {
 HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* source, const RECT* destination,
                                       HWND window, const RGNDATA* dirtyRegion) {
     tmoxr::VrBridge::Instance().OnBeforePresent(device);
-    return g_originalPresent(device, source, destination, window, dirtyRegion);
+    const HRESULT result = g_originalPresent(device, source, destination, window, dirtyRegion);
+    // The next clear starts a new frame. Keep the completed right-eye 3D scene
+    // intact when TrackMania subsequently clears its left-eye UI pass.
+    g_stereo.perspectivePassSeen = false;
+    return result;
 }
 
 HRESULT STDMETHODCALLTYPE ResetHook(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* parameters) {
@@ -170,6 +175,7 @@ HRESULT STDMETHODCALLTYPE SetTransformHook(IDirect3DDevice9* device, D3DTRANSFOR
     if (state == D3DTS_PROJECTION && matrix) {
         g_stereo.projection = *matrix;
         g_stereo.perspective = std::abs(matrix->_34) > 0.5f;
+        if (g_stereo.perspective) g_stereo.perspectivePassSeen = true;
     }
     return g_originalSetTransform(device, state, matrix);
 }
@@ -210,7 +216,8 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3D
 
 HRESULT STDMETHODCALLTYPE ClearHook(IDirect3DDevice9* device, DWORD count, const D3DRECT* rects, DWORD flags, D3DCOLOR color, float z, DWORD stencil) {
     const HRESULT left = g_originalClear(device, count, rects, flags, color, z, stencil);
-    if (g_stereo.ready && g_stereo.activeColor == g_stereo.leftColor && g_stereo.activeDepth == g_stereo.leftDepth) {
+    if (g_stereo.ready && g_stereo.activeColor == g_stereo.leftColor && g_stereo.activeDepth == g_stereo.leftDepth &&
+        (!g_stereo.perspectivePassSeen || g_stereo.perspective)) {
         g_originalSetDepthStencilSurface(device, nullptr);
         g_originalSetRenderTarget(device, 0, g_stereo.rightColor);
         g_originalSetDepthStencilSurface(device, g_stereo.rightDepth);
