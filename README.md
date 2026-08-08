@@ -1,5 +1,18 @@
 # TrackMania United Forever OpenXR mod
 
+> [!WARNING]
+> HUMAN-WRITTEN NOTE:
+> ## AI made it.
+> ## This repo is 100% vibed/slopped up. I didn't write any of this, not even the rest of this readme! All I did was sit with my VR headset on and launch the game whenever AI finished its turn.
+> 
+> BTW, **you have to disable anti aliasing in the Trackmania options for this to work.**
+> 
+> <img width="351" height="189" alt="image" src="https://github.com/user-attachments/assets/e39cf512-4586-4187-8dbd-8bc588ce553e" />
+>
+> <img width="1064" height="490" alt="image" src="https://github.com/user-attachments/assets/fe7cfbd8-04a6-4585-9ba1-09fe2bc01f15" />
+
+
+
 This project adds headset-only VR to the 32-bit Steam release of TrackMania United Forever. It uses the active OpenXR runtime, works with Virtual Desktop through SteamVR OpenXR, and leaves normal Xbox gamepad input unchanged. No motion controllers are created or required.
 
 ## Current features
