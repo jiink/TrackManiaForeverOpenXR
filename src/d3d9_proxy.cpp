@@ -52,6 +52,7 @@ using DrawPrimitiveFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRIMIT
 using DrawIndexedPrimitiveFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT);
 using SetDepthStencilSurfaceFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, IDirect3DSurface9*);
 using ClearFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, DWORD, const D3DRECT*, DWORD, D3DCOLOR, float, DWORD);
+using SetVertexShaderFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, IDirect3DVertexShader9*);
 PresentFn g_originalPresent = nullptr;
 ResetFn g_originalReset = nullptr;
 SetTransformFn g_originalSetTransform = nullptr;
@@ -60,6 +61,7 @@ DrawPrimitiveFn g_originalDrawPrimitive = nullptr;
 DrawIndexedPrimitiveFn g_originalDrawIndexedPrimitive = nullptr;
 SetDepthStencilSurfaceFn g_originalSetDepthStencilSurface = nullptr;
 ClearFn g_originalClear = nullptr;
+SetVertexShaderFn g_originalSetVertexShader = nullptr;
 std::atomic<bool> g_hooked = false;
 
 struct StereoResources {
@@ -76,8 +78,13 @@ struct StereoResources {
     bool perspectivePassSeen = false;
     bool rightDrawFailureLogged = false;
     uint32_t perspectiveDrawCandidates = 0;
+    uint32_t shaderPerspectiveCandidates = 0;
     uint32_t replayedDraws = 0;
     uint64_t presentedFrames = 0;
+    bool customVertexShaderBound = false;
+    UINT primaryWidth = 0;
+    UINT primaryHeight = 0;
+    D3DFORMAT primaryFormat = D3DFMT_UNKNOWN;
     bool ready = false;
 } g_stereo;
 
@@ -92,13 +99,17 @@ void ReleaseStereoResources() {
 
 bool EnsureRightEyeColor(IDirect3DDevice9* device) {
     if (!g_stereo.activeColor) return false;
+    D3DSURFACE_DESC color{};
+    if (FAILED(g_stereo.activeColor->GetDesc(&color))) return false;
+    // Ignore shadow maps, bloom buffers, and other auxiliary passes. Their
+    // contents are not a suitable headset eye image and caused allocation churn.
+    if (color.Width != g_stereo.primaryWidth || color.Height != g_stereo.primaryHeight || color.Format != g_stereo.primaryFormat) return false;
     if (g_stereo.colorSource == g_stereo.activeColor && g_stereo.rightColor) return true;
     if (g_stereo.colorSource) g_stereo.colorSource->Release();
     if (g_stereo.rightColor) g_stereo.rightColor->Release();
     g_stereo.colorSource = nullptr;
     g_stereo.rightColor = nullptr;
-    D3DSURFACE_DESC color{};
-    if (FAILED(g_stereo.activeColor->GetDesc(&color)) ||
+    if (
         FAILED(device->CreateRenderTarget(color.Width, color.Height, color.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &g_stereo.rightColor, nullptr))) {
         tmoxr::log::Warn("Native stereo skipped: could not mirror the currently bound scene color target.");
         if (g_stereo.rightColor) g_stereo.rightColor->Release();
@@ -150,6 +161,9 @@ bool CreateStereoResources(IDirect3DDevice9* device) {
     }
     g_stereo.activeColor = g_stereo.leftColor;
     g_stereo.activeDepth = g_stereo.leftDepth;
+    g_stereo.primaryWidth = color.Width;
+    g_stereo.primaryHeight = color.Height;
+    g_stereo.primaryFormat = color.Format;
     if (!EnsureRightEyeDepth(device)) {
         ReleaseStereoResources();
         return false;
@@ -196,8 +210,10 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
     tmoxr::VrBridge::Instance().OnBeforePresent(device);
     if (++g_stereo.presentedFrames % 180 == 0) {
         tmoxr::log::Info("Native stereo replay diagnostic: perspective candidates=" + std::to_string(g_stereo.perspectiveDrawCandidates) +
+            ", vertex-shader candidates=" + std::to_string(g_stereo.shaderPerspectiveCandidates) +
             ", replayed=" + std::to_string(g_stereo.replayedDraws) + ".");
         g_stereo.perspectiveDrawCandidates = 0;
+        g_stereo.shaderPerspectiveCandidates = 0;
         g_stereo.replayedDraws = 0;
     }
     const HRESULT result = g_originalPresent(device, source, destination, window, dirtyRegion);
@@ -242,9 +258,17 @@ HRESULT STDMETHODCALLTYPE SetDepthStencilSurfaceHook(IDirect3DDevice9* device, I
     return g_originalSetDepthStencilSurface(device, surface);
 }
 
+HRESULT STDMETHODCALLTYPE SetVertexShaderHook(IDirect3DDevice9* device, IDirect3DVertexShader9* shader) {
+    g_stereo.customVertexShaderBound = shader != nullptr;
+    return g_originalSetVertexShader(device, shader);
+}
+
 HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITIVETYPE type, UINT startVertex, UINT primitiveCount) {
     tmoxr::VrBridge::Instance().OnDraw(false);
-    if (g_stereo.perspective) ++g_stereo.perspectiveDrawCandidates;
+    if (g_stereo.perspective) {
+        ++g_stereo.perspectiveDrawCandidates;
+        if (g_stereo.customVertexShaderBound) ++g_stereo.shaderPerspectiveCandidates;
+    }
     if (!CanReplayStereoDraw(device)) return g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
     ++g_stereo.replayedDraws;
     SetEyeProjection(device, -0.032f);
@@ -262,7 +286,10 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITI
 HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITIVETYPE type, INT baseVertex, UINT minVertex,
                                                     UINT vertexCount, UINT startIndex, UINT primitiveCount) {
     tmoxr::VrBridge::Instance().OnDraw(true);
-    if (g_stereo.perspective) ++g_stereo.perspectiveDrawCandidates;
+    if (g_stereo.perspective) {
+        ++g_stereo.perspectiveDrawCandidates;
+        if (g_stereo.customVertexShaderBound) ++g_stereo.shaderPerspectiveCandidates;
+    }
     if (!CanReplayStereoDraw(device)) return g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
     ++g_stereo.replayedDraws;
     SetEyeProjection(device, -0.032f);
@@ -297,7 +324,7 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
     // IDirect3DDevice9 vtable indexes from the Direct3D 9 SDK: Reset=16, Present=17.
     auto table = *reinterpret_cast<void***>(device);
     DWORD oldProtect = 0;
-    if (!VirtualProtect(&table[16], sizeof(void*) * 67, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+    if (!VirtualProtect(&table[16], sizeof(void*) * 77, PAGE_EXECUTE_READWRITE, &oldProtect)) {
         tmoxr::log::Error("VirtualProtect on IDirect3DDevice9 vtable failed: " + std::to_string(GetLastError()));
         g_hooked = false;
         return false;
@@ -308,6 +335,7 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
     g_originalSetRenderTarget = reinterpret_cast<SetRenderTargetFn>(table[37]);
     g_originalSetDepthStencilSurface = reinterpret_cast<SetDepthStencilSurfaceFn>(table[39]);
     g_originalClear = reinterpret_cast<ClearFn>(table[43]);
+    g_originalSetVertexShader = reinterpret_cast<SetVertexShaderFn>(table[92]);
     g_originalDrawPrimitive = reinterpret_cast<DrawPrimitiveFn>(table[81]);
     g_originalDrawIndexedPrimitive = reinterpret_cast<DrawIndexedPrimitiveFn>(table[82]);
     table[16] = reinterpret_cast<void*>(&ResetHook);
@@ -316,11 +344,12 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
     table[37] = reinterpret_cast<void*>(&SetRenderTargetHook);
     table[39] = reinterpret_cast<void*>(&SetDepthStencilSurfaceHook);
     table[43] = reinterpret_cast<void*>(&ClearHook);
+    table[92] = reinterpret_cast<void*>(&SetVertexShaderHook);
     table[81] = reinterpret_cast<void*>(&DrawPrimitiveHook);
     table[82] = reinterpret_cast<void*>(&DrawIndexedPrimitiveHook);
     DWORD ignored = 0;
-    VirtualProtect(&table[16], sizeof(void*) * 67, oldProtect, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), &table[16], sizeof(void*) * 67);
+    VirtualProtect(&table[16], sizeof(void*) * 77, oldProtect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), &table[16], sizeof(void*) * 77);
     tmoxr::log::Info("Installed D3D9 Present/Reset/transform/render-pass diagnostic hooks.");
     return true;
 }
