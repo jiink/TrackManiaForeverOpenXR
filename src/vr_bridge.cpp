@@ -90,6 +90,8 @@ struct VrBridge::Impl {
     bool permanentlyDisabled = false;
     bool sessionRunning = false;
     bool copyFailureLogged = false;
+    uint32_t leftSourceSamples = 0;
+    uint32_t rightSourceSamples = 0;
     uint64_t frames = 0;
     uint32_t viewTransformsThisFrame = 0;
     uint32_t projectionTransformsThisFrame = 0;
@@ -402,6 +404,18 @@ struct VrBridge::Impl {
                             copyFailureLogged = true;
                             return false;
                         }
+                        uint32_t nonBlackSamples = 0;
+                        constexpr UINT sampleColumns = 32;
+                        constexpr UINT sampleRows = 24;
+                        for (UINT y = 0; y < sampleRows; ++y) {
+                            const auto* row = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(locked.pBits) +
+                                static_cast<size_t>(y) * sourceHeight / sampleRows * locked.Pitch);
+                            for (UINT x = 0; x < sampleColumns; ++x) {
+                                if ((row[x * sourceWidth / sampleColumns] & 0x00FFFFFFu) != 0) ++nonBlackSamples;
+                            }
+                        }
+                        if (eye == 0) leftSourceSamples = nonBlackSamples;
+                        else rightSourceSamples = nonBlackSamples;
                         uint32_t imageIndex = 0;
                         XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
                         XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
@@ -420,6 +434,10 @@ struct VrBridge::Impl {
                             projectionViews[eye].subImage.imageRect.extent.height = static_cast<int32_t>(sourceHeight);
                         }
                         eyeReadback->UnlockRect();
+                        if (eye == 1 && frames % 180 == 0) {
+                            log::Info("Stereo source pixel samples (non-black / 768): left=" + std::to_string(leftSourceSamples) +
+                                ", right=" + std::to_string(rightSourceSamples) + ".");
+                        }
                         return acquired;
                     };
                     const bool allEyesUploaded = uploadEye(0, gameBackbuffer, readback) && uploadEye(1, rightEyeSource, rightReadback);
