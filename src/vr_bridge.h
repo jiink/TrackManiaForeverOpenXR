@@ -12,6 +12,7 @@ public:
     void OnTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX& matrix);
     void OnRenderTarget(IDirect3DSurface9* surface);
     void OnDraw(bool indexed);
+    void SetRightEyeSurface(IDirect3DSurface9* surface);
     void Shutdown();
 
 private:

@@ -11,6 +11,7 @@
 #undef D3DPERF_SetOptions
 
 #include <atomic>
+#include <cmath>
 #include <filesystem>
 #include <string>
 
@@ -49,13 +50,92 @@ using SetTransformFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DTRANSFO
 using SetRenderTargetFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
 using DrawPrimitiveFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT);
 using DrawIndexedPrimitiveFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT);
+using SetDepthStencilSurfaceFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, IDirect3DSurface9*);
+using ClearFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, DWORD, const D3DRECT*, DWORD, D3DCOLOR, float, DWORD);
 PresentFn g_originalPresent = nullptr;
 ResetFn g_originalReset = nullptr;
 SetTransformFn g_originalSetTransform = nullptr;
 SetRenderTargetFn g_originalSetRenderTarget = nullptr;
 DrawPrimitiveFn g_originalDrawPrimitive = nullptr;
 DrawIndexedPrimitiveFn g_originalDrawIndexedPrimitive = nullptr;
+SetDepthStencilSurfaceFn g_originalSetDepthStencilSurface = nullptr;
+ClearFn g_originalClear = nullptr;
 std::atomic<bool> g_hooked = false;
+
+struct StereoResources {
+    IDirect3DSurface9* leftColor = nullptr;
+    IDirect3DSurface9* leftDepth = nullptr;
+    IDirect3DSurface9* rightColor = nullptr;
+    IDirect3DSurface9* rightDepth = nullptr;
+    IDirect3DSurface9* activeColor = nullptr;
+    IDirect3DSurface9* activeDepth = nullptr;
+    D3DMATRIX projection{};
+    bool perspective = false;
+    bool ready = false;
+} g_stereo;
+
+void ReleaseStereoResources() {
+    tmoxr::VrBridge::Instance().SetRightEyeSurface(nullptr);
+    for (auto** resource : {&g_stereo.leftColor, &g_stereo.leftDepth, &g_stereo.rightColor, &g_stereo.rightDepth}) {
+        if (*resource) (*resource)->Release();
+        *resource = nullptr;
+    }
+    g_stereo = {};
+}
+
+bool CreateStereoResources(IDirect3DDevice9* device) {
+    ReleaseStereoResources();
+    if (FAILED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &g_stereo.leftColor)) ||
+        FAILED(device->GetDepthStencilSurface(&g_stereo.leftDepth))) {
+        tmoxr::log::Warn("Native stereo unavailable: TrackMania did not expose a color/depth backbuffer pair.");
+        ReleaseStereoResources();
+        return false;
+    }
+    D3DSURFACE_DESC color{};
+    D3DSURFACE_DESC depth{};
+    if (FAILED(g_stereo.leftColor->GetDesc(&color)) || FAILED(g_stereo.leftDepth->GetDesc(&depth))) {
+        tmoxr::log::Warn("Native stereo unavailable: could not describe TrackMania render surfaces.");
+        ReleaseStereoResources();
+        return false;
+    }
+    if (FAILED(device->CreateRenderTarget(color.Width, color.Height, color.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &g_stereo.rightColor, nullptr)) ||
+        FAILED(device->CreateDepthStencilSurface(depth.Width, depth.Height, depth.Format, D3DMULTISAMPLE_NONE, 0, TRUE, &g_stereo.rightDepth, nullptr))) {
+        tmoxr::log::Warn("Native stereo unavailable: could not allocate a right-eye color/depth target.");
+        ReleaseStereoResources();
+        return false;
+    }
+    g_stereo.activeColor = g_stereo.leftColor;
+    g_stereo.activeDepth = g_stereo.leftDepth;
+    g_stereo.ready = true;
+    tmoxr::VrBridge::Instance().SetRightEyeSurface(g_stereo.rightColor);
+    tmoxr::log::Info("Experimental native stereo targets allocated: " + std::to_string(color.Width) + "x" + std::to_string(color.Height) + ".");
+    return true;
+}
+
+bool CanReplayStereoDraw() {
+    return g_stereo.ready && g_stereo.perspective &&
+        g_stereo.activeColor == g_stereo.leftColor && g_stereo.activeDepth == g_stereo.leftDepth;
+}
+
+void SetEyeProjection(IDirect3DDevice9* device, float eyeOffsetMeters) {
+    D3DMATRIX projection = g_stereo.projection;
+    // TrackMania submits camera-space vertices, so shifting the projection's
+    // fourth row creates the correct depth-dependent parallax for an eye offset.
+    projection._41 += -eyeOffsetMeters * projection._11;
+    g_originalSetTransform(device, D3DTS_PROJECTION, &projection);
+}
+
+void BeginRightEye(IDirect3DDevice9* device) {
+    g_originalSetRenderTarget(device, 0, g_stereo.rightColor);
+    g_originalSetDepthStencilSurface(device, g_stereo.rightDepth);
+    SetEyeProjection(device, +0.032f); // half a 64 mm IPD
+}
+
+void RestoreGameEye(IDirect3DDevice9* device) {
+    g_originalSetTransform(device, D3DTS_PROJECTION, &g_stereo.projection);
+    g_originalSetDepthStencilSurface(device, g_stereo.leftDepth);
+    g_originalSetRenderTarget(device, 0, g_stereo.leftColor);
+}
 
 HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* source, const RECT* destination,
                                       HWND window, const RGNDATA* dirtyRegion) {
@@ -66,30 +146,70 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
 HRESULT STDMETHODCALLTYPE ResetHook(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* parameters) {
     tmoxr::log::Info("IDirect3DDevice9::Reset intercepted; releasing OpenXR swapchains before reset.");
     tmoxr::VrBridge::Instance().OnBeforeReset();
-    return g_originalReset(device, parameters);
+    ReleaseStereoResources();
+    const HRESULT result = g_originalReset(device, parameters);
+    if (SUCCEEDED(result)) {
+        CreateStereoResources(device);
+        tmoxr::VrBridge::Instance().OnDeviceCreated(device, *parameters);
+    }
+    return result;
 }
 
 HRESULT STDMETHODCALLTYPE SetTransformHook(IDirect3DDevice9* device, D3DTRANSFORMSTATETYPE state, const D3DMATRIX* matrix) {
     if (matrix && (state == D3DTS_VIEW || state == D3DTS_PROJECTION)) {
         tmoxr::VrBridge::Instance().OnTransform(state, *matrix);
     }
+    if (state == D3DTS_PROJECTION && matrix) {
+        g_stereo.projection = *matrix;
+        g_stereo.perspective = std::abs(matrix->_34) > 0.5f;
+    }
     return g_originalSetTransform(device, state, matrix);
 }
 
 HRESULT STDMETHODCALLTYPE SetRenderTargetHook(IDirect3DDevice9* device, DWORD index, IDirect3DSurface9* surface) {
     if (index == 0 && surface) tmoxr::VrBridge::Instance().OnRenderTarget(surface);
+    if (index == 0) g_stereo.activeColor = surface;
     return g_originalSetRenderTarget(device, index, surface);
+}
+
+HRESULT STDMETHODCALLTYPE SetDepthStencilSurfaceHook(IDirect3DDevice9* device, IDirect3DSurface9* surface) {
+    g_stereo.activeDepth = surface;
+    return g_originalSetDepthStencilSurface(device, surface);
 }
 
 HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITIVETYPE type, UINT startVertex, UINT primitiveCount) {
     tmoxr::VrBridge::Instance().OnDraw(false);
-    return g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
+    if (!CanReplayStereoDraw()) return g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
+    SetEyeProjection(device, -0.032f);
+    const HRESULT left = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
+    BeginRightEye(device);
+    g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
+    RestoreGameEye(device);
+    return left;
 }
 
 HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITIVETYPE type, INT baseVertex, UINT minVertex,
                                                     UINT vertexCount, UINT startIndex, UINT primitiveCount) {
     tmoxr::VrBridge::Instance().OnDraw(true);
-    return g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
+    if (!CanReplayStereoDraw()) return g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
+    SetEyeProjection(device, -0.032f);
+    const HRESULT left = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
+    BeginRightEye(device);
+    g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
+    RestoreGameEye(device);
+    return left;
+}
+
+HRESULT STDMETHODCALLTYPE ClearHook(IDirect3DDevice9* device, DWORD count, const D3DRECT* rects, DWORD flags, D3DCOLOR color, float z, DWORD stencil) {
+    const HRESULT left = g_originalClear(device, count, rects, flags, color, z, stencil);
+    if (g_stereo.ready && g_stereo.activeColor == g_stereo.leftColor && g_stereo.activeDepth == g_stereo.leftDepth) {
+        g_originalSetRenderTarget(device, 0, g_stereo.rightColor);
+        g_originalSetDepthStencilSurface(device, g_stereo.rightDepth);
+        g_originalClear(device, count, rects, flags, color, z, stencil);
+        g_originalSetDepthStencilSurface(device, g_stereo.leftDepth);
+        g_originalSetRenderTarget(device, 0, g_stereo.leftColor);
+    }
+    return left;
 }
 
 bool InstallDeviceHooks(IDirect3DDevice9* device) {
@@ -106,12 +226,16 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
     g_originalPresent = reinterpret_cast<PresentFn>(table[17]);
     g_originalSetTransform = reinterpret_cast<SetTransformFn>(table[44]);
     g_originalSetRenderTarget = reinterpret_cast<SetRenderTargetFn>(table[37]);
+    g_originalSetDepthStencilSurface = reinterpret_cast<SetDepthStencilSurfaceFn>(table[39]);
+    g_originalClear = reinterpret_cast<ClearFn>(table[43]);
     g_originalDrawPrimitive = reinterpret_cast<DrawPrimitiveFn>(table[81]);
     g_originalDrawIndexedPrimitive = reinterpret_cast<DrawIndexedPrimitiveFn>(table[82]);
     table[16] = reinterpret_cast<void*>(&ResetHook);
     table[17] = reinterpret_cast<void*>(&PresentHook);
     table[44] = reinterpret_cast<void*>(&SetTransformHook);
     table[37] = reinterpret_cast<void*>(&SetRenderTargetHook);
+    table[39] = reinterpret_cast<void*>(&SetDepthStencilSurfaceHook);
+    table[43] = reinterpret_cast<void*>(&ClearHook);
     table[81] = reinterpret_cast<void*>(&DrawPrimitiveHook);
     table[82] = reinterpret_cast<void*>(&DrawIndexedPrimitiveHook);
     DWORD ignored = 0;
@@ -149,7 +273,10 @@ public:
         const HRESULT result = real_->CreateDevice(a,type,window,flags,parameters,device);
         if (SUCCEEDED(result) && device && *device) {
             tmoxr::log::Info("D3D9 device created: " + std::to_string(parameters->BackBufferWidth) + "x" + std::to_string(parameters->BackBufferHeight));
-            if (InstallDeviceHooks(*device)) tmoxr::VrBridge::Instance().OnDeviceCreated(*device, *parameters);
+            if (InstallDeviceHooks(*device)) {
+                tmoxr::VrBridge::Instance().OnDeviceCreated(*device, *parameters);
+                CreateStereoResources(*device);
+            }
         } else {
             tmoxr::log::Error("IDirect3D9::CreateDevice failed: HRESULT=" + std::to_string(static_cast<long>(result)));
         }

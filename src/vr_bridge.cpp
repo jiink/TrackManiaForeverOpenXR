@@ -79,6 +79,8 @@ struct VrBridge::Impl {
     std::vector<XrViewConfigurationView> viewConfigs;
     IDirect3DDevice9* device = nullptr;
     IDirect3DSurface9* readback = nullptr;
+    IDirect3DSurface9* rightReadback = nullptr;
+    IDirect3DSurface9* rightEyeSource = nullptr;
     ID3D11Device* d3d11Device = nullptr;
     ID3D11DeviceContext* d3d11Context = nullptr;
     UINT sourceWidth = 0;
@@ -126,6 +128,8 @@ struct VrBridge::Impl {
         loader = nullptr;
         if (readback) readback->Release();
         readback = nullptr;
+        if (rightReadback) rightReadback->Release();
+        rightReadback = nullptr;
         if (d3d11Context) d3d11Context->Release();
         d3d11Context = nullptr;
         if (d3d11Device) d3d11Device->Release();
@@ -379,42 +383,48 @@ struct VrBridge::Impl {
                 IDirect3DSurface9* gameBackbuffer = nullptr;
                 const HRESULT backBufferResult = device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &gameBackbuffer);
                 if (SUCCEEDED(backBufferResult)) {
-                    if (!readback) {
-                        const HRESULT create = device->CreateOffscreenPlainSurface(sourceWidth, sourceHeight, D3DFMT_A8R8G8B8,
-                            D3DPOOL_SYSTEMMEM, &readback, nullptr);
-                        if (FAILED(create)) log::Error("Could not create D3D9 system-memory readback surface: HRESULT=" + std::to_string(static_cast<long>(create)));
-                    }
-                    const HRESULT read = readback ? device->GetRenderTargetData(gameBackbuffer, readback) : E_FAIL;
-                    D3DLOCKED_RECT locked{};
-                    const HRESULT lock = SUCCEEDED(read) ? readback->LockRect(&locked, nullptr, D3DLOCK_READONLY) : read;
-                    if (SUCCEEDED(lock)) {
-                        projectionViews.resize(viewCount);
-                        bool allEyesUploaded = true;
-                        for (uint32_t eye = 0; eye < viewCount; ++eye) {
-                            uint32_t imageIndex = 0;
-                            XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-                            XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-                            wait.timeout = XR_INFINITE_DURATION;
-                            XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-                            if (Check(acquireImage(swapchains[eye], &acquire, &imageIndex), "xrAcquireSwapchainImage") &&
-                                Check(waitImage(swapchains[eye], &wait), "xrWaitSwapchainImage")) {
-                                d3d11Context->UpdateSubresource(images[eye][imageIndex].texture, 0, nullptr, locked.pBits, locked.Pitch, 0);
-                                releaseImage(swapchains[eye], &release);
-                                projectionViews[eye] = XrCompositionLayerProjectionView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
-                                projectionViews[eye].pose = views[eye].pose;
-                                projectionViews[eye].fov = views[eye].fov;
-                                projectionViews[eye].subImage.swapchain = swapchains[eye];
-                                projectionViews[eye].subImage.imageRect.extent.width = static_cast<int32_t>(sourceWidth);
-                                projectionViews[eye].subImage.imageRect.extent.height = static_cast<int32_t>(sourceHeight);
-                            } else allEyesUploaded = false;
+                    projectionViews.resize(viewCount);
+                    auto uploadEye = [&](uint32_t eye, IDirect3DSurface9* source, IDirect3DSurface9*& eyeReadback) {
+                        if (!source) return false;
+                        if (!eyeReadback) {
+                            const HRESULT create = device->CreateOffscreenPlainSurface(sourceWidth, sourceHeight, D3DFMT_A8R8G8B8,
+                                D3DPOOL_SYSTEMMEM, &eyeReadback, nullptr);
+                            if (FAILED(create)) {
+                                log::Error("Could not create D3D9 system-memory readback surface: HRESULT=" + std::to_string(static_cast<long>(create)));
+                                return false;
+                            }
                         }
-                        readback->UnlockRect();
-                        d3d11Context->Flush();
-                        if (!allEyesUploaded) projectionViews.clear();
-                    } else if (!copyFailureLogged) {
-                        log::Error("D3D9 readback/lock failed. Disable MSAA in TrackMania if it is enabled. HRESULT=" + std::to_string(static_cast<long>(lock)));
-                        copyFailureLogged = true;
-                    }
+                        const HRESULT read = device->GetRenderTargetData(source, eyeReadback);
+                        D3DLOCKED_RECT locked{};
+                        const HRESULT lock = SUCCEEDED(read) ? eyeReadback->LockRect(&locked, nullptr, D3DLOCK_READONLY) : read;
+                        if (FAILED(lock)) {
+                            if (!copyFailureLogged) log::Error("D3D9 readback/lock failed. Disable MSAA in TrackMania if it is enabled. HRESULT=" + std::to_string(static_cast<long>(lock)));
+                            copyFailureLogged = true;
+                            return false;
+                        }
+                        uint32_t imageIndex = 0;
+                        XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+                        XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                        wait.timeout = XR_INFINITE_DURATION;
+                        XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                        const bool acquired = Check(acquireImage(swapchains[eye], &acquire, &imageIndex), "xrAcquireSwapchainImage") &&
+                            Check(waitImage(swapchains[eye], &wait), "xrWaitSwapchainImage");
+                        if (acquired) {
+                            d3d11Context->UpdateSubresource(images[eye][imageIndex].texture, 0, nullptr, locked.pBits, locked.Pitch, 0);
+                            releaseImage(swapchains[eye], &release);
+                            projectionViews[eye] = XrCompositionLayerProjectionView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+                            projectionViews[eye].pose = views[eye].pose;
+                            projectionViews[eye].fov = views[eye].fov;
+                            projectionViews[eye].subImage.swapchain = swapchains[eye];
+                            projectionViews[eye].subImage.imageRect.extent.width = static_cast<int32_t>(sourceWidth);
+                            projectionViews[eye].subImage.imageRect.extent.height = static_cast<int32_t>(sourceHeight);
+                        }
+                        eyeReadback->UnlockRect();
+                        return acquired;
+                    };
+                    const bool allEyesUploaded = uploadEye(0, gameBackbuffer, readback) && uploadEye(1, rightEyeSource, rightReadback);
+                    d3d11Context->Flush();
+                    if (!allEyesUploaded) projectionViews.clear();
                     gameBackbuffer->Release();
                     layer.space = space;
                     layer.viewCount = static_cast<uint32_t>(projectionViews.size());
@@ -481,6 +491,15 @@ void VrBridge::OnTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX& matrix)
             impl_->perspectiveProjectionActive = false;
         }
     }
+}
+
+void VrBridge::SetRightEyeSurface(IDirect3DSurface9* surface) {
+    if (!impl_) impl_ = new Impl;
+    std::scoped_lock lock(impl_->mutex);
+    if (surface) surface->AddRef();
+    if (impl_->rightEyeSource) impl_->rightEyeSource->Release();
+    impl_->rightEyeSource = surface;
+    log::Info(surface ? "Right-eye native stereo source attached." : "Right-eye native stereo source detached.");
 }
 
 void VrBridge::OnRenderTarget(IDirect3DSurface9* surface) {
