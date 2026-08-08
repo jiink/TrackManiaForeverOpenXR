@@ -9,7 +9,8 @@ endif()
 include(FetchContent)
 FetchContent_Declare(
   openxr_headers
-  URL https://github.com/KhronosGroup/OpenXR-SDK-Source/archive/refs/tags/release-1.1.52.zip
+  URL https://github.com/KhronosGroup/OpenXR-SDK-Source/archive/refs/tags/release-1.1.62.zip
+  URL_HASH SHA256=FBEFD5E39E7D0D4C7D4552FDAB30A65AEB907D84B6C17AD5A06F7CD3F66CAAA0
 )
 FetchContent_MakeAvailable(openxr_headers)
 

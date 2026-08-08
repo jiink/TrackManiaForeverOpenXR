@@ -1,34 +1,90 @@
-# TrackMania United Forever OpenXR bridge
+# TrackMania United Forever OpenXR mod
 
-This is a minimal, headset-only VR bridge for the 32-bit Steam release of TrackMania United Forever. It uses the active OpenXR runtime, so Virtual Desktop works when SteamVR is configured as the active OpenXR runtime. The game continues to use its normal Xbox controller input; this mod creates no motion-controller bindings. Because OpenXR does not support Direct3D 9 surfaces directly, the bridge copies the final D3D9 frame through a small CPU readback into a runtime-compatible D3D11 OpenXR swapchain.
+This project adds headset-only VR to the 32-bit Steam release of TrackMania United Forever. It uses the active OpenXR runtime, works with Virtual Desktop through SteamVR OpenXR, and leaves normal Xbox gamepad input unchanged. No motion controllers are created or required.
 
-The minimal mode intentionally mirrors the final Direct3D 9 frame to both eyes. It is useful as a large, stable seated headset display, but it is **not native stereoscopic TrackMania** and it does not alter the game's camera from headset movement. Camera-memory reverse engineering is deliberately outside this safe first version.
+## Current features
 
+- Native stereoscopic rendering by replaying TrackMania's Direct3D 9 scene draws for two eyes.
+- 6DoF OpenXR headset rotation and position applied to the game camera.
+- OpenXR-recommended per-eye resolution and asymmetric headset FOV.
+- Correct OpenXR predicted-pose timing so runtime reprojection can stabilize lower-rate game frames.
+- The original desktop render remains untouched as a troubleshooting view.
+- Detailed `TMOXR.log` diagnostics for D3D9 hooks, shader coverage, tracking, frame timing, swapchains, uploads, and OpenXR errors.
+
+The bridge renders private D3D9 eye surfaces, reads them back through system memory, and uploads them to D3D11 OpenXR swapchains because OpenXR cannot consume Direct3D 9 surfaces directly.
+
+## Known limitations
+
+- TrackMania still performs frustum culling for its original camera. Objects can disappear near the edges when looking far away from the driving direction.
+- A small number of unusual vertex shaders are not camera-mapped yet. Some distant decorations, such as Island boulders, may not follow the tracked camera correctly.
+- Menus and other 2D overlays are not yet composited onto both private VR eye surfaces.
+- Stereo replay renders the scene three times: once for the desktop and once per eye. Native-resolution D3D9 readback and upload are also expensive, so the game render rate can be well below the headset refresh rate. Correct OpenXR pose timing allows the runtime to reproject those frames.
+- The initial valid headset pose becomes the session's camera origin. Restart the game to recenter.
+
+## Requirements
+
+- Windows and the 32-bit Steam version of TrackMania United Forever.
+- An OpenXR runtime supporting `XR_KHR_D3D11_enable`.
+- Virtual Desktop users should start Virtual Desktop and SteamVR first, and set SteamVR as the active OpenXR runtime.
+- A **32-bit (Win32)** `openxr_loader.dll`. A 64-bit loader cannot be loaded by `TmForever.exe`.
 
 ## Build
 
-Install Visual Studio Build Tools with the C++ desktop workload, then open an **x86 Native Tools Command Prompt** and run:
+Install Visual Studio Build Tools with the **Desktop development with C++** workload, CMake, and Ninja. Open an **x86 Native Tools Command Prompt** and run:
 
 ```powershell
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+cmake --build build --target d3d9
 ```
 
-The first configuration downloads the official Khronos OpenXR headers. No OpenXR loader import library is needed; the mod loads `openxr_loader.dll` at runtime so the installed active runtime is used. Because `TmForever.exe` is 32-bit, that loader must also be a **Win32** DLL. SteamVR normally installs it system-wide; if it does not, use the official Khronos Win32 loader distribution beside `TmForever.exe`.
+CMake downloads the official Khronos OpenXR 1.1.62 headers while configuring. The mod does not link an OpenXR import library; it loads `openxr_loader.dll` dynamically at runtime.
 
-## Install
+## Install script
 
-1. Back up any existing `d3d9.dll` in `C:\Program Files (x86)\Steam\steamapps\common\TrackMania United`.
-2. Copy `build\d3d9.dll` into that game folder, alongside `TmForever.exe`.
-3. In SteamVR, set SteamVR as the active OpenXR runtime. Start Virtual Desktop/SteamVR first, then launch TrackMania normally.
-4. Put on the headset and enter a race. The normal game window remains available for troubleshooting.
+From an elevated PowerShell after building:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\install.ps1
+```
+
+The installer:
+
+1. Validates the game and built mod paths.
+2. Preserves an existing proxy as `d3d9.before-tmoxr.dll` when that backup does not already exist.
+3. Copies `build\d3d9.dll` beside `TmForever.exe`.
+4. Checks whether the local OpenXR loader is Win32. If it is missing or has the wrong architecture, it downloads the pinned official Khronos 1.1.62 Windows loader archive, verifies its SHA-256 checksum, and installs `Win32\bin\openxr_loader.dll`.
+
+Use a different game path or deliberately refresh the pinned loader with:
+
+```powershell
+.\scripts\install.ps1 -GamePath 'D:\Games\TrackMania United' -RefreshOpenXrLoader
+```
+
+## Manual install
+
+1. Back up any existing `d3d9.dll` in the TrackMania folder.
+2. Copy `build\d3d9.dll` beside `TmForever.exe` (normally `C:\Program Files (x86)\Steam\steamapps\common\TrackMania United`).
+3. Download the official Khronos [`openxr_loader_windows-1.1.62.zip`](https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-1.1.62/openxr_loader_windows-1.1.62.zip).
+4. Extract the archive and copy **`Win32\bin\openxr_loader.dll`** beside `TmForever.exe`. Do not use `x64\bin\openxr_loader.dll`.
+5. Set SteamVR as the active OpenXR runtime, start Virtual Desktop/SteamVR, and launch TrackMania normally.
+6. Put on the headset and enter a race.
+
+The loader package being version 1.1.62 does not require the application or active runtime to use OpenXR API 1.1. The mod deliberately requests OpenXR 1.0 for compatibility with runtimes that expose 1.0; newer loaders can negotiate that version normally.
 
 ## Diagnostics
 
-Every launch writes `TMOXR.log` beside `TmForever.exe`. It records the real D3D9 DLL location, device setup, OpenXR loader/runtime discovery, enabled extensions, system/session states, swapchain allocation, Direct3D copy failures, and shutdown. Attach this file when reporting a problem.
+Every launch writes `TMOXR.log` beside `TmForever.exe`. Attach the complete file when reporting a crash or initialization problem. For rendering problems, the periodic stereo, shader-coverage, tracked-pose, and OpenXR-timing lines are usually sufficient.
 
 Common messages:
 
-- `openxr_loader.dll was not found`: install/repair SteamVR or the active OpenXR runtime.
-- `XR_KHR_D3D11_enable is unavailable`: the selected runtime cannot receive the bridge's D3D11 textures. Switch to SteamVR's OpenXR runtime.
-- `OpenXR session is not running yet`: normal until the headset/runtime marks the session ready.
+- `openxr_loader.dll was not found`: run the install script or follow the manual Win32 loader steps above.
+- `xrCreateInstance failed: XrResult=-4`: the requested OpenXR API version is unsupported. Current builds request OpenXR 1.0; confirm that the deployed `d3d9.dll` is current.
+- `XR_KHR_D3D11_enable is unavailable`: switch to an OpenXR runtime that supports D3D11, such as SteamVR.
+- `OpenXR session state changed to ...`: normal runtime lifecycle reporting; rendering starts after the session reaches the ready/running states.
+- `D3D9 readback/lock failed`: disable MSAA in TrackMania and attach the complete log.
+- `OpenXR timing: ...`: reports the runtime display period and TrackMania's measured presentation rate.
+
+## Uninstall
+
+Remove this mod's `d3d9.dll` from the TrackMania folder and restore `d3d9.before-tmoxr.dll` if the installer created it. The local Win32 `openxr_loader.dll` may also be removed if no other local mod needs it.
