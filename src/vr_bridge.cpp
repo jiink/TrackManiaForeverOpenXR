@@ -514,10 +514,11 @@ void VrBridge::OnTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX& matrix)
 void VrBridge::SetRightEyeSurface(IDirect3DSurface9* surface) {
     if (!impl_) impl_ = new Impl;
     std::scoped_lock lock(impl_->mutex);
+    if (impl_->rightEyeSource == surface) return;
     if (surface) surface->AddRef();
     if (impl_->rightEyeSource) impl_->rightEyeSource->Release();
     impl_->rightEyeSource = surface;
-    log::Info(surface ? "Right-eye native stereo source attached." : "Right-eye native stereo source detached.");
+    log::Info(surface ? "Right-eye native stereo source changed." : "Right-eye native stereo source detached.");
 }
 
 void VrBridge::OnRenderTarget(IDirect3DSurface9* surface) {
