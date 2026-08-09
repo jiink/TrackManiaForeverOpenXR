@@ -64,6 +64,7 @@ struct VrBridge::Impl {
     PFN_xrBeginFrame beginFrame = nullptr;
     PFN_xrEndFrame endFrame = nullptr;
     PFN_xrLocateViews locateViews = nullptr;
+    PFN_xrEnumerateSwapchainFormats enumerateSwapchainFormats = nullptr;
     PFN_xrCreateSwapchain createSwapchain = nullptr;
     PFN_xrDestroySwapchain destroySwapchain = nullptr;
     PFN_xrEnumerateSwapchainImages enumerateImages = nullptr;
@@ -463,6 +464,7 @@ struct VrBridge::Impl {
             LoadProc(getProc, instance, "xrBeginFrame", beginFrame) &&
             LoadProc(getProc, instance, "xrEndFrame", endFrame) &&
             LoadProc(getProc, instance, "xrLocateViews", locateViews) &&
+            LoadProc(getProc, instance, "xrEnumerateSwapchainFormats", enumerateSwapchainFormats) &&
             LoadProc(getProc, instance, "xrCreateSwapchain", createSwapchain) &&
             LoadProc(getProc, instance, "xrDestroySwapchain", destroySwapchain) &&
             LoadProc(getProc, instance, "xrEnumerateSwapchainImages", enumerateImages) &&
@@ -543,13 +545,30 @@ struct VrBridge::Impl {
         }
         viewConfigs.assign(count, templateView);
         if (!Check(enumerateViews(instance, system, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, count, &count, viewConfigs.data()), "xrEnumerateViewConfigurationViews(data)")) return false;
+        uint32_t formatCount = 0;
+        if (!Check(enumerateSwapchainFormats(session, 0, &formatCount, nullptr), "xrEnumerateSwapchainFormats(count)") || !formatCount) return false;
+        std::vector<int64_t> supportedFormats(formatCount);
+        if (!Check(enumerateSwapchainFormats(session, formatCount, &formatCount, supportedFormats.data()), "xrEnumerateSwapchainFormats(data)")) return false;
+        constexpr int64_t preferredFormat = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        constexpr int64_t fallbackFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+        int64_t swapchainFormat = 0;
+        if (std::find(supportedFormats.begin(), supportedFormats.end(), preferredFormat) != supportedFormats.end()) {
+            swapchainFormat = preferredFormat;
+            log::Info("OpenXR swapchains will use DXGI_FORMAT_B8G8R8A8_UNORM_SRGB so TrackMania's gamma-encoded backbuffer retains its desktop contrast.");
+        } else if (std::find(supportedFormats.begin(), supportedFormats.end(), fallbackFormat) != supportedFormats.end()) {
+            swapchainFormat = fallbackFormat;
+            log::Warn("The OpenXR runtime does not support a BGRA sRGB swapchain; falling back to BGRA UNORM, which may look washed out.");
+        } else {
+            log::Error("The OpenXR runtime supports neither BGRA sRGB nor BGRA UNORM swapchains required by the D3D9 upload path.");
+            return false;
+        }
         swapchains.resize(count, XR_NULL_HANDLE);
         images.resize(count);
         for (uint32_t eye = 0; eye < count; ++eye) {
             const auto& config = viewConfigs[eye];
             XrSwapchainCreateInfo info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
-            info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
-            info.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+            info.format = swapchainFormat;
             info.sampleCount = 1;
             info.width = config.recommendedImageRectWidth;
             info.height = config.recommendedImageRectHeight;

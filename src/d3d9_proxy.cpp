@@ -787,14 +787,22 @@ void AnalyzeVertexShader(IDirect3DVertexShader9* shader) {
     std::string line;
     std::string matrixInstructions;
     std::string positionInstructions;
+    uint32_t positionWriteCount = 0;
+    bool standardPositionWrites = true;
     while (std::getline(lines, line)) {
         if (line.find("oPos") != std::string::npos || line.find("o0") != std::string::npos) {
-            if (!positionInstructions.empty()) positionInstructions += " | ";
-            positionInstructions += line;
+            ++positionWriteCount;
+            if (line.find("dp4 oPos.") == std::string::npos) standardPositionWrites = false;
+            if (positionInstructions.size() < 900) {
+                if (!positionInstructions.empty()) positionInstructions += " | ";
+                positionInstructions += line;
+            }
         }
         if (line.find("m4x") != std::string::npos || line.find("dp4") != std::string::npos) {
-            if (!matrixInstructions.empty()) matrixInstructions += " | ";
-            matrixInstructions += line;
+            if (matrixInstructions.size() < 900) {
+                if (!matrixInstructions.empty()) matrixInstructions += " | ";
+                matrixInstructions += line;
+            }
         }
         if (matrixInstructions.size() >= 900 && positionInstructions.size() >= 900) break;
     }
@@ -804,6 +812,10 @@ void AnalyzeVertexShader(IDirect3DVertexShader9* shader) {
     }
     if (!positionMapped && g_stereo.analyzedShaders.size() <= 64) {
         tmoxr::log::Info("Unmapped perspective vertex shader position instructions: " +
+            (positionInstructions.empty() ? std::string("none found") : positionInstructions));
+    }
+    if (positionMapped && (positionWriteCount != 4 || !standardPositionWrites)) {
+        tmoxr::log::Info("Nonstandard mapped vertex shader position instructions (possible billboard path): " +
             (positionInstructions.empty() ? std::string("none found") : positionInstructions));
     }
 }
