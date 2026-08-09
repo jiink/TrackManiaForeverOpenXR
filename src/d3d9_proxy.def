@@ -3,3 +3,5 @@ EXPORTS
     Direct3DCreate9
     Direct3DCreate9Ex
     D3DPERF_SetOptions
+    TMOXR_GetGamepadState
+    TMOXR_LogInputMessage

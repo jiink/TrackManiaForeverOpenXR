@@ -14,11 +14,17 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <sstream>
 #include <string>
 #include <vector>
+
+#ifndef TMOXR_EXPERIMENTAL_CULLING
+#define TMOXR_EXPERIMENTAL_CULLING 0
+#endif
 
 namespace {
 using Create9Fn = IDirect3D9* (WINAPI*)(UINT);
@@ -113,6 +119,16 @@ struct StereoResources {
     uint32_t untransformedShaderDraws = 0;
     uint32_t fixedFunctionDraws = 0;
     uint64_t presentedFrames = 0;
+#if TMOXR_EXPERIMENTAL_CULLING
+    uint64_t lastCameraScanFrame = 0;
+    std::vector<const uint8_t*> cameraObjects;
+    const uint8_t* activeCullingCamera = nullptr;
+    std::array<float, 6> baseCullingFrustum{};
+    std::array<float, 4> lastAppliedCullingBounds{};
+    bool haveBaseCullingFrustum = false;
+    bool haveLastAppliedCullingBounds = false;
+    uint64_t lastCullingLogFrame = 0;
+#endif
     bool customVertexShaderBound = false;
     IDirect3DVertexShader9* vertexShader = nullptr;
     std::vector<IDirect3DVertexShader9*> analyzedShaders;
@@ -125,6 +141,222 @@ struct StereoResources {
     D3DFORMAT primaryFormat = D3DFMT_UNKNOWN;
     bool ready = false;
 } g_stereo;
+
+#if TMOXR_EXPERIMENTAL_CULLING
+constexpr uintptr_t kCHmsCameraVtableRva = 0x00756554;
+constexpr size_t kCHmsCameraDiagnosticSize = 0x204;
+
+bool IsReadableMemory(const void* address, size_t size) {
+    if (!address || !size) return false;
+    MEMORY_BASIC_INFORMATION memory{};
+    if (!VirtualQuery(address, &memory, sizeof(memory)) || memory.State != MEM_COMMIT) return false;
+    if ((memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) return false;
+    const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+    const uintptr_t regionStart = reinterpret_cast<uintptr_t>(memory.BaseAddress);
+    const uintptr_t regionEnd = regionStart + memory.RegionSize;
+    return start >= regionStart && size <= regionEnd - start;
+}
+
+void FindCHmsCameraObjects() {
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    if (!module) return;
+    const uintptr_t expectedVtable = module + kCHmsCameraVtableRva;
+    std::vector<const uint8_t*> objects;
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    uintptr_t cursor = reinterpret_cast<uintptr_t>(system.lpMinimumApplicationAddress);
+    const uintptr_t maximum = reinterpret_cast<uintptr_t>(system.lpMaximumApplicationAddress);
+    while (cursor < maximum) {
+        MEMORY_BASIC_INFORMATION memory{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) || !memory.RegionSize) break;
+        const uintptr_t next = reinterpret_cast<uintptr_t>(memory.BaseAddress) + memory.RegionSize;
+        const DWORD protection = memory.Protect & 0xff;
+        const bool writable = protection == PAGE_READWRITE || protection == PAGE_WRITECOPY ||
+            protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
+        if (memory.State == MEM_COMMIT && memory.Type == MEM_PRIVATE && writable &&
+            (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0) {
+            const uintptr_t begin = (reinterpret_cast<uintptr_t>(memory.BaseAddress) + 3u) & ~uintptr_t(3u);
+            const uintptr_t end = next >= sizeof(uintptr_t) ? next - sizeof(uintptr_t) : begin;
+            for (uintptr_t candidate = begin; candidate <= end; candidate += sizeof(uint32_t)) {
+                if (*reinterpret_cast<const uintptr_t*>(candidate) != expectedVtable) continue;
+                const auto* object = reinterpret_cast<const uint8_t*>(candidate);
+                if (IsReadableMemory(object, kCHmsCameraDiagnosticSize)) objects.push_back(object);
+            }
+        }
+        if (next <= cursor) break;
+        cursor = next;
+    }
+    if (objects != g_stereo.cameraObjects) {
+        g_stereo.cameraObjects = std::move(objects);
+        tmoxr::log::Info("Camera diagnostic located " + std::to_string(g_stereo.cameraObjects.size()) +
+            " exact CHmsCamera object(s).");
+    }
+}
+
+template <typename T>
+T ReadCameraValue(const uint8_t* camera, size_t offset) {
+    T value{};
+    std::memcpy(&value, camera + offset, sizeof(value));
+    return value;
+}
+
+void ResetActiveCullingCamera() {
+    g_stereo.activeCullingCamera = nullptr;
+    g_stereo.haveBaseCullingFrustum = false;
+    g_stereo.haveLastAppliedCullingBounds = false;
+}
+
+bool ApproximatelyEqual(float left, float right, float relativeTolerance = 0.025f) {
+    return std::abs(left - right) <= relativeTolerance * std::max({1.0f, std::abs(left), std::abs(right)});
+}
+
+bool IsPlausiblePerspectiveCamera(const uint8_t* camera) {
+    if (ReadCameraValue<uint32_t>(camera, 0x118) != 0) return false;
+    const float left = ReadCameraValue<float>(camera, 0x11c);
+    const float bottom = ReadCameraValue<float>(camera, 0x120);
+    const float nearZ = ReadCameraValue<float>(camera, 0x124);
+    const float right = ReadCameraValue<float>(camera, 0x128);
+    const float top = ReadCameraValue<float>(camera, 0x12c);
+    const float farZ = ReadCameraValue<float>(camera, 0x130);
+    return std::isfinite(left) && std::isfinite(bottom) && std::isfinite(nearZ) &&
+        std::isfinite(right) && std::isfinite(top) && std::isfinite(farZ) &&
+        left < -0.01f && right > 0.01f && bottom < -0.01f && top > 0.01f &&
+        nearZ >= 0.01f && farZ > nearZ && farZ < 10000000.0f;
+}
+
+bool CameraMatchesGameProjection(const uint8_t* camera) {
+    if (!IsPlausiblePerspectiveCamera(camera) || !g_stereo.perspective) return false;
+    const float left = ReadCameraValue<float>(camera, 0x11c);
+    const float bottom = ReadCameraValue<float>(camera, 0x120);
+    const float right = ReadCameraValue<float>(camera, 0x128);
+    const float top = ReadCameraValue<float>(camera, 0x12c);
+    const float horizontalScale = 2.0f / (right - left);
+    const float verticalScale = 2.0f / (top - bottom);
+    return ApproximatelyEqual(std::abs(g_stereo.projection._11), horizontalScale) &&
+        ApproximatelyEqual(std::abs(g_stereo.projection._22), verticalScale);
+}
+
+void CaptureBaseCullingFrustum(const uint8_t* camera) {
+    for (size_t index = 0; index < g_stereo.baseCullingFrustum.size(); ++index) {
+        g_stereo.baseCullingFrustum[index] = ReadCameraValue<float>(camera, 0x11c + index * sizeof(float));
+    }
+    g_stereo.haveBaseCullingFrustum = true;
+}
+
+void WriteCameraFloat(const uint8_t* camera, size_t offset, float value) {
+    std::memcpy(const_cast<uint8_t*>(camera) + offset, &value, sizeof(value));
+}
+
+void ExpandActiveCameraCullingFrustum() {
+    if (!g_stereo.haveHeadPose || !g_stereo.perspective) return;
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    if (g_stereo.activeCullingCamera &&
+        (!IsReadableMemory(g_stereo.activeCullingCamera, kCHmsCameraDiagnosticSize) ||
+         ReadCameraValue<uintptr_t>(g_stereo.activeCullingCamera, 0) != module + kCHmsCameraVtableRva)) {
+        ResetActiveCullingCamera();
+    }
+    if (!g_stereo.activeCullingCamera) {
+        for (const auto* camera : g_stereo.cameraObjects) {
+            if (!CameraMatchesGameProjection(camera)) continue;
+            g_stereo.activeCullingCamera = camera;
+            CaptureBaseCullingFrustum(camera);
+            tmoxr::log::Info("Matched the active TrackMania CHmsCamera to the current D3D projection; enabling dynamic head-view culling expansion.");
+            break;
+        }
+    }
+    const auto* camera = g_stereo.activeCullingCamera;
+    if (!camera || !IsPlausiblePerspectiveCamera(camera)) return;
+
+    const std::array<float, 4> currentBounds = {
+        ReadCameraValue<float>(camera, 0x11c), ReadCameraValue<float>(camera, 0x120),
+        ReadCameraValue<float>(camera, 0x128), ReadCameraValue<float>(camera, 0x12c)};
+    if (g_stereo.haveLastAppliedCullingBounds) {
+        bool gameReplacedBounds = false;
+        for (size_t index = 0; index < currentBounds.size(); ++index) {
+            if (!ApproximatelyEqual(currentBounds[index], g_stereo.lastAppliedCullingBounds[index], 0.001f)) {
+                gameReplacedBounds = true;
+                break;
+            }
+        }
+        if (gameReplacedBounds) CaptureBaseCullingFrustum(camera);
+    } else if (!g_stereo.haveBaseCullingFrustum) {
+        CaptureBaseCullingFrustum(camera);
+    }
+
+    const float x = g_stereo.headPose.orientation[0];
+    const float y = g_stereo.headPose.orientation[1];
+    const float z = g_stereo.headPose.orientation[2];
+    const float w = g_stereo.headPose.orientation[3];
+    const float forwardX = 2.0f * (x * z + y * w);
+    const float forwardY = -2.0f * (y * z - x * w);
+    const float forwardZ = 1.0f - 2.0f * (x * x + y * y);
+    const float yaw = std::abs(std::atan2(forwardX, forwardZ));
+    const float pitch = std::abs(std::atan2(-forwardY, std::sqrt(forwardX * forwardX + forwardZ * forwardZ)));
+    float eyeHalfHorizontal = std::atan(std::max(-g_stereo.baseCullingFrustum[0], g_stereo.baseCullingFrustum[3]));
+    float eyeHalfVertical = std::atan(std::max(-g_stereo.baseCullingFrustum[1], g_stereo.baseCullingFrustum[4]));
+    if (g_stereo.haveRenderConfiguration) {
+        for (const auto& eye : g_stereo.renderConfiguration.eyes) {
+            eyeHalfHorizontal = std::max(eyeHalfHorizontal, std::max(std::abs(eye.angleLeft), std::abs(eye.angleRight)));
+            eyeHalfVertical = std::max(eyeHalfVertical, std::max(std::abs(eye.angleDown), std::abs(eye.angleUp)));
+        }
+    }
+    constexpr float maximumHalfAngle = 1.483529864f; // 85 degrees; a perspective frustum cannot include the rear hemisphere.
+    const float horizontalExtent = std::tan(std::min(maximumHalfAngle, yaw + eyeHalfHorizontal));
+    const float verticalExtent = std::tan(std::min(maximumHalfAngle, pitch + eyeHalfVertical));
+    const std::array<float, 4> expandedBounds = {
+        std::min(g_stereo.baseCullingFrustum[0], -horizontalExtent),
+        std::min(g_stereo.baseCullingFrustum[1], -verticalExtent),
+        std::max(g_stereo.baseCullingFrustum[3], horizontalExtent),
+        std::max(g_stereo.baseCullingFrustum[4], verticalExtent)};
+    WriteCameraFloat(camera, 0x11c, expandedBounds[0]);
+    WriteCameraFloat(camera, 0x120, expandedBounds[1]);
+    WriteCameraFloat(camera, 0x128, expandedBounds[2]);
+    WriteCameraFloat(camera, 0x12c, expandedBounds[3]);
+    g_stereo.lastAppliedCullingBounds = expandedBounds;
+    g_stereo.haveLastAppliedCullingBounds = true;
+    if (!g_stereo.lastCullingLogFrame || g_stereo.presentedFrames - g_stereo.lastCullingLogFrame >= 180) {
+        g_stereo.lastCullingLogFrame = g_stereo.presentedFrames;
+        tmoxr::log::Info("Dynamic culling frustum: head yaw/pitch=" + std::to_string(yaw * 57.2957795f) + "/" +
+            std::to_string(pitch * 57.2957795f) + " degrees, bounds=(" +
+            std::to_string(expandedBounds[0]) + "," + std::to_string(expandedBounds[1]) + "," +
+            std::to_string(expandedBounds[2]) + "," + std::to_string(expandedBounds[3]) + ").");
+    }
+}
+
+void LogCHmsCameraObjects() {
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    std::vector<const uint8_t*> validObjects;
+    validObjects.reserve(g_stereo.cameraObjects.size());
+    for (size_t index = 0; index < g_stereo.cameraObjects.size(); ++index) {
+        const auto* camera = g_stereo.cameraObjects[index];
+        if (!IsReadableMemory(camera, kCHmsCameraDiagnosticSize) ||
+            ReadCameraValue<uintptr_t>(camera, 0) != module + kCHmsCameraVtableRva) {
+            tmoxr::log::Warn("Camera diagnostic object " + std::to_string(index) + " is no longer valid; a rescan will be attempted.");
+            if (camera == g_stereo.activeCullingCamera) ResetActiveCullingCamera();
+            continue;
+        }
+        validObjects.push_back(camera);
+        std::ostringstream address;
+        address << std::hex << std::uppercase << reinterpret_cast<uintptr_t>(camera);
+        tmoxr::log::Info("CHmsCamera diagnostic " + std::to_string(index) + " at 0x" + address.str() +
+            ": frustum type=" + std::to_string(ReadCameraValue<uint32_t>(camera, 0x118)) +
+            ", raw bounds=(" + std::to_string(ReadCameraValue<float>(camera, 0x11c)) + "," +
+            std::to_string(ReadCameraValue<float>(camera, 0x120)) + "," +
+            std::to_string(ReadCameraValue<float>(camera, 0x124)) + "," +
+            std::to_string(ReadCameraValue<float>(camera, 0x128)) + "," +
+            std::to_string(ReadCameraValue<float>(camera, 0x12c)) + "," +
+            std::to_string(ReadCameraValue<float>(camera, 0x130)) + ")" +
+            ", fields 134/164/168/16c/170/200=(" +
+            std::to_string(ReadCameraValue<float>(camera, 0x134)) + "," +
+            std::to_string(ReadCameraValue<float>(camera, 0x164)) + "," +
+            std::to_string(ReadCameraValue<float>(camera, 0x168)) + "," +
+            std::to_string(ReadCameraValue<float>(camera, 0x16c)) + "," +
+            std::to_string(ReadCameraValue<float>(camera, 0x170)) + "," +
+            std::to_string(ReadCameraValue<float>(camera, 0x200)) + ").");
+    }
+    g_stereo.cameraObjects = std::move(validObjects);
+}
+#endif
 
 void ReleasePrivateEyeTargets() {
     tmoxr::VrBridge::Instance().SetLeftEyeSurface(nullptr);
@@ -264,6 +496,7 @@ bool CreateStereoResources(IDirect3DDevice9* device) {
     }
     g_stereo.ready = true;
     tmoxr::log::Info("Experimental native stereo resources initialized: " + std::to_string(color.Width) + "x" + std::to_string(color.Height) + ".");
+    tmoxr::log::Info("Stereo camera baseline for TrackMania's reflected X projection: left=0.000 m, right=-0.064 m.");
     return true;
 }
 
@@ -392,9 +625,9 @@ Matrix4 HeadViewMatrix(float eyeOffsetMeters) {
     return view;
 }
 
-Matrix4 ApplyHeadPoseToCombinedMatrix(const Matrix4& original, float eyeOffsetMeters) {
+Matrix4 ApplyHeadPoseToCombinedMatrix(const Matrix4& original, float eyeOffsetMeters, bool rightEye) {
     const Matrix4 projection = TransposedProjection();
-    const Matrix4 eyeProjection = EyeProjection(eyeOffsetMeters > 0.0f);
+    const Matrix4 eyeProjection = EyeProjection(rightEye);
     Matrix4 inverseProjection{};
     if (!InvertMatrix(projection, inverseProjection)) {
         Matrix4 fallback = original;
@@ -418,8 +651,8 @@ D3DMATRIX MultiplyD3DMatrix(const D3DMATRIX& a, const D3DMATRIX& b) {
     return result;
 }
 
-void SetFixedFunctionEyePose(IDirect3DDevice9* device, float eyeOffsetMeters) {
-    const Matrix4 projectionColumn = EyeProjection(eyeOffsetMeters > 0.0f);
+void SetFixedFunctionEyePose(IDirect3DDevice9* device, float eyeOffsetMeters, bool rightEye) {
+    const Matrix4 projectionColumn = EyeProjection(rightEye);
     D3DMATRIX projectionRow{};
     float* projectionOutput = &projectionRow._11;
     for (UINT row = 0; row < 4; ++row) {
@@ -455,9 +688,9 @@ ShaderEyeState CaptureShaderEyeState(IDirect3DDevice9* device) {
     return state;
 }
 
-void ApplyShaderEyeState(IDirect3DDevice9* device, const ShaderEyeState& state, float eyeOffsetMeters) {
+void ApplyShaderEyeState(IDirect3DDevice9* device, const ShaderEyeState& state, float eyeOffsetMeters, bool rightEye) {
     if (!state.active) return;
-    const auto matrix = ApplyHeadPoseToCombinedMatrix(state.original, eyeOffsetMeters);
+    const auto matrix = ApplyHeadPoseToCombinedMatrix(state.original, eyeOffsetMeters, rightEye);
     g_originalSetVertexShaderConstantF(device, state.baseRegister, matrix.data(), 4);
     if (!g_stereo.shaderPositionLogWritten) {
         g_stereo.shaderPositionLogWritten = true;
@@ -484,7 +717,9 @@ void BeginTrackedEye(IDirect3DDevice9* device, bool rightEye) {
     }
     D3DVIEWPORT9 viewport{0, 0, g_stereo.renderWidth, g_stereo.renderHeight, 0.0f, 1.0f};
     device->SetViewport(&viewport);
-    SetFixedFunctionEyePose(device, rightEye ? +0.064f : 0.0f);
+    // TrackMania's projection reflects X, so its right-eye camera translation
+    // has the opposite sign from an ordinary positive-X projection.
+    SetFixedFunctionEyePose(device, rightEye ? -0.064f : 0.0f, rightEye);
 }
 
 void RestoreGameEye(IDirect3DDevice9* device) {
@@ -556,7 +791,19 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
     tmoxr::VrBridge::Instance().SetLeftEyeSurface(g_stereo.trackedLeftColor);
     tmoxr::VrBridge::Instance().SetRightEyeSurface(g_stereo.rightColor);
     tmoxr::VrBridge::Instance().OnBeforePresent(device);
-    if (++g_stereo.presentedFrames % 180 == 0) {
+    ++g_stereo.presentedFrames;
+#if TMOXR_EXPERIMENTAL_CULLING
+    if (g_stereo.cameraObjects.empty() &&
+        (!g_stereo.lastCameraScanFrame || g_stereo.presentedFrames - g_stereo.lastCameraScanFrame >= 180)) {
+        g_stereo.lastCameraScanFrame = g_stereo.presentedFrames;
+        FindCHmsCameraObjects();
+        LogCHmsCameraObjects();
+    }
+#endif
+    if (g_stereo.presentedFrames % 180 == 0) {
+#if TMOXR_EXPERIMENTAL_CULLING
+        LogCHmsCameraObjects();
+#endif
         UINT likelyRegister = 0;
         uint32_t likelyCount = 0;
         for (UINT registerIndex = 0; registerIndex < g_stereo.perspectiveMatrixCandidates.size(); ++registerIndex) {
@@ -609,6 +856,9 @@ HRESULT STDMETHODCALLTYPE BeginSceneHook(IDirect3DDevice9* device) {
     if (tmoxr::VrBridge::Instance().GetRenderConfiguration(renderConfiguration)) {
         UpdateStereoRenderConfiguration(renderConfiguration);
     }
+#if TMOXR_EXPERIMENTAL_CULLING
+    ExpandActiveCameraCullingFrustum();
+#endif
     return g_originalBeginScene(device);
 }
 
@@ -704,10 +954,10 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITI
     else ++g_stereo.fixedFunctionDraws;
     const HRESULT game = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
     BeginTrackedEye(device, false);
-    ApplyShaderEyeState(device, shaderEye, 0.0f);
+    ApplyShaderEyeState(device, shaderEye, 0.0f, false);
     const HRESULT left = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
     BeginTrackedEye(device, true);
-    ApplyShaderEyeState(device, shaderEye, +0.064f);
+    ApplyShaderEyeState(device, shaderEye, -0.064f, true);
     const HRESULT right = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
     if (FAILED(right) && !g_stereo.rightDrawFailureLogged) {
         g_stereo.rightDrawFailureLogged = true;
@@ -737,10 +987,10 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3D
     else ++g_stereo.fixedFunctionDraws;
     const HRESULT game = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
     BeginTrackedEye(device, false);
-    ApplyShaderEyeState(device, shaderEye, 0.0f);
+    ApplyShaderEyeState(device, shaderEye, 0.0f, false);
     const HRESULT left = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
     BeginTrackedEye(device, true);
-    ApplyShaderEyeState(device, shaderEye, +0.064f);
+    ApplyShaderEyeState(device, shaderEye, -0.064f, true);
     const HRESULT right = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
     if (FAILED(right) && !g_stereo.rightDrawFailureLogged) {
         g_stereo.rightDrawFailureLogged = true;
@@ -874,6 +1124,15 @@ __declspec(dllexport) HRESULT WINAPI Direct3DCreate9Ex(UINT sdkVersion, IDirect3
 extern "C" __declspec(dllexport) void WINAPI D3DPERF_SetOptions(DWORD options) {
     LoadRealD3D9();
     if (g_perfSetOptions) g_perfSetOptions(options);
+}
+
+extern "C" __declspec(dllexport) BOOL WINAPI TMOXR_GetGamepadState(tmoxr::GamepadState* state) {
+    if (!state || state->size != sizeof(tmoxr::GamepadState)) return FALSE;
+    return tmoxr::VrBridge::Instance().GetGamepadState(*state) ? TRUE : FALSE;
+}
+
+extern "C" __declspec(dllexport) void WINAPI TMOXR_LogInputMessage(const char* message) {
+    if (message) tmoxr::log::Info(std::string("Input proxy: ") + message);
 }
 
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {

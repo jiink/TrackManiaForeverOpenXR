@@ -70,11 +70,30 @@ struct VrBridge::Impl {
     PFN_xrAcquireSwapchainImage acquireImage = nullptr;
     PFN_xrWaitSwapchainImage waitImage = nullptr;
     PFN_xrReleaseSwapchainImage releaseImage = nullptr;
+    PFN_xrStringToPath stringToPath = nullptr;
+    PFN_xrCreateActionSet createActionSet = nullptr;
+    PFN_xrDestroyActionSet destroyActionSet = nullptr;
+    PFN_xrCreateAction createAction = nullptr;
+    PFN_xrSuggestInteractionProfileBindings suggestBindings = nullptr;
+    PFN_xrAttachSessionActionSets attachActionSets = nullptr;
+    PFN_xrSyncActions syncActions = nullptr;
+    PFN_xrGetActionStateBoolean getActionStateBoolean = nullptr;
+    PFN_xrGetActionStateFloat getActionStateFloat = nullptr;
+    PFN_xrGetActionStateVector2f getActionStateVector2f = nullptr;
 
     XrInstance instance = XR_NULL_HANDLE;
     XrSystemId system = XR_NULL_SYSTEM_ID;
     XrSession session = XR_NULL_HANDLE;
     XrSpace space = XR_NULL_HANDLE;
+    XrActionSet controllerActionSet = XR_NULL_HANDLE;
+    XrAction triggerAction = XR_NULL_HANDLE;
+    XrAction squeezeAction = XR_NULL_HANDLE;
+    XrAction thumbstickAction = XR_NULL_HANDLE;
+    XrAction primaryAction = XR_NULL_HANDLE;
+    XrAction secondaryAction = XR_NULL_HANDLE;
+    XrAction thumbstickClickAction = XR_NULL_HANDLE;
+    XrAction menuAction = XR_NULL_HANDLE;
+    std::array<XrPath, 2> handPaths{XR_NULL_PATH, XR_NULL_PATH};
     std::vector<XrSwapchain> swapchains;
     std::vector<std::vector<XrSwapchainImageD3D11KHR>> images;
     std::vector<XrViewConfigurationView> viewConfigs;
@@ -116,6 +135,10 @@ struct VrBridge::Impl {
     bool haveBaseHeadPose = false;
     bool haveHeadPose = false;
     bool haveRenderConfiguration = false;
+    GamepadState gamepadState{};
+    bool controllerActionsAttached = false;
+    bool controllerActiveLogged = false;
+    bool controllerActionErrorLogged = false;
     bool perspectiveProjectionActive = false;
     D3DSURFACE_DESC activeTarget{};
     D3DSURFACE_DESC perspectiveTarget{};
@@ -222,6 +245,169 @@ struct VrBridge::Impl {
         haveRenderConfiguration = true;
     }
 
+    bool CreateControllerAction(XrActionType type, const char* name, const char* localizedName, XrAction& action) {
+        XrActionCreateInfo info{XR_TYPE_ACTION_CREATE_INFO};
+        info.actionType = type;
+        std::strncpy(info.actionName, name, XR_MAX_ACTION_NAME_SIZE - 1);
+        std::strncpy(info.localizedActionName, localizedName, XR_MAX_LOCALIZED_ACTION_NAME_SIZE - 1);
+        info.countSubactionPaths = static_cast<uint32_t>(handPaths.size());
+        info.subactionPaths = handPaths.data();
+        return Check(createAction(controllerActionSet, &info, &action), "xrCreateAction(controller)");
+    }
+
+    bool CreateControllerActions() {
+        if (!stringToPath || !createActionSet || !createAction || !suggestBindings) return false;
+        if (!Check(stringToPath(instance, "/user/hand/left", &handPaths[0]), "xrStringToPath(left hand)") ||
+            !Check(stringToPath(instance, "/user/hand/right", &handPaths[1]), "xrStringToPath(right hand)")) return false;
+        XrActionSetCreateInfo setInfo{XR_TYPE_ACTION_SET_CREATE_INFO};
+        std::strncpy(setInfo.actionSetName, "tmoxr_gamepad", XR_MAX_ACTION_SET_NAME_SIZE - 1);
+        std::strncpy(setInfo.localizedActionSetName, "TrackMania VR Gamepad", XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE - 1);
+        setInfo.priority = 0;
+        if (!Check(createActionSet(instance, &setInfo, &controllerActionSet), "xrCreateActionSet(controller)")) return false;
+        if (!CreateControllerAction(XR_ACTION_TYPE_FLOAT_INPUT, "trigger", "Triggers", triggerAction) ||
+            !CreateControllerAction(XR_ACTION_TYPE_FLOAT_INPUT, "squeeze", "Bumpers", squeezeAction) ||
+            !CreateControllerAction(XR_ACTION_TYPE_VECTOR2F_INPUT, "thumbstick", "Thumbsticks", thumbstickAction) ||
+            !CreateControllerAction(XR_ACTION_TYPE_BOOLEAN_INPUT, "primary_button", "Primary buttons", primaryAction) ||
+            !CreateControllerAction(XR_ACTION_TYPE_BOOLEAN_INPUT, "secondary_button", "Secondary buttons", secondaryAction) ||
+            !CreateControllerAction(XR_ACTION_TYPE_BOOLEAN_INPUT, "thumbstick_click", "Thumbstick clicks", thumbstickClickAction) ||
+            !CreateControllerAction(XR_ACTION_TYPE_BOOLEAN_INPUT, "menu_button", "Menu button", menuAction)) return false;
+
+        std::vector<XrActionSuggestedBinding> bindings;
+        auto bind = [&](XrAction action, const char* path) {
+            XrPath bindingPath = XR_NULL_PATH;
+            if (XR_SUCCEEDED(stringToPath(instance, path, &bindingPath))) bindings.push_back({action, bindingPath});
+        };
+        bind(triggerAction, "/user/hand/left/input/trigger/value");
+        bind(triggerAction, "/user/hand/right/input/trigger/value");
+        bind(squeezeAction, "/user/hand/left/input/squeeze/value");
+        bind(squeezeAction, "/user/hand/right/input/squeeze/value");
+        bind(thumbstickAction, "/user/hand/left/input/thumbstick");
+        bind(thumbstickAction, "/user/hand/right/input/thumbstick");
+        bind(primaryAction, "/user/hand/left/input/x/click");
+        bind(primaryAction, "/user/hand/right/input/a/click");
+        bind(secondaryAction, "/user/hand/left/input/y/click");
+        bind(secondaryAction, "/user/hand/right/input/b/click");
+        bind(thumbstickClickAction, "/user/hand/left/input/thumbstick/click");
+        bind(thumbstickClickAction, "/user/hand/right/input/thumbstick/click");
+        bind(menuAction, "/user/hand/left/input/menu/click");
+        XrPath profile = XR_NULL_PATH;
+        if (!Check(stringToPath(instance, "/interaction_profiles/oculus/touch_controller", &profile), "xrStringToPath(Touch profile)")) return false;
+        XrInteractionProfileSuggestedBinding suggested{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+        suggested.interactionProfile = profile;
+        suggested.countSuggestedBindings = static_cast<uint32_t>(bindings.size());
+        suggested.suggestedBindings = bindings.data();
+        const XrResult suggestionResult = suggestBindings(instance, &suggested);
+        if (XR_FAILED(suggestionResult)) {
+            log::Warn("OpenXR rejected Meta/Oculus Touch gamepad bindings (" + Result(suggestionResult) + ").");
+            return false;
+        }
+        log::Info("Registered OpenXR Meta/Oculus Touch bindings for the virtual gamepad.");
+        return true;
+    }
+
+    bool AttachControllerActions() {
+        if (controllerActionSet == XR_NULL_HANDLE) return false;
+        XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+        attach.countActionSets = 1;
+        attach.actionSets = &controllerActionSet;
+        controllerActionsAttached = Check(attachActionSets(session, &attach), "xrAttachSessionActionSets(controller)");
+        return controllerActionsAttached;
+    }
+
+    float ControllerFloat(XrAction action, XrPath hand, bool& active) {
+        XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+        info.action = action;
+        info.subactionPath = hand;
+        XrActionStateFloat state{XR_TYPE_ACTION_STATE_FLOAT};
+        const XrResult result = getActionStateFloat(session, &info, &state);
+        if (XR_FAILED(result)) {
+            LogControllerActionError("xrGetActionStateFloat", result);
+            return 0.0f;
+        }
+        if (!state.isActive) return 0.0f;
+        active = true;
+        return std::clamp(state.currentState, 0.0f, 1.0f);
+    }
+
+    bool ControllerBoolean(XrAction action, XrPath hand, bool& active) {
+        XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+        info.action = action;
+        info.subactionPath = hand;
+        XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
+        const XrResult result = getActionStateBoolean(session, &info, &state);
+        if (XR_FAILED(result)) {
+            LogControllerActionError("xrGetActionStateBoolean", result);
+            return false;
+        }
+        if (!state.isActive) return false;
+        active = true;
+        return state.currentState != XR_FALSE;
+    }
+
+    XrVector2f ControllerStick(XrPath hand, bool& active) {
+        XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+        info.action = thumbstickAction;
+        info.subactionPath = hand;
+        XrActionStateVector2f state{XR_TYPE_ACTION_STATE_VECTOR2F};
+        const XrResult result = getActionStateVector2f(session, &info, &state);
+        if (XR_FAILED(result)) {
+            LogControllerActionError("xrGetActionStateVector2f", result);
+            return {};
+        }
+        if (!state.isActive) return {};
+        active = true;
+        return state.currentState;
+    }
+
+    void SyncControllerState() {
+        if (!controllerActionsAttached || !syncActions) return;
+        XrActiveActionSet activeSet{controllerActionSet, XR_NULL_PATH};
+        XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
+        sync.countActiveActionSets = 1;
+        sync.activeActionSets = &activeSet;
+        const XrResult syncResult = syncActions(session, &sync);
+        if (XR_FAILED(syncResult)) {
+            LogControllerActionError("xrSyncActions", syncResult);
+            GamepadState neutral{};
+            neutral.sample = gamepadState.sample + 1;
+            gamepadState = neutral;
+            return;
+        }
+        bool active = false;
+        const XrVector2f leftStick = ControllerStick(handPaths[0], active);
+        const XrVector2f rightStick = ControllerStick(handPaths[1], active);
+        GamepadState next{};
+        next.leftX = leftStick.x;
+        next.leftY = leftStick.y;
+        next.rightX = rightStick.x;
+        next.rightY = rightStick.y;
+        next.leftTrigger = ControllerFloat(triggerAction, handPaths[0], active);
+        next.rightTrigger = ControllerFloat(triggerAction, handPaths[1], active);
+        if (ControllerFloat(squeezeAction, handPaths[0], active) > 0.5f) next.buttons |= GamepadLeftBumper;
+        if (ControllerFloat(squeezeAction, handPaths[1], active) > 0.5f) next.buttons |= GamepadRightBumper;
+        if (ControllerBoolean(primaryAction, handPaths[0], active)) next.buttons |= GamepadX;
+        if (ControllerBoolean(primaryAction, handPaths[1], active)) next.buttons |= GamepadA;
+        if (ControllerBoolean(secondaryAction, handPaths[0], active)) next.buttons |= GamepadY;
+        if (ControllerBoolean(secondaryAction, handPaths[1], active)) next.buttons |= GamepadB;
+        if (ControllerBoolean(thumbstickClickAction, handPaths[0], active)) next.buttons |= GamepadLeftStick;
+        if (ControllerBoolean(thumbstickClickAction, handPaths[1], active)) next.buttons |= GamepadRightStick;
+        if (ControllerBoolean(menuAction, handPaths[0], active)) next.buttons |= GamepadBack;
+        next.connected = active;
+        next.sample = gamepadState.sample + 1;
+        gamepadState = next;
+        if (active && !controllerActiveLogged) {
+            controllerActiveLogged = true;
+            log::Info("OpenXR Touch controllers are active as a virtual DirectInput gamepad.");
+        }
+    }
+
+    void LogControllerActionError(const char* operation, XrResult result) {
+        if (controllerActionErrorLogged) return;
+        controllerActionErrorLogged = true;
+        log::Warn(std::string(operation) + " failed for the virtual gamepad (" + Result(result) +
+            "). Controller input has been neutralized; VR rendering will continue.");
+    }
+
     void DestroySwapchains() {
         if (destroySwapchain) for (auto swapchain : swapchains) destroySwapchain(swapchain);
         swapchains.clear();
@@ -236,6 +422,8 @@ struct VrBridge::Impl {
         space = XR_NULL_HANDLE;
         if (session != XR_NULL_HANDLE && destroySession) destroySession(session);
         session = XR_NULL_HANDLE;
+        if (controllerActionSet != XR_NULL_HANDLE && destroyActionSet) destroyActionSet(controllerActionSet);
+        controllerActionSet = XR_NULL_HANDLE;
         if (instance != XR_NULL_HANDLE && destroyInstance) destroyInstance(instance);
         instance = XR_NULL_HANDLE;
         if (loader) FreeLibrary(loader);
@@ -253,6 +441,9 @@ struct VrBridge::Impl {
         haveBaseHeadPose = false;
         haveHeadPose = false;
         haveRenderConfiguration = false;
+        controllerActionsAttached = false;
+        controllerActiveLogged = false;
+        gamepadState = {};
         activeFrameState = XrFrameState{XR_TYPE_FRAME_STATE};
     }
 
@@ -277,7 +468,17 @@ struct VrBridge::Impl {
             LoadProc(getProc, instance, "xrEnumerateSwapchainImages", enumerateImages) &&
             LoadProc(getProc, instance, "xrAcquireSwapchainImage", acquireImage) &&
             LoadProc(getProc, instance, "xrWaitSwapchainImage", waitImage) &&
-            LoadProc(getProc, instance, "xrReleaseSwapchainImage", releaseImage);
+            LoadProc(getProc, instance, "xrReleaseSwapchainImage", releaseImage) &&
+            LoadProc(getProc, instance, "xrStringToPath", stringToPath) &&
+            LoadProc(getProc, instance, "xrCreateActionSet", createActionSet) &&
+            LoadProc(getProc, instance, "xrDestroyActionSet", destroyActionSet) &&
+            LoadProc(getProc, instance, "xrCreateAction", createAction) &&
+            LoadProc(getProc, instance, "xrSuggestInteractionProfileBindings", suggestBindings) &&
+            LoadProc(getProc, instance, "xrAttachSessionActionSets", attachActionSets) &&
+            LoadProc(getProc, instance, "xrSyncActions", syncActions) &&
+            LoadProc(getProc, instance, "xrGetActionStateBoolean", getActionStateBoolean) &&
+            LoadProc(getProc, instance, "xrGetActionStateFloat", getActionStateFloat) &&
+            LoadProc(getProc, instance, "xrGetActionStateVector2f", getActionStateVector2f);
     }
 
     bool CreateD3D11Device(const XrGraphicsRequirementsD3D11KHR& requirements) {
@@ -413,6 +614,11 @@ struct VrBridge::Impl {
         instanceInfo.enabledExtensionNames = enabledExtensions;
         if (!Check(createInstance(&instanceInfo, &instance), "xrCreateInstance")) { permanentlyDisabled = true; DestroyOpenXR(); return false; }
         if (!LoadFunctions()) { permanentlyDisabled = true; DestroyOpenXR(); return false; }
+        if (!CreateControllerActions()) {
+            if (controllerActionSet != XR_NULL_HANDLE && destroyActionSet) destroyActionSet(controllerActionSet);
+            controllerActionSet = XR_NULL_HANDLE;
+            log::Warn("OpenXR Touch gamepad actions are unavailable; headset rendering will continue without the virtual controller.");
+        }
         XrSystemGetInfo systemInfo{XR_TYPE_SYSTEM_GET_INFO};
         systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
         if (!Check(getSystem(instance, &systemInfo, &system), "xrGetSystem")) { permanentlyDisabled = true; DestroyOpenXR(); return false; }
@@ -425,6 +631,7 @@ struct VrBridge::Impl {
         sessionInfo.next = &binding;
         sessionInfo.systemId = system;
         if (!Check(createSession(instance, &sessionInfo, &session), "xrCreateSession")) { permanentlyDisabled = true; DestroyOpenXR(); return false; }
+        AttachControllerActions();
         XrReferenceSpaceCreateInfo spaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
         spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
         spaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
@@ -463,6 +670,7 @@ struct VrBridge::Impl {
         if (!Initialize()) return;
         PollEvents();
         if (!sessionRunning) return;
+        SyncControllerState();
         XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
         activeFrameState = XrFrameState{XR_TYPE_FRAME_STATE};
         if (!Check(waitFrame(session, &waitInfo, &activeFrameState), "xrWaitFrame")) return;
@@ -730,6 +938,13 @@ bool VrBridge::GetRenderConfiguration(RenderConfiguration& configuration) {
     if (!impl_->haveRenderConfiguration) return false;
     configuration = impl_->renderConfiguration;
     return true;
+}
+
+bool VrBridge::GetGamepadState(GamepadState& state) {
+    if (!impl_) return false;
+    std::scoped_lock lock(impl_->mutex);
+    state = impl_->gamepadState;
+    return state.connected;
 }
 
 void VrBridge::OnRenderTarget(IDirect3DSurface9* surface) {

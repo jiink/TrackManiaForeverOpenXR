@@ -34,9 +34,11 @@ std::string Timestamp() {
 void Initialize() {
     std::scoped_lock lock(g_mutex);
     if (g_file.is_open()) return;
-    g_file.open(LogPath(), std::ios::out | std::ios::app);
+    // One launch, one diagnostic file. Keeping prior sessions made it too easy
+    // to mistake an old experimental message for the currently deployed build.
+    g_file.open(LogPath(), std::ios::out | std::ios::trunc);
     if (g_file.is_open()) {
-        g_file << "\n========== TrackMania OpenXR bridge started ==========" << std::endl;
+        g_file << "========== TrackMania OpenXR bridge started ==========" << std::endl;
     }
 }
 

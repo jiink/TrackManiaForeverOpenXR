@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.24)
 
 project(TrackManiaOpenXRBridge LANGUAGES CXX)
 
+option(TMOXR_EXPERIMENTAL_CULLING "Enable unfinished TrackMania camera/frustum experiments" OFF)
+
 if(NOT WIN32 OR NOT MSVC)
   message(FATAL_ERROR "This project builds a Win32 Direct3D 9 proxy and requires MSVC on Windows.")
 endif()
@@ -23,11 +25,31 @@ add_library(d3d9 SHARED
 
 target_compile_features(d3d9 PRIVATE cxx_std_20)
 target_compile_definitions(d3d9 PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX XR_USE_GRAPHICS_API_D3D11 XR_NO_PROTOTYPES)
+if(TMOXR_EXPERIMENTAL_CULLING)
+  target_compile_definitions(d3d9 PRIVATE TMOXR_EXPERIMENTAL_CULLING=1)
+else()
+  target_compile_definitions(d3d9 PRIVATE TMOXR_EXPERIMENTAL_CULLING=0)
+endif()
 target_include_directories(d3d9 PRIVATE
   "${openxr_headers_SOURCE_DIR}/src"
   "${openxr_headers_BINARY_DIR}/include"
 )
 target_link_libraries(d3d9 PRIVATE dxguid d3d11 dxgi)
+
+add_library(dinput8 SHARED
+  src/dinput8_proxy.cpp
+  src/dinput8_proxy.def
+)
+target_compile_features(dinput8 PRIVATE cxx_std_20)
+target_compile_definitions(dinput8 PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX DIRECTINPUT_VERSION=0x0800)
+target_include_directories(dinput8 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(dinput8 PRIVATE dxguid)
+set_target_properties(dinput8 PROPERTIES OUTPUT_NAME "dinput8" PREFIX "" SUFFIX ".dll")
+
+add_executable(dinput8_smoke EXCLUDE_FROM_ALL tests/dinput8_smoke.cpp)
+target_compile_features(dinput8_smoke PRIVATE cxx_std_20)
+target_compile_definitions(dinput8_smoke PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX DIRECTINPUT_VERSION=0x0800)
+target_link_libraries(dinput8_smoke PRIVATE dxguid)
 
 set_target_properties(d3d9 PROPERTIES
   OUTPUT_NAME "d3d9"

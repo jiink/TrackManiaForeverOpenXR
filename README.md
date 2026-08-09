@@ -21,6 +21,7 @@ This project adds headset-only VR to the 32-bit Steam release of TrackMania Unit
 - 6DoF OpenXR headset rotation and position applied to the game camera.
 - OpenXR-recommended per-eye resolution and asymmetric headset FOV.
 - Correct OpenXR predicted-pose timing so runtime reprojection can stabilize lower-rate game frames.
+- Meta Quest Touch controllers exposed to TrackMania as an analog DirectInput gamepad.
 - The original desktop render remains untouched as a troubleshooting view.
 - Detailed `TMOXR.log` diagnostics for D3D9 hooks, shader coverage, tracking, frame timing, swapchains, uploads, and OpenXR errors.
 
@@ -47,10 +48,12 @@ Install Visual Studio Build Tools with the **Desktop development with C++** work
 
 ```powershell
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target d3d9
+cmake --build build --target d3d9 dinput8
 ```
 
 CMake downloads the official Khronos OpenXR 1.1.62 headers while configuring. The mod does not link an OpenXR import library; it loads `openxr_loader.dll` dynamically at runtime.
+
+Normal builds compile out the unfinished camera-memory scanning and frustum-culling experiments. Developers can opt into that diagnostic code in a separate build with `-DTMOXR_EXPERIMENTAL_CULLING=ON`; DLLs intended for normal use or sharing should leave the option off.
 
 ## Install script
 
@@ -65,8 +68,9 @@ The installer:
 
 1. Validates the game and built mod paths.
 2. Preserves an existing proxy as `d3d9.before-tmoxr.dll` when that backup does not already exist.
-3. Copies `build\d3d9.dll` beside `TmForever.exe`.
-4. Checks whether the local OpenXR loader is Win32. If it is missing or has the wrong architecture, it downloads the pinned official Khronos 1.1.62 Windows loader archive, verifies its SHA-256 checksum, and installs `Win32\bin\openxr_loader.dll`.
+3. Copies `build\d3d9.dll` and `build\dinput8.dll` beside `TmForever.exe`.
+4. Preserves an existing `dinput8.dll` as `dinput8.before-tmoxr.dll` when needed.
+5. Checks whether the local OpenXR loader is Win32. If it is missing or has the wrong architecture, it downloads the pinned official Khronos 1.1.62 Windows loader archive, verifies its SHA-256 checksum, and installs `Win32\bin\openxr_loader.dll`.
 
 Use a different game path or deliberately refresh the pinned loader with:
 
@@ -77,7 +81,7 @@ Use a different game path or deliberately refresh the pinned loader with:
 ## Manual install
 
 1. Back up any existing `d3d9.dll` in the TrackMania folder.
-2. Copy `build\d3d9.dll` beside `TmForever.exe` (normally `C:\Program Files (x86)\Steam\steamapps\common\TrackMania United`).
+2. Copy `build\d3d9.dll` and `build\dinput8.dll` beside `TmForever.exe` (normally `C:\Program Files (x86)\Steam\steamapps\common\TrackMania United`).
 3. Download the official Khronos [`openxr_loader_windows-1.1.62.zip`](https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-1.1.62/openxr_loader_windows-1.1.62.zip).
 4. Extract the archive and copy **`Win32\bin\openxr_loader.dll`** beside `TmForever.exe`. Do not use `x64\bin\openxr_loader.dll`.
 5. Set SteamVR as the active OpenXR runtime, start Virtual Desktop/SteamVR, and launch TrackMania normally.
@@ -85,9 +89,24 @@ Use a different game path or deliberately refresh the pinned loader with:
 
 The loader package being version 1.1.62 does not require the application or active runtime to use OpenXR API 1.1. The mod deliberately requests OpenXR 1.0 for compatibility with runtimes that expose 1.0; newer loaders can negotiate that version normally.
 
+## Quest Touch gamepad mapping
+
+The companion `dinput8.dll` adds a virtual controller named **Meta Quest Touch Virtual Gamepad** and continues forwarding every real DirectInput device. TrackMania can bind it like a conventional controller.
+
+| Quest Touch input | Virtual Xbox-style input |
+| --- | --- |
+| Left / right thumbstick | Left / right stick |
+| Left / right trigger | Left / right Xbox trigger |
+| Left / right grip | Left / right bumper |
+| A, B, X, Y | A, B, X, Y |
+| Thumbstick clicks | Left / right stick click |
+| Left controller menu button | Back |
+
+Xbox controllers exposed through legacy DirectInput combine both triggers onto one centered Z axis: left trigger moves it positive and right trigger moves it negative. The virtual controller follows that Windows convention, so both triggers cannot be represented simultaneously. The Quest system button is reserved by the runtime, so Start and Guide are not currently mapped.
+
 ## Diagnostics
 
-Every launch writes `TMOXR.log` beside `TmForever.exe`. Attach the complete file when reporting a crash or initialization problem. For rendering problems, the periodic stereo, shader-coverage, tracked-pose, and OpenXR-timing lines are usually sufficient.
+Every launch replaces `TMOXR.log` beside `TmForever.exe`, so the file contains only the current session. Attach the complete file when reporting a crash or initialization problem. For rendering problems, the periodic stereo, shader-coverage, tracked-pose, and OpenXR-timing lines are usually sufficient.
 
 Common messages:
 
@@ -97,10 +116,13 @@ Common messages:
 - `OpenXR session state changed to ...`: normal runtime lifecycle reporting; rendering starts after the session reaches the ready/running states.
 - `D3D9 readback/lock failed`: disable MSAA in TrackMania and attach the complete log.
 - `OpenXR timing: ...`: reports the runtime display period and TrackMania's measured presentation rate.
+- `Registered OpenXR Meta/Oculus Touch bindings`: the runtime accepted the controller profile.
+- `OpenXR Touch controllers are active as a virtual DirectInput gamepad`: action synchronization is receiving a tracked Touch controller.
+- `Input proxy: Advertised ...`: TrackMania enumerated the virtual gamepad through `dinput8.dll`.
 
 ## Uninstall
 
-Remove this mod's `d3d9.dll` from the TrackMania folder and restore `d3d9.before-tmoxr.dll` if the installer created it. The local Win32 `openxr_loader.dll` may also be removed if no other local mod needs it.
+Remove this mod's `d3d9.dll` and `dinput8.dll` from the TrackMania folder. Restore `d3d9.before-tmoxr.dll` and `dinput8.before-tmoxr.dll` if the installer created them. The local Win32 `openxr_loader.dll` may also be removed if no other local mod needs it.
 
 > [!NOTE]
 > ANOTHER HUMAN-WRITTEN NOTE:
