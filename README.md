@@ -5,11 +5,12 @@
 > ## AI made it.
 > ## This repo is 100% vibed/slopped up. I didn't write any of this, not even the rest of this readme! All I did was sit with my VR headset on and launch the game whenever AI finished its turn.
 > 
-> BTW, **you have to disable anti aliasing in the Trackmania options for this to work.**
+> BTW, **you have to disable fullscreen and anti aliasing in the Trackmania options for this to work.**
 > 
 > <img width="351" height="189" alt="image" src="https://github.com/user-attachments/assets/e39cf512-4586-4187-8dbd-8bc588ce553e" />
 >
-> <img width="1064" height="490" alt="image" src="https://github.com/user-attachments/assets/fe7cfbd8-04a6-4585-9ba1-09fe2bc01f15" />
+> <img width="1064" height="490" alt="image" src="https://github.com/user-attachments/assets/0d32a0e7-6af0-486f-82ab-1827ca1bc44a" />
+
 
 
 
