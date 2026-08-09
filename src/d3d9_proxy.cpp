@@ -381,6 +381,12 @@ void ReleaseStereoResources() {
         if (*resource) (*resource)->Release();
         *resource = nullptr;
     }
+    // The shader-analysis cache retains one reference per shader so a later
+    // track cannot recycle the same COM pointer for different bytecode and
+    // inherit a stale camera-constant mapping.
+    for (auto* shader : g_stereo.analyzedShaders) {
+        if (shader) shader->Release();
+    }
     g_stereo = {};
 }
 
@@ -742,6 +748,10 @@ void AnalyzeVertexShader(IDirect3DVertexShader9* shader) {
         }
         return;
     }
+    // TrackMania destroys and recreates material shaders between tracks. Keep
+    // analyzed shader objects alive (bounded by the safety limit above), or a
+    // new shader may reuse an old pointer and receive the old shader's mapping.
+    shader->AddRef();
     g_stereo.analyzedShaders.push_back(shader);
 
     UINT byteCount = 0;
@@ -762,27 +772,39 @@ void AnalyzeVertexShader(IDirect3DVertexShader9* shader) {
     const std::string disassembly(static_cast<const char*>(output->GetBufferPointer()), output->GetBufferSize());
     output->Release();
 
+    bool positionMapped = false;
     const auto positionInstruction = disassembly.find("dp4 oPos.x");
     if (positionInstruction != std::string::npos) {
         const auto constant = disassembly.find(", c", positionInstruction);
         if (constant != std::string::npos) {
             const UINT baseRegister = static_cast<UINT>(std::strtoul(disassembly.c_str() + constant + 3, nullptr, 10));
             g_stereo.shaderPositionInfo.push_back({shader, baseRegister});
+            positionMapped = true;
         }
     }
 
     std::istringstream lines(disassembly);
     std::string line;
     std::string matrixInstructions;
+    std::string positionInstructions;
     while (std::getline(lines, line)) {
-        if (line.find("m4x") == std::string::npos && line.find("dp4") == std::string::npos) continue;
-        if (!matrixInstructions.empty()) matrixInstructions += " | ";
-        matrixInstructions += line;
-        if (matrixInstructions.size() >= 900) break;
+        if (line.find("oPos") != std::string::npos || line.find("o0") != std::string::npos) {
+            if (!positionInstructions.empty()) positionInstructions += " | ";
+            positionInstructions += line;
+        }
+        if (line.find("m4x") != std::string::npos || line.find("dp4") != std::string::npos) {
+            if (!matrixInstructions.empty()) matrixInstructions += " | ";
+            matrixInstructions += line;
+        }
+        if (matrixInstructions.size() >= 900 && positionInstructions.size() >= 900) break;
     }
     if (g_stereo.analyzedShaders.size() <= 32) {
         tmoxr::log::Info("Perspective scene vertex shader matrix instructions: " +
             (matrixInstructions.empty() ? std::string("none") : matrixInstructions));
+    }
+    if (!positionMapped && g_stereo.analyzedShaders.size() <= 64) {
+        tmoxr::log::Info("Unmapped perspective vertex shader position instructions: " +
+            (positionInstructions.empty() ? std::string("none found") : positionInstructions));
     }
 }
 
