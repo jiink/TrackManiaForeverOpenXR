@@ -26,6 +26,7 @@ This project adds headset-only VR to the 32-bit Steam release of TrackMania Unit
 - Correct OpenXR predicted-pose timing so runtime reprojection can stabilize lower-rate game frames.
 - Meta Quest Touch controllers exposed to TrackMania as an analog DirectInput gamepad.
 - The original desktop render remains untouched as a troubleshooting view.
+- Menus, HUD elements, and other desktop-space UI are captured onto a world-locked virtual screen two metres in front of the initial headset pose.
 - Detailed `TMOXR.log` diagnostics for D3D9 hooks, shader coverage, tracking, frame timing, swapchains, uploads, and OpenXR errors.
 
 The bridge renders private D3D9 eye surfaces, reads them back through system memory, and uploads them to D3D11 OpenXR swapchains because OpenXR cannot consume Direct3D 9 surfaces directly.
@@ -34,7 +35,7 @@ The bridge renders private D3D9 eye surfaces, reads them back through system mem
 
 - TrackMania still performs frustum culling for its original camera. Objects can disappear near the edges when looking far away from the driving direction.
 - A small number of unusual vertex shaders are not camera-mapped yet. Some distant decorations, such as Island boulders, may not follow the tracked camera correctly.
-- Menus and other 2D overlays are not yet composited onto both private VR eye surfaces.
+- The headset UI screen size and two-metre distance are currently fixed rather than user-configurable.
 - Stereo replay renders the scene three times: once for the desktop and once per eye. Native-resolution D3D9 readback and upload are also expensive, so the game render rate can be well below the headset refresh rate. Correct OpenXR pose timing allows the runtime to reproject those frames.
 - The initial valid headset pose becomes the session's camera origin. Restart the game to recenter.
 
@@ -123,6 +124,7 @@ Common messages:
 - `XR_KHR_D3D11_enable is unavailable`: switch to a Win32 OpenXR runtime that supports D3D11, such as VDXR.
 - `OpenXR session state changed to ...`: normal runtime lifecycle reporting; rendering starts after the session reaches the ready/running states.
 - `D3D9 readback/lock failed`: disable MSAA in TrackMania and attach the complete log.
+- `captured UI draws=...`: a nonzero count confirms desktop-space UI was captured for the OpenXR virtual-screen layer.
 - `OpenXR timing: ...`: reports the runtime display period and TrackMania's measured presentation rate.
 - `Registered OpenXR Meta/Oculus Touch bindings`: the runtime accepted the controller profile.
 - `OpenXR Touch controllers are active as a virtual DirectInput gamepad`: action synchronization is receiving a tracked Touch controller.

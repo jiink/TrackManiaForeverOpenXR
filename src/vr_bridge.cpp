@@ -190,12 +190,16 @@ struct VrBridge::Impl {
     std::array<XrPath, 2> handPaths{XR_NULL_PATH, XR_NULL_PATH};
     std::vector<XrSwapchain> swapchains;
     std::vector<std::vector<XrSwapchainImageD3D11KHR>> images;
+    XrSwapchain uiSwapchain = XR_NULL_HANDLE;
+    std::vector<XrSwapchainImageD3D11KHR> uiImages;
     std::vector<XrViewConfigurationView> viewConfigs;
     IDirect3DDevice9* device = nullptr;
     IDirect3DSurface9* readback = nullptr;
     IDirect3DSurface9* rightReadback = nullptr;
+    IDirect3DSurface9* uiReadback = nullptr;
     IDirect3DSurface9* leftEyeSource = nullptr;
     IDirect3DSurface9* rightEyeSource = nullptr;
+    IDirect3DSurface9* uiSource = nullptr;
     ID3D11Device* d3d11Device = nullptr;
     ID3D11DeviceContext* d3d11Context = nullptr;
     UINT sourceWidth = 0;
@@ -532,6 +536,9 @@ struct VrBridge::Impl {
 
     void DestroySwapchains() {
         if (destroySwapchain) for (auto swapchain : swapchains) destroySwapchain(swapchain);
+        if (uiSwapchain != XR_NULL_HANDLE && destroySwapchain) destroySwapchain(uiSwapchain);
+        uiSwapchain = XR_NULL_HANDLE;
+        uiImages.clear();
         swapchains.clear();
         images.clear();
         viewConfigs.clear();
@@ -554,6 +561,8 @@ struct VrBridge::Impl {
         readback = nullptr;
         if (rightReadback) rightReadback->Release();
         rightReadback = nullptr;
+        if (uiReadback) uiReadback->Release();
+        uiReadback = nullptr;
         if (d3d11Context) d3d11Context->Release();
         d3d11Context = nullptr;
         if (d3d11Device) d3d11Device->Release();
@@ -705,6 +714,23 @@ struct VrBridge::Impl {
             if (!Check(enumerateImages(swapchains[eye], imageCount, &imageCount, base), "xrEnumerateSwapchainImages(data)")) return false;
             log::Info("OpenXR eye " + std::to_string(eye) + " swapchain: " + std::to_string(info.width) + "x" + std::to_string(info.height) + ", " + std::to_string(imageCount) + " images.");
         }
+        XrSwapchainCreateInfo uiInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        uiInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        uiInfo.format = swapchainFormat;
+        uiInfo.sampleCount = 1;
+        uiInfo.width = sourceWidth;
+        uiInfo.height = sourceHeight;
+        uiInfo.faceCount = 1;
+        uiInfo.arraySize = 1;
+        uiInfo.mipCount = 1;
+        if (!Check(createSwapchain(session, &uiInfo, &uiSwapchain), "xrCreateSwapchain(UI)")) return false;
+        uint32_t uiImageCount = 0;
+        if (!Check(enumerateImages(uiSwapchain, 0, &uiImageCount, nullptr), "xrEnumerateSwapchainImages(UI count)")) return false;
+        uiImages.assign(uiImageCount, XrSwapchainImageD3D11KHR{XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
+        auto* uiBase = reinterpret_cast<XrSwapchainImageBaseHeader*>(uiImages.data());
+        if (!Check(enumerateImages(uiSwapchain, uiImageCount, &uiImageCount, uiBase), "xrEnumerateSwapchainImages(UI data)")) return false;
+        log::Info("OpenXR virtual-screen UI swapchain: " + std::to_string(sourceWidth) + "x" +
+            std::to_string(sourceHeight) + ", " + std::to_string(uiImageCount) + " images.");
         return true;
     }
 
@@ -940,7 +966,9 @@ struct VrBridge::Impl {
 
         std::vector<XrCompositionLayerProjectionView> projectionViews;
         XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-        const XrCompositionLayerBaseHeader* layers[] = {reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer)};
+        XrCompositionLayerQuad uiLayer{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        std::array<const XrCompositionLayerBaseHeader*, 2> layers{};
+        uint32_t layerCount = 0;
         if (activeFrameState.shouldRender && activeViewsLocated) {
             const uint32_t viewCount = static_cast<uint32_t>(activeViews.size());
                 IDirect3DSurface9* gameBackbuffer = nullptr;
@@ -1026,16 +1054,75 @@ struct VrBridge::Impl {
                     layer.space = space;
                     layer.viewCount = static_cast<uint32_t>(projectionViews.size());
                     layer.views = projectionViews.data();
+                    if (!projectionViews.empty()) {
+                        layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer);
+                    }
                 } else if (!copyFailureLogged) {
                     log::Error("GetBackBuffer failed: HRESULT=" + std::to_string(static_cast<long>(backBufferResult)));
                     copyFailureLogged = true;
                 }
+            if (uiSource && uiSwapchain != XR_NULL_HANDLE && haveBaseHeadPose) {
+                D3DSURFACE_DESC description{};
+                if (SUCCEEDED(uiSource->GetDesc(&description)) && description.Width == sourceWidth &&
+                    description.Height == sourceHeight) {
+                    if (uiReadback) {
+                        D3DSURFACE_DESC readbackDescription{};
+                        if (FAILED(uiReadback->GetDesc(&readbackDescription)) ||
+                            readbackDescription.Width != description.Width ||
+                            readbackDescription.Height != description.Height ||
+                            readbackDescription.Format != description.Format) {
+                            uiReadback->Release();
+                            uiReadback = nullptr;
+                        }
+                    }
+                    if (!uiReadback) {
+                        device->CreateOffscreenPlainSurface(description.Width, description.Height, description.Format,
+                            D3DPOOL_SYSTEMMEM, &uiReadback, nullptr);
+                    }
+                    const HRESULT read = uiReadback ? device->GetRenderTargetData(uiSource, uiReadback) : E_FAIL;
+                    D3DLOCKED_RECT locked{};
+                    const HRESULT lock = SUCCEEDED(read) ? uiReadback->LockRect(&locked, nullptr, D3DLOCK_READONLY) : read;
+                    if (SUCCEEDED(lock)) {
+                        uint32_t imageIndex = 0;
+                        XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+                        XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                        wait.timeout = XR_INFINITE_DURATION;
+                        XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                        if (Check(acquireImage(uiSwapchain, &acquire, &imageIndex), "xrAcquireSwapchainImage(UI)") &&
+                            Check(waitImage(uiSwapchain, &wait), "xrWaitSwapchainImage(UI)")) {
+                            d3d11Context->UpdateSubresource(uiImages[imageIndex].texture, 0, nullptr,
+                                locked.pBits, locked.Pitch, 0);
+                            d3d11Context->Flush();
+                            releaseImage(uiSwapchain, &release);
+                            const XrVector3f screenOffset = Rotate(baseHeadPose.orientation, {0.0f, 0.0f, -2.0f});
+                            uiLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                            uiLayer.space = space;
+                            uiLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                            uiLayer.pose.orientation = baseHeadPose.orientation;
+                            uiLayer.pose.position = {
+                                baseHeadPose.position.x + screenOffset.x,
+                                baseHeadPose.position.y + screenOffset.y,
+                                baseHeadPose.position.z + screenOffset.z};
+                            uiLayer.size.width = 1.6f;
+                            uiLayer.size.height = 1.6f * static_cast<float>(sourceHeight) / static_cast<float>(sourceWidth);
+                            uiLayer.subImage.swapchain = uiSwapchain;
+                            uiLayer.subImage.imageRect.extent.width = static_cast<int32_t>(sourceWidth);
+                            uiLayer.subImage.imageRect.extent.height = static_cast<int32_t>(sourceHeight);
+                            layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&uiLayer);
+                        }
+                        uiReadback->UnlockRect();
+                    } else if (!copyFailureLogged) {
+                        log::Error("D3D9 UI readback/lock failed: HRESULT=" + std::to_string(static_cast<long>(lock)));
+                        copyFailureLogged = true;
+                    }
+                }
+            }
         }
         XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
         end.displayTime = activeFrameState.predictedDisplayTime;
         end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-        end.layerCount = projectionViews.empty() ? 0u : 1u;
-        end.layers = projectionViews.empty() ? nullptr : layers;
+        end.layerCount = layerCount;
+        end.layers = layerCount ? layers.data() : nullptr;
         Check(endFrame(session, &end), "xrEndFrame");
         frameBegun = false;
         activeViewsLocated = false;
@@ -1131,6 +1218,15 @@ void VrBridge::SetLeftEyeSurface(IDirect3DSurface9* surface) {
     log::Info(surface ? "Left-eye tracked stereo source changed." : "Left-eye tracked stereo source detached.");
 }
 
+void VrBridge::SetUiSurface(IDirect3DSurface9* surface) {
+    if (!impl_) impl_ = new Impl;
+    std::scoped_lock lock(impl_->mutex);
+    if (impl_->uiSource == surface) return;
+    if (surface) surface->AddRef();
+    if (impl_->uiSource) impl_->uiSource->Release();
+    impl_->uiSource = surface;
+}
+
 bool VrBridge::GetHeadPose(HeadPose& pose) {
     if (!impl_) return false;
     std::scoped_lock lock(impl_->mutex);
@@ -1180,6 +1276,12 @@ void VrBridge::Shutdown() {
     std::scoped_lock lock(impl_->mutex);
     log::Info("OpenXR bridge shutdown requested.");
     impl_->DestroyOpenXR();
+    if (impl_->leftEyeSource) impl_->leftEyeSource->Release();
+    if (impl_->rightEyeSource) impl_->rightEyeSource->Release();
+    if (impl_->uiSource) impl_->uiSource->Release();
+    impl_->leftEyeSource = nullptr;
+    impl_->rightEyeSource = nullptr;
+    impl_->uiSource = nullptr;
     if (impl_->device) impl_->device->Release();
     impl_->device = nullptr;
     delete impl_;

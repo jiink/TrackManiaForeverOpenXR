@@ -39,6 +39,7 @@ public:
     void OnDraw(bool indexed);
     void SetLeftEyeSurface(IDirect3DSurface9* surface);
     void SetRightEyeSurface(IDirect3DSurface9* surface);
+    void SetUiSurface(IDirect3DSurface9* surface);
     bool GetHeadPose(HeadPose& pose);
     bool GetRenderConfiguration(RenderConfiguration& configuration);
     bool GetGamepadState(GamepadState& state);
