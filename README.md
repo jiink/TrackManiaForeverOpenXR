@@ -16,7 +16,7 @@ https://github.com/user-attachments/assets/af46091f-3f3d-45b9-ac23-9a4004db7dac
 
 
 
-This project adds headset-only VR to the 32-bit Steam release of TrackMania United Forever. It uses the active OpenXR runtime, works with Virtual Desktop through SteamVR OpenXR, and leaves normal Xbox gamepad input unchanged. No motion controllers are created or required.
+This project adds headset-only VR to the 32-bit Steam release of TrackMania United Forever. It uses the active Win32 OpenXR runtime, works with Virtual Desktop through VDXR, and leaves normal Xbox gamepad input unchanged. No motion controllers are created or required.
 
 ## Current features
 
@@ -42,7 +42,8 @@ The bridge renders private D3D9 eye surfaces, reads them back through system mem
 
 - Windows and the 32-bit Steam version of TrackMania United Forever.
 - An OpenXR runtime supporting `XR_KHR_D3D11_enable`.
-- Virtual Desktop users should start Virtual Desktop and SteamVR first, and set SteamVR as the active OpenXR runtime.
+- Virtual Desktop users should select **VirtualDesktopXR (VDXR)** as the OpenXR runtime and connect the headset through Virtual Desktop before starting the game. SteamVR is not needed for this path.
+- Selecting an OpenXR runtime for 64-bit applications does not necessarily register a Win32 runtime. This 32-bit game uses `HKLM\SOFTWARE\WOW6432Node\Khronos\OpenXR\1\ActiveRuntime`.
 - A **32-bit (Win32)** `openxr_loader.dll`. A 64-bit loader cannot be loaded by `TmForever.exe`.
 
 ## Build
@@ -87,7 +88,7 @@ Use a different game path or deliberately refresh the pinned loader with:
 2. Copy `build\d3d9.dll` and `build\dinput8.dll` beside `TmForever.exe` (normally `C:\Program Files (x86)\Steam\steamapps\common\TrackMania United`).
 3. Download the official Khronos [`openxr_loader_windows-1.1.62.zip`](https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-1.1.62/openxr_loader_windows-1.1.62.zip).
 4. Extract the archive and copy **`Win32\bin\openxr_loader.dll`** beside `TmForever.exe`. Do not use `x64\bin\openxr_loader.dll`.
-5. Set SteamVR as the active OpenXR runtime, start Virtual Desktop/SteamVR, and launch TrackMania normally.
+5. For Virtual Desktop, select **VirtualDesktopXR (VDXR)** as the OpenXR runtime, connect the headset, and launch TrackMania normally.
 6. Put on the headset and enter a race.
 
 The loader package being version 1.1.62 does not require the application or active runtime to use OpenXR API 1.1. The mod deliberately requests OpenXR 1.0 for compatibility with runtimes that expose 1.0; newer loaders can negotiate that version normally.
@@ -113,9 +114,11 @@ Every launch replaces `TMOXR.log` beside `TmForever.exe`, so the file contains o
 
 Common messages:
 
-- `openxr_loader.dll was not found`: run the install script or follow the manual Win32 loader steps above.
-- `xrCreateInstance failed: XrResult=-4`: the requested OpenXR API version is unsupported. Current builds request OpenXR 1.0; confirm that the deployed `d3d9.dll` is current.
-- `XR_KHR_D3D11_enable is unavailable`: switch to an OpenXR runtime that supports D3D11, such as SteamVR.
+- `Could not load the Win32 openxr_loader.dll`: run the install script or follow the manual Win32 loader steps above; ensure the DLL is the Win32 build rather than x64.
+- `XR_ERROR_RUNTIME_UNAVAILABLE (-51)`: the Win32 loader is present, but it could not find or load the registered Win32 OpenXR runtime. Check the `Win32 OpenXR ActiveRuntime=...` line immediately above it.
+- `XR_ERROR_FORM_FACTOR_UNAVAILABLE (-35)`: the runtime loaded, but it cannot currently see a headset. Ensure the headset is connected through the runtime named by the `OpenXR runtime: ...` line. In particular, VDXR only sees headsets connected through Virtual Desktop, not Steam Link.
+- `XR_ERROR_API_VERSION_UNSUPPORTED (-4)`: the requested OpenXR API version is unsupported. Current builds request OpenXR 1.0; confirm that the deployed `d3d9.dll` is current.
+- `XR_KHR_D3D11_enable is unavailable`: switch to a Win32 OpenXR runtime that supports D3D11, such as VDXR.
 - `OpenXR session state changed to ...`: normal runtime lifecycle reporting; rendering starts after the session reaches the ready/running states.
 - `D3D9 readback/lock failed`: disable MSAA in TrackMania and attach the complete log.
 - `OpenXR timing: ...`: reports the runtime display period and TrackMania's measured presentation rate.

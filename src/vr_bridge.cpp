@@ -7,6 +7,7 @@
 #include <dxgi.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
+#include <openxr/openxr_reflection.h>
 
 #include <algorithm>
 #include <array>
@@ -21,8 +22,80 @@
 
 namespace tmoxr {
 namespace {
+const char* ResultName(XrResult value) {
+#define TMOXR_RESULT_CASE(name, numericValue) case name: return #name;
+    switch (value) {
+        XR_LIST_ENUM_XrResult(TMOXR_RESULT_CASE)
+        default: return "XR_UNKNOWN_RESULT";
+    }
+#undef TMOXR_RESULT_CASE
+}
+
 std::string Result(XrResult value) {
-    return "XrResult=" + std::to_string(static_cast<int>(value));
+    return std::string(ResultName(value)) + " (" + std::to_string(static_cast<int>(value)) + ")";
+}
+
+std::string Utf8(const wchar_t* value) {
+    if (!value || !*value) return {};
+    const int required = WideCharToMultiByte(CP_UTF8, 0, value, -1, nullptr, 0, nullptr, nullptr);
+    if (required <= 1) return {};
+    std::string output(static_cast<size_t>(required), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value, -1, output.data(), required, nullptr, nullptr);
+    output.resize(static_cast<size_t>(required - 1));
+    return output;
+}
+
+std::wstring EnvironmentValue(const wchar_t* name) {
+    const DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
+    if (!required) return {};
+    std::vector<wchar_t> value(required);
+    if (!GetEnvironmentVariableW(name, value.data(), required)) return {};
+    return value.data();
+}
+
+bool FileExists(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+void LogOpenXrDiscovery() {
+    const std::wstring environmentOverride = EnvironmentValue(L"XR_RUNTIME_JSON");
+    if (!environmentOverride.empty()) {
+        log::Info("OpenXR runtime override XR_RUNTIME_JSON=" + Utf8(environmentOverride.c_str()) +
+            (FileExists(environmentOverride) ? "." : " (file does not exist)."));
+        return;
+    }
+
+    constexpr wchar_t registryPath[] = L"SOFTWARE\\Khronos\\OpenXR\\1";
+    HKEY key = nullptr;
+    const LONG openResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, registryPath, 0,
+        KEY_QUERY_VALUE | KEY_WOW64_32KEY, &key);
+    if (openResult != ERROR_SUCCESS) {
+        log::Warn("No Win32 OpenXR ActiveRuntime registry key was found (HKLM\\SOFTWARE\\WOW6432Node\\Khronos\\OpenXR\\1). Windows error=" +
+            std::to_string(openResult) + ".");
+        return;
+    }
+
+    std::vector<wchar_t> activeRuntime(32768);
+    DWORD bytes = static_cast<DWORD>(activeRuntime.size() * sizeof(wchar_t));
+    const LONG readResult = RegGetValueW(key, nullptr, L"ActiveRuntime",
+        RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, nullptr, activeRuntime.data(), &bytes);
+    RegCloseKey(key);
+    if (readResult != ERROR_SUCCESS) {
+        log::Warn("The Win32 OpenXR registry key has no readable ActiveRuntime value. Windows error=" +
+            std::to_string(readResult) + ".");
+        return;
+    }
+
+    const std::wstring path = activeRuntime.data();
+    log::Info("Win32 OpenXR ActiveRuntime=" + Utf8(path.c_str()) +
+        (FileExists(path) ? "." : " (manifest file does not exist)."));
+}
+
+std::string ModulePath(HMODULE module) {
+    std::vector<wchar_t> path(32768);
+    const DWORD length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
+    return length && length < path.size() ? Utf8(path.data()) : std::string("<path unavailable>");
 }
 
 template <typename T>
@@ -50,6 +123,7 @@ struct VrBridge::Impl {
     PFN_xrCreateInstance createInstance = nullptr;
     PFN_xrEnumerateInstanceExtensionProperties enumerateExtensions = nullptr;
     PFN_xrDestroyInstance destroyInstance = nullptr;
+    PFN_xrGetInstanceProperties getInstanceProperties = nullptr;
     PFN_xrGetSystem getSystem = nullptr;
     PFN_xrGetD3D11GraphicsRequirementsKHR getRequirements = nullptr;
     PFN_xrCreateSession createSession = nullptr;
@@ -450,6 +524,7 @@ struct VrBridge::Impl {
 
     bool LoadFunctions() {
         return LoadProc(getProc, instance, "xrDestroyInstance", destroyInstance) &&
+            LoadProc(getProc, instance, "xrGetInstanceProperties", getInstanceProperties) &&
             LoadProc(getProc, instance, "xrGetSystem", getSystem) &&
             LoadProc(getProc, instance, "xrGetD3D11GraphicsRequirementsKHR", getRequirements) &&
             LoadProc(getProc, instance, "xrCreateSession", createSession) &&
@@ -590,12 +665,17 @@ struct VrBridge::Impl {
         if (initialized || permanentlyDisabled) return initialized;
         if (!device) return false;
         log::Info("Beginning OpenXR initialization; Direct3D 9 frames will be uploaded to a D3D11 bridge device.");
+        LogOpenXrDiscovery();
         loader = LoadLibraryW(L"openxr_loader.dll");
         if (!loader) {
-            log::Error("openxr_loader.dll was not found. Install an OpenXR runtime (for Virtual Desktop, SteamVR is typical). Windows error=" + std::to_string(GetLastError()));
+            const DWORD error = GetLastError();
+            log::Error("Could not load the Win32 openxr_loader.dll beside TrackMania. Windows error=" +
+                std::to_string(error) + (error == ERROR_BAD_EXE_FORMAT ?
+                " (the DLL may be 64-bit; install the Win32 loader)." : "."));
             permanentlyDisabled = true;
             return false;
         }
+        log::Info("Loaded OpenXR loader from " + ModulePath(loader) + ".");
         getProc = reinterpret_cast<PFN_xrGetInstanceProcAddr>(GetProcAddress(loader, "xrGetInstanceProcAddr"));
         createInstance = reinterpret_cast<PFN_xrCreateInstance>(GetProcAddress(loader, "xrCreateInstance"));
         enumerateExtensions = reinterpret_cast<PFN_xrEnumerateInstanceExtensionProperties>(GetProcAddress(loader, "xrEnumerateInstanceExtensionProperties"));
@@ -606,7 +686,16 @@ struct VrBridge::Impl {
             return false;
         }
         uint32_t extensionCount = 0;
-        if (!Check(enumerateExtensions(nullptr, 0, &extensionCount, nullptr), "xrEnumerateInstanceExtensionProperties(count)")) { permanentlyDisabled = true; DestroyOpenXR(); return false; }
+        const XrResult enumerateResult = enumerateExtensions(nullptr, 0, &extensionCount, nullptr);
+        if (!Check(enumerateResult, "xrEnumerateInstanceExtensionProperties(count)")) {
+            if (enumerateResult == XR_ERROR_RUNTIME_UNAVAILABLE) {
+                log::Error("The OpenXR loader could not find or load the registered Win32 runtime. Check the Win32 ActiveRuntime manifest path logged above and reinstall/select a 32-bit-capable runtime.");
+            }
+            permanentlyDisabled = true;
+            DestroyOpenXR();
+            return false;
+        }
+        log::Info("The active OpenXR runtime advertises " + std::to_string(extensionCount) + " instance extensions.");
         std::vector<XrExtensionProperties> extensions(extensionCount, XrExtensionProperties{XR_TYPE_EXTENSION_PROPERTIES});
         if (!Check(enumerateExtensions(nullptr, extensionCount, &extensionCount, extensions.data()), "xrEnumerateInstanceExtensionProperties(data)")) { permanentlyDisabled = true; DestroyOpenXR(); return false; }
         bool d3d11Supported = false;
@@ -633,6 +722,13 @@ struct VrBridge::Impl {
         instanceInfo.enabledExtensionNames = enabledExtensions;
         if (!Check(createInstance(&instanceInfo, &instance), "xrCreateInstance")) { permanentlyDisabled = true; DestroyOpenXR(); return false; }
         if (!LoadFunctions()) { permanentlyDisabled = true; DestroyOpenXR(); return false; }
+        XrInstanceProperties instanceProperties{XR_TYPE_INSTANCE_PROPERTIES};
+        if (Check(getInstanceProperties(instance, &instanceProperties), "xrGetInstanceProperties")) {
+            log::Info("OpenXR runtime: " + std::string(instanceProperties.runtimeName) + " " +
+                std::to_string(XR_VERSION_MAJOR(instanceProperties.runtimeVersion)) + "." +
+                std::to_string(XR_VERSION_MINOR(instanceProperties.runtimeVersion)) + "." +
+                std::to_string(XR_VERSION_PATCH(instanceProperties.runtimeVersion)) + ".");
+        }
         if (!CreateControllerActions()) {
             if (controllerActionSet != XR_NULL_HANDLE && destroyActionSet) destroyActionSet(controllerActionSet);
             controllerActionSet = XR_NULL_HANDLE;
@@ -640,7 +736,19 @@ struct VrBridge::Impl {
         }
         XrSystemGetInfo systemInfo{XR_TYPE_SYSTEM_GET_INFO};
         systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
-        if (!Check(getSystem(instance, &systemInfo, &system), "xrGetSystem")) { permanentlyDisabled = true; DestroyOpenXR(); return false; }
+        const XrResult systemResult = getSystem(instance, &systemInfo, &system);
+        if (!Check(systemResult, "xrGetSystem")) {
+            if (systemResult == XR_ERROR_FORM_FACTOR_UNAVAILABLE) {
+                log::Error("The runtime loaded successfully, but it has no headset available. Ensure the headset is connected through the same runtime named above; VDXR requires an active Virtual Desktop connection and cannot see a Steam Link session.");
+            } else if (systemResult == XR_ERROR_FORM_FACTOR_UNSUPPORTED) {
+                log::Error("The selected OpenXR runtime does not support head-mounted displays.");
+            }
+            permanentlyDisabled = true;
+            DestroyOpenXR();
+            return false;
+        }
+        log::Info("The OpenXR runtime reported an available head-mounted display (system ID " +
+            std::to_string(static_cast<uint64_t>(system)) + ").");
         XrGraphicsRequirementsD3D11KHR requirements{XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR};
         if (!Check(getRequirements(instance, system, &requirements), "xrGetD3D11GraphicsRequirementsKHR")) { permanentlyDisabled = true; DestroyOpenXR(); return false; }
         if (!CreateD3D11Device(requirements) || !DetermineSourceSize()) { permanentlyDisabled = true; DestroyOpenXR(); return false; }

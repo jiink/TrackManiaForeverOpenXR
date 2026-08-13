@@ -118,6 +118,7 @@ struct StereoResources {
     uint32_t transformedDraws = 0;
     uint32_t untransformedShaderDraws = 0;
     uint32_t fixedFunctionDraws = 0;
+    uint32_t suppressedDesktopSpaceLightDraws = 0;
     uint64_t presentedFrames = 0;
 #if TMOXR_EXPERIMENTAL_CULLING
     uint64_t lastCameraScanFrame = 0;
@@ -736,6 +737,45 @@ void RestoreGameEye(IDirect3DDevice9* device) {
     g_originalSetDepthStencilSurface(device, g_stereo.leftDepth);
 }
 
+bool IsDesktopSpaceAdditiveSprite(IDirect3DDevice9* device) {
+    if (g_stereo.vertexShader) return false;
+    bool pretransformed = false;
+    DWORD fvf = 0;
+    if (SUCCEEDED(device->GetFVF(&fvf))) {
+        pretransformed = (fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW;
+    }
+    if (!pretransformed) {
+        IDirect3DVertexDeclaration9* declaration = nullptr;
+        if (SUCCEEDED(device->GetVertexDeclaration(&declaration)) && declaration) {
+            UINT elementCount = 0;
+            if (SUCCEEDED(declaration->GetDeclaration(nullptr, &elementCount)) && elementCount) {
+                std::vector<D3DVERTEXELEMENT9> elements(elementCount);
+                if (SUCCEEDED(declaration->GetDeclaration(elements.data(), &elementCount))) {
+                    for (const auto& element : elements) {
+                        if (element.Stream == 0xff) break;
+                        if (element.Usage == D3DDECLUSAGE_POSITIONT) {
+                            pretransformed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            declaration->Release();
+        }
+    }
+    if (!pretransformed) return false;
+    DWORD alphaBlend = FALSE;
+    DWORD sourceBlend = D3DBLEND_ONE;
+    DWORD destinationBlend = D3DBLEND_ZERO;
+    DWORD blendOperation = D3DBLENDOP_ADD;
+    if (FAILED(device->GetRenderState(D3DRS_ALPHABLENDENABLE, &alphaBlend)) || !alphaBlend ||
+        FAILED(device->GetRenderState(D3DRS_SRCBLEND, &sourceBlend)) ||
+        FAILED(device->GetRenderState(D3DRS_DESTBLEND, &destinationBlend)) ||
+        FAILED(device->GetRenderState(D3DRS_BLENDOP, &blendOperation))) return false;
+    return blendOperation == D3DBLENDOP_ADD && destinationBlend == D3DBLEND_ONE &&
+        (sourceBlend == D3DBLEND_ONE || sourceBlend == D3DBLEND_SRCALPHA);
+}
+
 void AnalyzeVertexShader(IDirect3DVertexShader9* shader) {
     if (!shader || std::find(g_stereo.analyzedShaders.begin(), g_stereo.analyzedShaders.end(), shader) != g_stereo.analyzedShaders.end()) return;
     // TrackMania uses many material variants for the same scene. Every distinct
@@ -790,7 +830,9 @@ void AnalyzeVertexShader(IDirect3DVertexShader9* shader) {
     uint32_t positionWriteCount = 0;
     bool standardPositionWrites = true;
     while (std::getline(lines, line)) {
-        if (line.find("oPos") != std::string::npos || line.find("o0") != std::string::npos) {
+        const auto firstCharacter = line.find_first_not_of(" \t");
+        const bool comment = firstCharacter != std::string::npos && line.compare(firstCharacter, 2, "//") == 0;
+        if (!comment && line.find("oPos") != std::string::npos) {
             ++positionWriteCount;
             if (line.find("dp4 oPos.") == std::string::npos) standardPositionWrites = false;
             if (positionInstructions.size() < 900) {
@@ -856,6 +898,7 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
             ", camera-transformed=" + std::to_string(g_stereo.transformedDraws) +
             ", unmapped-shader=" + std::to_string(g_stereo.untransformedShaderDraws) +
             ", fixed-function=" + std::to_string(g_stereo.fixedFunctionDraws) +
+            ", suppressed desktop-space lights=" + std::to_string(g_stereo.suppressedDesktopSpaceLightDraws) +
             ", shaders analyzed/mapped=" + std::to_string(g_stereo.analyzedShaders.size()) + "/" +
             std::to_string(g_stereo.shaderPositionInfo.size()) + ".");
         if (g_stereo.haveHeadPose) {
@@ -875,6 +918,7 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
         g_stereo.transformedDraws = 0;
         g_stereo.untransformedShaderDraws = 0;
         g_stereo.fixedFunctionDraws = 0;
+        g_stereo.suppressedDesktopSpaceLightDraws = 0;
     }
     const HRESULT result = g_originalPresent(device, source, destination, window, dirtyRegion);
     // The next clear starts a new frame. Keep the completed right-eye 3D scene
@@ -987,6 +1031,10 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITI
     else if (g_stereo.vertexShader) ++g_stereo.untransformedShaderDraws;
     else ++g_stereo.fixedFunctionDraws;
     const HRESULT game = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
+    if (IsDesktopSpaceAdditiveSprite(device)) {
+        ++g_stereo.suppressedDesktopSpaceLightDraws;
+        return game;
+    }
     BeginTrackedEye(device, false);
     ApplyShaderEyeState(device, shaderEye, 0.0f, false);
     const HRESULT left = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
@@ -1020,6 +1068,10 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3D
     else if (g_stereo.vertexShader) ++g_stereo.untransformedShaderDraws;
     else ++g_stereo.fixedFunctionDraws;
     const HRESULT game = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
+    if (IsDesktopSpaceAdditiveSprite(device)) {
+        ++g_stereo.suppressedDesktopSpaceLightDraws;
+        return game;
+    }
     BeginTrackedEye(device, false);
     ApplyShaderEyeState(device, shaderEye, 0.0f, false);
     const HRESULT left = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
