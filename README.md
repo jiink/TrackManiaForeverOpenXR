@@ -112,6 +112,8 @@ Xbox controllers exposed through legacy DirectInput combine both triggers onto o
 
 Every launch replaces `TMOXR.log` beside `TmForever.exe`, so the file contains only the current session. Attach the complete file when reporting a crash or initialization problem. For rendering problems, the periodic stereo, shader-coverage, tracked-pose, and OpenXR-timing lines are usually sufficient.
 
+If OpenXR initialization fails, the mod displays a one-time error dialog over the game with the failing stage, symbolic error name, and a suggested action. Dismiss it to continue playing on the monitor without VR; the complete details remain in `TMOXR.log`.
+
 Common messages:
 
 - `Could not load the Win32 openxr_loader.dll`: run the install script or follow the manual Win32 loader steps above; ensure the DLL is the Win32 build rather than x64.

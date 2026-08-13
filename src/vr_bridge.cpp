@@ -45,6 +45,15 @@ std::string Utf8(const wchar_t* value) {
     return output;
 }
 
+std::wstring Utf16(const std::string& value) {
+    if (value.empty()) return {};
+    const int required = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
+    if (required <= 0) return {};
+    std::wstring output(static_cast<size_t>(required), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), output.data(), required);
+    return output;
+}
+
 std::wstring EnvironmentValue(const wchar_t* name) {
     const DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
     if (!required) return {};
@@ -96,6 +105,16 @@ std::string ModulePath(HMODULE module) {
     std::vector<wchar_t> path(32768);
     const DWORD length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
     return length && length < path.size() ? Utf8(path.data()) : std::string("<path unavailable>");
+}
+
+std::wstring LogFilePath() {
+    std::vector<wchar_t> executable(32768);
+    const DWORD length = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+    if (!length || length >= executable.size()) return L"TMOXR.log beside TmForever.exe";
+    std::wstring path(executable.data(), length);
+    const size_t separator = path.find_last_of(L"\\/");
+    path.resize(separator == std::wstring::npos ? 0 : separator + 1);
+    return path + L"TMOXR.log";
 }
 
 template <typename T>
@@ -184,6 +203,7 @@ struct VrBridge::Impl {
     D3DPRESENT_PARAMETERS present{};
     bool initialized = false;
     bool permanentlyDisabled = false;
+    bool startupFailureShown = false;
     bool sessionRunning = false;
     bool copyFailureLogged = false;
     uint32_t leftSourceSamples = 0;
@@ -224,6 +244,33 @@ struct VrBridge::Impl {
     bool frameBegun = false;
     bool activeViewsLocated = false;
     std::mutex mutex;
+
+    void ShowStartupFailure(const std::string& stage, const std::string& error, const std::string& guidance) {
+        if (startupFailureShown) return;
+        startupFailureShown = true;
+
+        std::wstring message = L"TrackMania VR could not start.\n\nStage: " + Utf16(stage) +
+            L"\nError: " + Utf16(error);
+        if (!guidance.empty()) message += L"\n\n" + Utf16(guidance);
+        message += L"\n\nThe game will continue on the monitor without VR.\n\nFull diagnostics:\n" + LogFilePath();
+
+        HWND owner = present.hDeviceWindow;
+        if ((!owner || !IsWindow(owner)) && device) {
+            D3DDEVICE_CREATION_PARAMETERS creation{};
+            if (SUCCEEDED(device->GetCreationParameters(&creation))) owner = creation.hFocusWindow;
+        }
+        if (!owner || !IsWindow(owner)) owner = GetForegroundWindow();
+        MessageBoxW(owner, message.c_str(), L"TrackMania OpenXR - VR startup failed",
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST);
+    }
+
+    bool DisableAfterStartupFailure(const std::string& stage, const std::string& error,
+                                    const std::string& guidance) {
+        permanentlyDisabled = true;
+        DestroyOpenXR();
+        ShowStartupFailure(stage, error, guidance);
+        return false;
+    }
 
     void EndActiveFrameWithoutLayers() {
         if (!frameBegun || !endFrame) return;
@@ -669,11 +716,12 @@ struct VrBridge::Impl {
         loader = LoadLibraryW(L"openxr_loader.dll");
         if (!loader) {
             const DWORD error = GetLastError();
-            log::Error("Could not load the Win32 openxr_loader.dll beside TrackMania. Windows error=" +
-                std::to_string(error) + (error == ERROR_BAD_EXE_FORMAT ?
-                " (the DLL may be 64-bit; install the Win32 loader)." : "."));
-            permanentlyDisabled = true;
-            return false;
+            const std::string detail = "Windows error " + std::to_string(error);
+            const std::string guidance = error == ERROR_BAD_EXE_FORMAT ?
+                "The OpenXR loader may be 64-bit. Install Win32/bin/openxr_loader.dll beside TmForever.exe." :
+                "Install Win32/bin/openxr_loader.dll beside TmForever.exe.";
+            log::Error("Could not load the Win32 openxr_loader.dll beside TrackMania. " + detail + ". " + guidance);
+            return DisableAfterStartupFailure("loading the Win32 OpenXR loader", detail, guidance);
         }
         log::Info("Loaded OpenXR loader from " + ModulePath(loader) + ".");
         getProc = reinterpret_cast<PFN_xrGetInstanceProcAddr>(GetProcAddress(loader, "xrGetInstanceProcAddr"));
@@ -681,32 +729,34 @@ struct VrBridge::Impl {
         enumerateExtensions = reinterpret_cast<PFN_xrEnumerateInstanceExtensionProperties>(GetProcAddress(loader, "xrEnumerateInstanceExtensionProperties"));
         if (!getProc || !createInstance || !enumerateExtensions) {
             log::Error("OpenXR loader is missing required global entry points.");
-            permanentlyDisabled = true;
-            DestroyOpenXR();
-            return false;
+            return DisableAfterStartupFailure("validating the OpenXR loader", "required OpenXR functions are missing",
+                "Replace openxr_loader.dll with the official Win32 Khronos loader supplied in the installation instructions.");
         }
         uint32_t extensionCount = 0;
         const XrResult enumerateResult = enumerateExtensions(nullptr, 0, &extensionCount, nullptr);
         if (!Check(enumerateResult, "xrEnumerateInstanceExtensionProperties(count)")) {
+            std::string guidance = "See TMOXR.log for the registered Win32 runtime path.";
             if (enumerateResult == XR_ERROR_RUNTIME_UNAVAILABLE) {
-                log::Error("The OpenXR loader could not find or load the registered Win32 runtime. Check the Win32 ActiveRuntime manifest path logged above and reinstall/select a 32-bit-capable runtime.");
+                guidance = "The Win32 OpenXR runtime is missing or could not be loaded. Select or reinstall a 32-bit-capable runtime; Virtual Desktop users should select VDXR.";
+                log::Error(guidance);
             }
-            permanentlyDisabled = true;
-            DestroyOpenXR();
-            return false;
+            return DisableAfterStartupFailure("finding the active Win32 OpenXR runtime", Result(enumerateResult), guidance);
         }
         log::Info("The active OpenXR runtime advertises " + std::to_string(extensionCount) + " instance extensions.");
         std::vector<XrExtensionProperties> extensions(extensionCount, XrExtensionProperties{XR_TYPE_EXTENSION_PROPERTIES});
-        if (!Check(enumerateExtensions(nullptr, extensionCount, &extensionCount, extensions.data()), "xrEnumerateInstanceExtensionProperties(data)")) { permanentlyDisabled = true; DestroyOpenXR(); return false; }
+        const XrResult extensionDataResult = enumerateExtensions(nullptr, extensionCount, &extensionCount, extensions.data());
+        if (!Check(extensionDataResult, "xrEnumerateInstanceExtensionProperties(data)")) {
+            return DisableAfterStartupFailure("reading OpenXR runtime capabilities", Result(extensionDataResult),
+                "See TMOXR.log for the selected Win32 runtime.");
+        }
         bool d3d11Supported = false;
         for (const auto& extension : extensions) {
             if (std::strcmp(extension.extensionName, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) == 0) d3d11Supported = true;
         }
         if (!d3d11Supported) {
             log::Error("The active OpenXR runtime does not offer XR_KHR_D3D11_enable. No VR frames will be submitted.");
-            permanentlyDisabled = true;
-            DestroyOpenXR();
-            return false;
+            return DisableAfterStartupFailure("checking OpenXR graphics support", "XR_KHR_D3D11_enable is unavailable",
+                "Select a Win32 OpenXR runtime with Direct3D 11 support, such as VDXR.");
         }
         const char* enabledExtensions[] = {XR_KHR_D3D11_ENABLE_EXTENSION_NAME};
         XrInstanceCreateInfo instanceInfo{XR_TYPE_INSTANCE_CREATE_INFO};
@@ -720,8 +770,15 @@ struct VrBridge::Impl {
         instanceInfo.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
         instanceInfo.enabledExtensionCount = 1;
         instanceInfo.enabledExtensionNames = enabledExtensions;
-        if (!Check(createInstance(&instanceInfo, &instance), "xrCreateInstance")) { permanentlyDisabled = true; DestroyOpenXR(); return false; }
-        if (!LoadFunctions()) { permanentlyDisabled = true; DestroyOpenXR(); return false; }
+        const XrResult instanceResult = createInstance(&instanceInfo, &instance);
+        if (!Check(instanceResult, "xrCreateInstance")) {
+            return DisableAfterStartupFailure("creating the OpenXR instance", Result(instanceResult),
+                "Check that the selected Win32 OpenXR runtime is installed and running correctly.");
+        }
+        if (!LoadFunctions()) {
+            return DisableAfterStartupFailure("loading OpenXR runtime functions", "a required OpenXR function is unavailable",
+                "The selected runtime may be incompatible. See TMOXR.log for the missing function.");
+        }
         XrInstanceProperties instanceProperties{XR_TYPE_INSTANCE_PROPERTIES};
         if (Check(getInstanceProperties(instance, &instanceProperties), "xrGetInstanceProperties")) {
             log::Info("OpenXR runtime: " + std::string(instanceProperties.runtimeName) + " " +
@@ -738,32 +795,55 @@ struct VrBridge::Impl {
         systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
         const XrResult systemResult = getSystem(instance, &systemInfo, &system);
         if (!Check(systemResult, "xrGetSystem")) {
+            std::string guidance = "See TMOXR.log for the runtime name and version.";
             if (systemResult == XR_ERROR_FORM_FACTOR_UNAVAILABLE) {
-                log::Error("The runtime loaded successfully, but it has no headset available. Ensure the headset is connected through the same runtime named above; VDXR requires an active Virtual Desktop connection and cannot see a Steam Link session.");
+                guidance = "The runtime loaded, but it cannot see a headset. Connect through the runtime named in TMOXR.log; VDXR requires Virtual Desktop and cannot see a Steam Link session.";
+                log::Error(guidance);
             } else if (systemResult == XR_ERROR_FORM_FACTOR_UNSUPPORTED) {
-                log::Error("The selected OpenXR runtime does not support head-mounted displays.");
+                guidance = "The selected OpenXR runtime does not support head-mounted displays.";
+                log::Error(guidance);
             }
-            permanentlyDisabled = true;
-            DestroyOpenXR();
-            return false;
+            return DisableAfterStartupFailure("finding an OpenXR headset", Result(systemResult), guidance);
         }
         log::Info("The OpenXR runtime reported an available head-mounted display (system ID " +
             std::to_string(static_cast<uint64_t>(system)) + ").");
         XrGraphicsRequirementsD3D11KHR requirements{XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR};
-        if (!Check(getRequirements(instance, system, &requirements), "xrGetD3D11GraphicsRequirementsKHR")) { permanentlyDisabled = true; DestroyOpenXR(); return false; }
-        if (!CreateD3D11Device(requirements) || !DetermineSourceSize()) { permanentlyDisabled = true; DestroyOpenXR(); return false; }
+        const XrResult requirementsResult = getRequirements(instance, system, &requirements);
+        if (!Check(requirementsResult, "xrGetD3D11GraphicsRequirementsKHR")) {
+            return DisableAfterStartupFailure("querying OpenXR graphics requirements", Result(requirementsResult),
+                "Update or reinstall the active OpenXR runtime and graphics driver.");
+        }
+        if (!CreateD3D11Device(requirements)) {
+            return DisableAfterStartupFailure("creating the OpenXR Direct3D 11 bridge", "Direct3D device creation failed",
+                "See TMOXR.log for the graphics adapter or HRESULT failure.");
+        }
+        if (!DetermineSourceSize()) {
+            return DisableAfterStartupFailure("reading TrackMania's backbuffer", "the Direct3D 9 backbuffer is unavailable",
+                "Run the game windowed and disable antialiasing, then try again.");
+        }
         XrGraphicsBindingD3D11KHR binding{XR_TYPE_GRAPHICS_BINDING_D3D11_KHR};
         binding.device = d3d11Device;
         XrSessionCreateInfo sessionInfo{XR_TYPE_SESSION_CREATE_INFO};
         sessionInfo.next = &binding;
         sessionInfo.systemId = system;
-        if (!Check(createSession(instance, &sessionInfo, &session), "xrCreateSession")) { permanentlyDisabled = true; DestroyOpenXR(); return false; }
+        const XrResult sessionResult = createSession(instance, &sessionInfo, &session);
+        if (!Check(sessionResult, "xrCreateSession")) {
+            return DisableAfterStartupFailure("creating the OpenXR headset session", Result(sessionResult),
+                "Confirm the headset and game are using the same graphics adapter and OpenXR runtime.");
+        }
         AttachControllerActions();
         XrReferenceSpaceCreateInfo spaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
         spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
         spaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
-        if (!Check(createReferenceSpace(session, &spaceInfo, &space), "xrCreateReferenceSpace")) { permanentlyDisabled = true; DestroyOpenXR(); return false; }
-        if (!CreateSwapchains()) { permanentlyDisabled = true; DestroyOpenXR(); return false; }
+        const XrResult spaceResult = createReferenceSpace(session, &spaceInfo, &space);
+        if (!Check(spaceResult, "xrCreateReferenceSpace")) {
+            return DisableAfterStartupFailure("creating the OpenXR tracking space", Result(spaceResult),
+                "Restart the headset runtime and try again.");
+        }
+        if (!CreateSwapchains()) {
+            return DisableAfterStartupFailure("creating OpenXR eye images", "OpenXR swapchain creation failed",
+                "See TMOXR.log for the exact swapchain error and supported image formats.");
+        }
         initialized = true;
         log::Info("OpenXR initialization completed. Waiting for runtime to report session READY.");
         return true;
