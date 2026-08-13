@@ -89,6 +89,82 @@ SetVertexShaderFn g_originalSetVertexShader = nullptr;
 SetVertexShaderConstantFFn g_originalSetVertexShaderConstantF = nullptr;
 std::atomic<bool> g_hooked = false;
 
+struct CameraSettings {
+    bool cockpitEnabled = true;
+    // User-facing axes: positive X is right, positive Y is up, and positive Z
+    // is forward. TrackMania's reflected projection requires X to be negated
+    // when the offset is converted to its camera basis.
+    float cockpitOffsetRight = 0.0f;
+    float cockpitOffsetUp = 0.35f;
+    float cockpitOffsetForward = -1.25f;
+    int selectedCamera = 0;
+    std::array<bool, 8> cameraKeyDown{};
+    bool loaded = false;
+} g_cameraSettings;
+
+float ReadIniFloat(const std::filesystem::path& path, const wchar_t* key, float defaultValue) {
+    wchar_t defaultText[32]{};
+    swprintf_s(defaultText, L"%.3f", defaultValue);
+    wchar_t value[64]{};
+    GetPrivateProfileStringW(L"Camera", key, defaultText, value, static_cast<DWORD>(std::size(value)), path.c_str());
+    wchar_t* end = nullptr;
+    const float parsed = std::wcstof(value, &end);
+    return end != value && std::isfinite(parsed) ? parsed : defaultValue;
+}
+
+void LoadCameraSettings() {
+    if (g_cameraSettings.loaded) return;
+    g_cameraSettings.loaded = true;
+    wchar_t executablePath[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, executablePath, static_cast<DWORD>(std::size(executablePath)))) {
+        tmoxr::log::Warn("Could not locate TMOXR.ini; using the default cockpit camera offset.");
+        return;
+    }
+    const auto path = std::filesystem::path(executablePath).parent_path() / L"TMOXR.ini";
+    g_cameraSettings.cockpitEnabled = GetPrivateProfileIntW(L"Camera", L"CockpitEnabled", 1, path.c_str()) != 0;
+    g_cameraSettings.cockpitOffsetRight = ReadIniFloat(path, L"CockpitOffsetRight", 0.0f);
+    g_cameraSettings.cockpitOffsetUp = ReadIniFloat(path, L"CockpitOffsetUp", 0.35f);
+    g_cameraSettings.cockpitOffsetForward = ReadIniFloat(path, L"CockpitOffsetForward", -1.25f);
+    tmoxr::log::Info("Cockpit camera configuration: enabled=" + std::to_string(g_cameraSettings.cockpitEnabled) +
+        ", right/up/forward=(" + std::to_string(g_cameraSettings.cockpitOffsetRight) + "," +
+        std::to_string(g_cameraSettings.cockpitOffsetUp) + "," +
+        std::to_string(g_cameraSettings.cockpitOffsetForward) + ") metres.");
+}
+
+bool GameHasKeyboardFocus() {
+    const HWND foreground = GetForegroundWindow();
+    if (!foreground) return false;
+    DWORD processId = 0;
+    GetWindowThreadProcessId(foreground, &processId);
+    return processId == GetCurrentProcessId();
+}
+
+void UpdateSelectedCameraFromKeyboard() {
+    if (!GameHasKeyboardFocus()) return;
+    // The keypad reports navigation virtual keys when Num Lock is off even
+    // though TrackMania still treats the physical keys as camera shortcuts.
+    constexpr std::array<int, 8> navigationKeys = {
+        0, VK_END, VK_DOWN, VK_NEXT, VK_LEFT, VK_CLEAR, VK_RIGHT, VK_HOME};
+    for (int camera = 1; camera <= 7; ++camera) {
+        const bool down = (GetAsyncKeyState(VK_NUMPAD0 + camera) & 0x8000) != 0 ||
+            (GetAsyncKeyState('0' + camera) & 0x8000) != 0 ||
+            (GetAsyncKeyState(navigationKeys[camera]) & 0x8000) != 0;
+        if (down && !g_cameraSettings.cameraKeyDown[camera]) {
+            g_cameraSettings.selectedCamera = camera;
+            if (camera == 3) {
+                tmoxr::log::Info("Camera 3 selected; applying the VR cockpit seat offset.");
+            } else if (g_cameraSettings.cockpitEnabled) {
+                tmoxr::log::Info("Camera " + std::to_string(camera) + " selected; VR cockpit seat offset disabled.");
+            }
+        }
+        g_cameraSettings.cameraKeyDown[camera] = down;
+    }
+}
+
+bool CockpitCameraActive() {
+    return g_cameraSettings.cockpitEnabled && g_cameraSettings.selectedCamera == 3;
+}
+
 struct StereoResources {
     struct ColorPair { IDirect3DSurface9* source; IDirect3DSurface9* left; IDirect3DSurface9* right; };
     struct ShaderPositionInfo { IDirect3DVertexShader9* shader; UINT baseRegister; };
@@ -643,6 +719,11 @@ Matrix4 HeadViewMatrix(float eyeOffsetMeters) {
         g_stereo.haveHeadPose ? -g_stereo.headPose.position[0] : 0.0f,
         g_stereo.haveHeadPose ? g_stereo.headPose.position[1] : 0.0f,
         g_stereo.haveHeadPose ? -g_stereo.headPose.position[2] : 0.0f};
+    if (CockpitCameraActive()) {
+        cameraPosition[0] -= g_cameraSettings.cockpitOffsetRight;
+        cameraPosition[1] += g_cameraSettings.cockpitOffsetUp;
+        cameraPosition[2] += g_cameraSettings.cockpitOffsetForward;
+    }
     // The eye offset is local to the headset and therefore rotates with it.
     for (UINT row = 0; row < 3; ++row) cameraPosition[row] += rotation[row][0] * eyeOffsetMeters;
 
@@ -1048,6 +1129,7 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
 
 HRESULT STDMETHODCALLTYPE BeginSceneHook(IDirect3DDevice9* device) {
     tmoxr::VrBridge::Instance().OnBeginScene();
+    UpdateSelectedCameraFromKeyboard();
     g_stereo.haveHeadPose = tmoxr::VrBridge::Instance().GetHeadPose(g_stereo.headPose);
     tmoxr::RenderConfiguration renderConfiguration{};
     if (tmoxr::VrBridge::Instance().GetRenderConfiguration(renderConfiguration)) {
@@ -1351,6 +1433,7 @@ private:
 
 __declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT sdkVersion) {
     tmoxr::log::Initialize();
+    LoadCameraSettings();
     LoadRealD3D9();
     if (!g_create9) return nullptr;
     auto* real = g_create9(sdkVersion);

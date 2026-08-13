@@ -22,6 +22,7 @@ This project adds headset-only VR to the 32-bit Steam release of TrackMania Unit
 
 - Native stereoscopic rendering by replaying TrackMania's Direct3D 9 scene draws for two eyes.
 - 6DoF OpenXR headset rotation and position applied to the game camera.
+- A configurable driver-seat offset for camera 3, placing the VR view farther back and higher inside the car.
 - OpenXR-recommended per-eye resolution and asymmetric headset FOV.
 - Correct OpenXR predicted-pose timing so runtime reprojection can stabilize lower-rate game frames.
 - Meta Quest Touch controllers exposed to TrackMania as an analog DirectInput gamepad.
@@ -93,6 +94,20 @@ Use a different game path or deliberately refresh the pinned loader with:
 6. Put on the headset and enter a race.
 
 The loader package being version 1.1.62 does not require the application or active runtime to use OpenXR API 1.1. The mod deliberately requests OpenXR 1.0 for compatibility with runtimes that expose 1.0; newer loaders can negotiate that version normally.
+
+## Cockpit camera
+
+Press camera key **3** (the numeric keypad key used by TrackMania, or a top-row 3 binding) to enable the VR driver-seat offset. Pressing camera keys 1, 2, or 4–7 disables it. The adjustment affects only the two headset views; the desktop camera is unchanged.
+
+The install script places `TMOXR.ini` beside `TmForever.exe` without overwriting an existing copy. Its offsets are measured in metres in the camera's local axes:
+
+- `CockpitOffsetRight`: positive moves the viewpoint to the right.
+- `CockpitOffsetUp`: positive moves it upward.
+- `CockpitOffsetForward`: positive moves it toward the front of the car; negative moves it toward the seat.
+
+The supplied starting point is centered, 0.35 m higher, and 1.25 m behind TrackMania's camera-3 position. Different environments and custom vehicle models have different dimensions, so adjust these values and restart the game if the view lands inside bodywork. Set `CockpitEnabled=0` to turn the feature off.
+
+The first version recognizes camera mode from manual 1–7 key presses. A camera change forced by a track's MediaTracker does not yet notify the mod, so it does not automatically toggle the seat offset.
 
 ## Quest Touch gamepad mapping
 

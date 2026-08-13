@@ -50,6 +50,8 @@ $proxyBackup = Join-Path $resolvedGamePath 'd3d9.before-tmoxr.dll'
 $destinationInputProxy = Join-Path $resolvedGamePath 'dinput8.dll'
 $inputProxyBackup = Join-Path $resolvedGamePath 'dinput8.before-tmoxr.dll'
 $destinationLoader = Join-Path $resolvedGamePath 'openxr_loader.dll'
+$sourceConfiguration = Join-Path $scriptRoot '..\TMOXR.ini'
+$destinationConfiguration = Join-Path $resolvedGamePath 'TMOXR.ini'
 
 if (-not (Test-Path -LiteralPath $gameExecutable -PathType Leaf)) {
     throw "TmForever.exe was not found at '$gameExecutable'. Pass the correct -GamePath."
@@ -82,6 +84,12 @@ if ((Test-Path -LiteralPath $destinationInputProxy -PathType Leaf) -and
 }
 Copy-Item -LiteralPath $resolvedInputDll -Destination $destinationInputProxy -Force
 Write-Host "Installed OpenXR virtual gamepad proxy: '$destinationInputProxy'."
+
+if ((Test-Path -LiteralPath $sourceConfiguration -PathType Leaf) -and
+    -not (Test-Path -LiteralPath $destinationConfiguration -PathType Leaf)) {
+    Copy-Item -LiteralPath $sourceConfiguration -Destination $destinationConfiguration
+    Write-Host "Installed editable VR camera configuration: '$destinationConfiguration'."
+}
 
 $loaderIsWin32 = (Test-Path -LiteralPath $destinationLoader -PathType Leaf) -and
     ((Get-PeMachine -Path $destinationLoader) -eq $x86Machine)
