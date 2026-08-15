@@ -97,10 +97,16 @@ struct CameraSettings {
     float cockpitOffsetRight = 0.0f;
     float cockpitOffsetUp = 0.35f;
     float cockpitOffsetForward = -1.25f;
-    int selectedCamera = 0;
+    float cockpitNearClip = 0.05f;
+    std::atomic<int> selectedCamera{0};
     std::array<bool, 8> cameraKeyDown{};
     bool loaded = false;
 } g_cameraSettings;
+
+using VehicleSetVisibilityFn = void(__thiscall*)(void*, void*, int, int, int);
+VehicleSetVisibilityFn g_originalVehicleSetVisibility = nullptr;
+void** g_vehicleSetVisibilitySlot = nullptr;
+std::atomic<bool> g_vehicleVisibilityOverrideLogged = false;
 
 float ReadIniFloat(const std::filesystem::path& path, const wchar_t* key, float defaultValue) {
     wchar_t defaultText[32]{};
@@ -125,10 +131,12 @@ void LoadCameraSettings() {
     g_cameraSettings.cockpitOffsetRight = ReadIniFloat(path, L"CockpitOffsetRight", 0.0f);
     g_cameraSettings.cockpitOffsetUp = ReadIniFloat(path, L"CockpitOffsetUp", 0.35f);
     g_cameraSettings.cockpitOffsetForward = ReadIniFloat(path, L"CockpitOffsetForward", -1.25f);
+    g_cameraSettings.cockpitNearClip = std::clamp(ReadIniFloat(path, L"CockpitNearClip", 0.05f), 0.01f, 0.5f);
     tmoxr::log::Info("Cockpit camera configuration: enabled=" + std::to_string(g_cameraSettings.cockpitEnabled) +
         ", right/up/forward=(" + std::to_string(g_cameraSettings.cockpitOffsetRight) + "," +
         std::to_string(g_cameraSettings.cockpitOffsetUp) + "," +
-        std::to_string(g_cameraSettings.cockpitOffsetForward) + ") metres.");
+        std::to_string(g_cameraSettings.cockpitOffsetForward) + ") metres, near clip=" +
+        std::to_string(g_cameraSettings.cockpitNearClip) + " metres.");
 }
 
 bool GameHasKeyboardFocus() {
@@ -150,7 +158,7 @@ void UpdateSelectedCameraFromKeyboard() {
             (GetAsyncKeyState('0' + camera) & 0x8000) != 0 ||
             (GetAsyncKeyState(navigationKeys[camera]) & 0x8000) != 0;
         if (down && !g_cameraSettings.cameraKeyDown[camera]) {
-            g_cameraSettings.selectedCamera = camera;
+            g_cameraSettings.selectedCamera.store(camera, std::memory_order_relaxed);
             if (camera == 3) {
                 tmoxr::log::Info("Camera 3 selected; applying the VR cockpit seat offset.");
             } else if (g_cameraSettings.cockpitEnabled) {
@@ -162,7 +170,64 @@ void UpdateSelectedCameraFromKeyboard() {
 }
 
 bool CockpitCameraActive() {
-    return g_cameraSettings.cockpitEnabled && g_cameraSettings.selectedCamera == 3;
+    return g_cameraSettings.cockpitEnabled &&
+        g_cameraSettings.selectedCamera.load(std::memory_order_relaxed) == 3;
+}
+
+void __fastcall VehicleSetVisibilityHook(void* game, void*, void* vehicleMobil,
+                                         int visible, int context, int recursive) {
+    // Camera input is processed before D3D BeginScene, so sample the shortcut
+    // here as well or the first camera-3 hide request can arrive one frame
+    // before the renderer has recorded the new camera mode.
+    UpdateSelectedCameraFromKeyboard();
+    if (CockpitCameraActive() && vehicleMobil && visible == 0) {
+        visible = 1;
+        if (!g_vehicleVisibilityOverrideLogged.exchange(true)) {
+            tmoxr::log::Info("Camera 3 attempted to hide a vehicle mobil; forcing its native model visible for the VR cockpit.");
+        }
+    }
+    g_originalVehicleSetVisibility(game, vehicleMobil, visible, context, recursive);
+}
+
+bool InstallVehicleVisibilityHook() {
+    if (g_originalVehicleSetVisibility) return true;
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    if (!module) return false;
+    // Steam TMUF 2.11.26: CTrackMania vtable + CGameApp::VehicleSetVisibility
+    // slot. Validate both RVAs before touching the executable's read-only data.
+    constexpr uintptr_t slotRva = 0x0073E0F8;
+    constexpr uintptr_t functionRva = 0x000859C0;
+    auto** slot = reinterpret_cast<void**>(module + slotRva);
+    void* const expected = reinterpret_cast<void*>(module + functionRva);
+    if (*slot != expected) {
+        tmoxr::log::Warn("Cockpit vehicle visibility hook was not installed because this TmForever.exe does not match the supported Steam 2.11.26 layout.");
+        return false;
+    }
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &oldProtection)) {
+        tmoxr::log::Warn("VirtualProtect failed while installing the cockpit vehicle visibility hook: " +
+            std::to_string(GetLastError()));
+        return false;
+    }
+    g_originalVehicleSetVisibility = reinterpret_cast<VehicleSetVisibilityFn>(*slot);
+    *slot = reinterpret_cast<void*>(&VehicleSetVisibilityHook);
+    DWORD ignored = 0;
+    VirtualProtect(slot, sizeof(*slot), oldProtection, &ignored);
+    g_vehicleSetVisibilitySlot = slot;
+    tmoxr::log::Info("Installed camera-3 native vehicle visibility override.");
+    return true;
+}
+
+void RemoveVehicleVisibilityHook() {
+    if (!g_vehicleSetVisibilitySlot || !g_originalVehicleSetVisibility) return;
+    DWORD oldProtection = 0;
+    if (VirtualProtect(g_vehicleSetVisibilitySlot, sizeof(*g_vehicleSetVisibilitySlot), PAGE_READWRITE, &oldProtection)) {
+        *g_vehicleSetVisibilitySlot = reinterpret_cast<void*>(g_originalVehicleSetVisibility);
+        DWORD ignored = 0;
+        VirtualProtect(g_vehicleSetVisibilitySlot, sizeof(*g_vehicleSetVisibilitySlot), oldProtection, &ignored);
+    }
+    g_vehicleSetVisibilitySlot = nullptr;
+    g_originalVehicleSetVisibility = nullptr;
 }
 
 struct StereoResources {
@@ -692,6 +757,13 @@ Matrix4 EyeProjection(bool rightEye) {
     // Retain TrackMania's near/far depth mapping while replacing only FOV.
     projection[10] = gameProjection[10];
     projection[11] = gameProjection[11];
+    if (CockpitCameraActive() && gameProjection[10] > 1.0f && gameProjection[11] < 0.0f) {
+        const float farClip = -gameProjection[11] / (gameProjection[10] - 1.0f);
+        if (std::isfinite(farClip) && farClip > g_cameraSettings.cockpitNearClip) {
+            projection[10] = farClip / (farClip - g_cameraSettings.cockpitNearClip);
+            projection[11] = -g_cameraSettings.cockpitNearClip * projection[10];
+        }
+    }
     projection[14] = gameProjection[14];
     projection[15] = gameProjection[15];
     return projection;
@@ -1434,6 +1506,7 @@ private:
 __declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT sdkVersion) {
     tmoxr::log::Initialize();
     LoadCameraSettings();
+    InstallVehicleVisibilityHook();
     LoadRealD3D9();
     if (!g_create9) return nullptr;
     auto* real = g_create9(sdkVersion);
@@ -1465,6 +1538,9 @@ extern "C" __declspec(dllexport) void WINAPI TMOXR_LogInputMessage(const char* m
 }
 
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
-    if (reason == DLL_PROCESS_DETACH) tmoxr::VrBridge::Instance().Shutdown();
+    if (reason == DLL_PROCESS_DETACH) {
+        RemoveVehicleVisibilityHook();
+        tmoxr::VrBridge::Instance().Shutdown();
+    }
     return TRUE;
 }

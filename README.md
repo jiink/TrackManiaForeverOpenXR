@@ -97,15 +97,16 @@ The loader package being version 1.1.62 does not require the application or acti
 
 ## Cockpit camera
 
-Press camera key **3** (the numeric keypad key used by TrackMania, or a top-row 3 binding) to enable the VR driver-seat offset. Pressing camera keys 1, 2, or 4–7 disables it. The adjustment affects only the two headset views; the desktop camera is unchanged.
+Press camera key **3** (the numeric keypad key used by TrackMania, or a top-row 3 binding) to enable the VR driver-seat offset. Pressing camera keys 1, 2, or 4–7 disables it. The seat transform affects only the two headset views. The native-car visibility override is game-wide, so the monitor may also show parts of the car while camera 3 is selected.
 
 The install script places `TMOXR.ini` beside `TmForever.exe` without overwriting an existing copy. Its offsets are measured in metres in the camera's local axes:
 
 - `CockpitOffsetRight`: positive moves the viewpoint to the right.
 - `CockpitOffsetUp`: positive moves it upward.
 - `CockpitOffsetForward`: positive moves it toward the front of the car; negative moves it toward the seat.
+- `CockpitNearClip`: nearest visible distance; the 0.05 m default keeps nearby cockpit geometry from being clipped.
 
-The supplied starting point is centered, 0.35 m higher, and 1.25 m behind TrackMania's camera-3 position. Different environments and custom vehicle models have different dimensions, so adjust these values and restart the game if the view lands inside bodywork. Set `CockpitEnabled=0` to turn the feature off.
+The supplied starting point is centered, 0.35 m higher, and 1.25 m behind TrackMania's camera-3 position. While camera 3 is selected, the mod also overrides TrackMania's request to hide the native player-vehicle model. Different environments and custom vehicle models have different dimensions, so adjust these values and restart the game if the view lands inside bodywork. Set `CockpitEnabled=0` to turn the feature off.
 
 The first version recognizes camera mode from manual 1–7 key presses. A camera change forced by a track's MediaTracker does not yet notify the mod, so it does not automatically toggle the seat offset.
 
