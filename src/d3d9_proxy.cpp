@@ -838,6 +838,17 @@ bool CreateStereoResources(IDirect3DDevice9* device) {
         return false;
     }
     g_stereo.haveGameViewport = SUCCEEDED(device->GetViewport(&g_stereo.gameViewport));
+    if (SUCCEEDED(device->GetTransform(D3DTS_PROJECTION, &g_stereo.projection))) {
+        g_stereo.perspective = std::abs(g_stereo.projection._34) > 0.5f;
+        g_stereo.perspectivePassSeen = g_stereo.perspective;
+    }
+    g_stereo.haveView = SUCCEEDED(device->GetTransform(D3DTS_VIEW, &g_stereo.view));
+    IDirect3DVertexShader9* activeShader = nullptr;
+    if (SUCCEEDED(device->GetVertexShader(&activeShader))) {
+        g_stereo.vertexShader = activeShader;
+        g_stereo.customVertexShaderBound = activeShader != nullptr;
+        if (activeShader) activeShader->Release();
+    }
     g_stereo.ready = true;
     tmoxr::log::Info("Experimental native stereo resources initialized: " + std::to_string(color.Width) + "x" + std::to_string(color.Height) + ".");
     tmoxr::log::Info("Stereo camera baseline for TrackMania's reflected X projection: left=0.000 m, right=-0.064 m.");
@@ -1346,6 +1357,113 @@ void CaptureUiDraw(IDirect3DDevice9* device, Draw&& draw) {
     g_originalSetViewport(device, &viewport);
 }
 
+struct CursorVertex {
+    float x;
+    float y;
+    float z;
+    float rhw;
+    D3DCOLOR color;
+};
+
+void AppendCursorRectangle(std::vector<CursorVertex>& vertices, float left, float top,
+                           float right, float bottom, D3DCOLOR color) {
+    const CursorVertex topLeft{left, top, 0.0f, 1.0f, color};
+    const CursorVertex topRight{right, top, 0.0f, 1.0f, color};
+    const CursorVertex bottomLeft{left, bottom, 0.0f, 1.0f, color};
+    const CursorVertex bottomRight{right, bottom, 0.0f, 1.0f, color};
+    vertices.insert(vertices.end(), {topLeft, topRight, bottomLeft, bottomLeft, topRight, bottomRight});
+}
+
+void CaptureMouseCursor(IDirect3DDevice9* device, HWND window) {
+    if (!device || !window || !g_stereo.ready || !g_stereo.uiSurface ||
+        !g_stereo.primaryWidth || !g_stereo.primaryHeight) return;
+
+    CURSORINFO cursor{sizeof(cursor)};
+    if (!GetCursorInfo(&cursor) || (cursor.flags & CURSOR_SHOWING) == 0) return;
+    POINT point = cursor.ptScreenPos;
+    if (!ScreenToClient(window, &point)) return;
+    RECT client{};
+    if (!GetClientRect(window, &client)) return;
+    const LONG clientWidth = client.right - client.left;
+    const LONG clientHeight = client.bottom - client.top;
+    if (clientWidth <= 0 || clientHeight <= 0 || point.x < 0 || point.y < 0 ||
+        point.x >= clientWidth || point.y >= clientHeight) return;
+
+    const float x = (static_cast<float>(point.x) + 0.5f) *
+        static_cast<float>(g_stereo.primaryWidth) / static_cast<float>(clientWidth) - 0.5f;
+    const float y = (static_cast<float>(point.y) + 0.5f) *
+        static_cast<float>(g_stereo.primaryHeight) / static_cast<float>(clientHeight) - 0.5f;
+    const float scale = std::max(1.0f, std::min(
+        static_cast<float>(g_stereo.primaryWidth) / 1024.0f,
+        static_cast<float>(g_stereo.primaryHeight) / 768.0f));
+
+    std::vector<CursorVertex> vertices;
+    vertices.reserve(24);
+    // Opaque black outline plus a smaller white cross remains visible over
+    // both TrackMania's bright menus and dark translucent panels.
+    AppendCursorRectangle(vertices, x - 11.0f * scale, y - 3.0f * scale,
+        x + 12.0f * scale, y + 4.0f * scale, D3DCOLOR_ARGB(255, 0, 0, 0));
+    AppendCursorRectangle(vertices, x - 3.0f * scale, y - 11.0f * scale,
+        x + 4.0f * scale, y + 12.0f * scale, D3DCOLOR_ARGB(255, 0, 0, 0));
+    AppendCursorRectangle(vertices, x - 9.0f * scale, y - 1.0f * scale,
+        x + 10.0f * scale, y + 2.0f * scale, D3DCOLOR_ARGB(255, 255, 255, 255));
+    AppendCursorRectangle(vertices, x - 1.0f * scale, y - 9.0f * scale,
+        x + 2.0f * scale, y + 10.0f * scale, D3DCOLOR_ARGB(255, 255, 255, 255));
+
+    IDirect3DStateBlock9* state = nullptr;
+    if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &state))) return;
+    const bool beginTemporaryScene = !g_stereo.sceneActive;
+    if (beginTemporaryScene && FAILED(g_originalBeginScene(device))) {
+        state->Release();
+        return;
+    }
+
+    g_originalSetDepthStencilSurface(device, nullptr);
+    if (SUCCEEDED(g_originalSetRenderTarget(device, 0, g_stereo.uiSurface))) {
+        if (!g_stereo.uiOverlayClearedThisFrame) {
+            g_originalClear(device, 0, nullptr, D3DCLEAR_TARGET, 0x00000000u, 1.0f, 0);
+            g_stereo.uiOverlayClearedThisFrame = true;
+        }
+        const D3DVIEWPORT9 viewport{0, 0, g_stereo.primaryWidth, g_stereo.primaryHeight, 0.0f, 1.0f};
+        g_originalSetViewport(device, &viewport);
+        g_originalSetVertexShader(device, nullptr);
+        device->SetPixelShader(nullptr);
+        device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+        device->SetTexture(0, nullptr);
+        device->SetRenderState(D3DRS_ZENABLE, FALSE);
+        device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+        device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+        device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+        device->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+        device->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, TRUE);
+        device->SetRenderState(D3DRS_SRCBLENDALPHA, D3DBLEND_ONE);
+        device->SetRenderState(D3DRS_DESTBLENDALPHA, D3DBLEND_INVSRCALPHA);
+        device->SetRenderState(D3DRS_BLENDOPALPHA, D3DBLENDOP_ADD);
+        device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED |
+            D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE | D3DCOLORWRITEENABLE_ALPHA);
+        device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+        device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+        device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+        device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+        if (SUCCEEDED(g_originalDrawPrimitiveUP(device, D3DPT_TRIANGLELIST,
+                static_cast<UINT>(vertices.size() / 3), vertices.data(), sizeof(CursorVertex)))) {
+            ++g_stereo.uiDrawsThisFrame;
+            ++g_stereo.capturedUiDraws;
+        }
+    }
+
+    state->Apply();
+    state->Release();
+    g_originalSetDepthStencilSurface(device, nullptr);
+    g_originalSetRenderTarget(device, 0, g_stereo.activeColor);
+    g_originalSetDepthStencilSurface(device, g_stereo.activeDepth);
+    if (g_stereo.haveGameViewport) g_originalSetViewport(device, &g_stereo.gameViewport);
+    if (beginTemporaryScene) g_originalEndScene(device);
+}
+
 bool IsDesktopSpaceAdditiveSprite(IDirect3DDevice9* device) {
     if (g_stereo.vertexShader) return false;
     bool pretransformed = false;
@@ -1477,6 +1595,10 @@ void AnalyzeVertexShader(IDirect3DVertexShader9* shader) {
 HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* source, const RECT* destination,
                                       HWND window, const RGNDATA* dirtyRegion) {
     FlushDesktopEyeMirror(device);
+    D3DDEVICE_CREATION_PARAMETERS creation{};
+    HWND cursorWindow = window;
+    if (!cursorWindow && SUCCEEDED(device->GetCreationParameters(&creation))) cursorWindow = creation.hFocusWindow;
+    CaptureMouseCursor(device, cursorWindow);
     tmoxr::VrBridge::Instance().SetLeftEyeSurface(g_stereo.trackedLeftColor, g_stereo.trackedLeftSharedHandle);
     tmoxr::VrBridge::Instance().SetRightEyeSurface(g_stereo.rightColor, g_stereo.rightSharedHandle);
     tmoxr::VrBridge::Instance().SetUiSurface(g_stereo.uiDrawsThisFrame ? g_stereo.uiSurface : nullptr,
@@ -1601,7 +1723,6 @@ HRESULT STDMETHODCALLTYPE ResetHook(IDirect3DDevice9* device, D3DPRESENT_PARAMET
     const HRESULT result = g_originalReset(device, parameters);
     if (SUCCEEDED(result)) {
         CreateStereoResources(device);
-        g_stereo.haveGameViewport = SUCCEEDED(device->GetViewport(&g_stereo.gameViewport));
         tmoxr::VrBridge::Instance().OnDeviceCreated(device, *parameters);
     }
     return result;
