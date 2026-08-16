@@ -43,6 +43,7 @@ public:
     bool GetHeadPose(HeadPose& pose);
     bool GetRenderConfiguration(RenderConfiguration& configuration);
     bool GetGamepadState(GamepadState& state);
+    void SetVerboseDiagnostics(bool enabled);
     void Shutdown();
 
 private:

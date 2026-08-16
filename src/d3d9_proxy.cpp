@@ -10,6 +10,8 @@
 #undef Direct3DCreate9Ex
 #undef D3DPERF_SetOptions
 
+#include <d3d9on12.h>
+
 #include <atomic>
 #include <algorithm>
 #include <array>
@@ -34,6 +36,7 @@ using PerfSetOptionsFn = void (WINAPI*)(DWORD);
 HMODULE g_realD3D9 = nullptr;
 Create9Fn g_create9 = nullptr;
 Create9ExFn g_create9Ex = nullptr;
+PFN_Direct3DCreate9On12 g_create9On12 = nullptr;
 PerfSetOptionsFn g_perfSetOptions = nullptr;
 
 void LoadRealD3D9() {
@@ -51,6 +54,8 @@ void LoadRealD3D9() {
     }
     g_create9 = reinterpret_cast<Create9Fn>(GetProcAddress(g_realD3D9, "Direct3DCreate9"));
     g_create9Ex = reinterpret_cast<Create9ExFn>(GetProcAddress(g_realD3D9, "Direct3DCreate9Ex"));
+    g_create9On12 = reinterpret_cast<PFN_Direct3DCreate9On12>(
+        GetProcAddress(g_realD3D9, "Direct3DCreate9On12"));
     g_perfSetOptions = reinterpret_cast<PerfSetOptionsFn>(GetProcAddress(g_realD3D9, "D3DPERF_SetOptions"));
     tmoxr::log::Info("Loaded real Direct3D 9 from " + path.string());
 }
@@ -104,6 +109,8 @@ struct CameraSettings {
     std::atomic<float> horizonLockReleaseStart{35.0f};
     std::atomic<float> horizonLockReleaseEnd{70.0f};
     std::atomic<bool> mirrorEyeToDesktop{true};
+    std::atomic<bool> d3d9On12{true};
+    std::atomic<bool> verboseDiagnostics{false};
     std::atomic<int> selectedCamera{0};
     std::array<std::atomic<bool>, 8> cameraKeyDown{};
     std::filesystem::path configurationPath;
@@ -144,6 +151,10 @@ void ReadCameraSettings(bool reloaded) {
         ReadIniFloat(path, L"HorizonLockReleaseEnd", 70.0f), horizonReleaseStart + 1.0f, 89.0f);
     const bool mirrorEyeToDesktop =
         GetPrivateProfileIntW(L"Performance", L"MirrorEyeToDesktop", 1, path.c_str()) != 0;
+    const bool d3d9On12 =
+        GetPrivateProfileIntW(L"Performance", L"D3D9On12", 1, path.c_str()) != 0;
+    const bool verboseDiagnostics =
+        GetPrivateProfileIntW(L"Diagnostics", L"Verbose", 0, path.c_str()) != 0;
     g_cameraSettings.cockpitEnabled.store(enabled, std::memory_order_relaxed);
     g_cameraSettings.cockpitOffsetRight.store(right, std::memory_order_relaxed);
     g_cameraSettings.cockpitOffsetUp.store(up, std::memory_order_relaxed);
@@ -153,6 +164,9 @@ void ReadCameraSettings(bool reloaded) {
     g_cameraSettings.horizonLockReleaseStart.store(horizonReleaseStart, std::memory_order_relaxed);
     g_cameraSettings.horizonLockReleaseEnd.store(horizonReleaseEnd, std::memory_order_relaxed);
     g_cameraSettings.mirrorEyeToDesktop.store(mirrorEyeToDesktop, std::memory_order_relaxed);
+    g_cameraSettings.d3d9On12.store(d3d9On12, std::memory_order_relaxed);
+    g_cameraSettings.verboseDiagnostics.store(verboseDiagnostics, std::memory_order_relaxed);
+    tmoxr::VrBridge::Instance().SetVerboseDiagnostics(verboseDiagnostics);
     tmoxr::log::Info(std::string(reloaded ? "Reloaded" : "Loaded") +
         " cockpit camera configuration: enabled=" + std::to_string(enabled) +
         ", right/up/forward=(" + std::to_string(right) + "," + std::to_string(up) + "," +
@@ -160,7 +174,9 @@ void ReadCameraSettings(bool reloaded) {
         " metres, horizon lock=" + std::to_string(horizonLock) +
         ", adaptive release=" + std::to_string(horizonReleaseStart) + "-" +
         std::to_string(horizonReleaseEnd) + " degrees, mirror eye to desktop=" +
-        std::to_string(mirrorEyeToDesktop) + ".");
+        std::to_string(mirrorEyeToDesktop) + ", D3D9On12=" + std::to_string(d3d9On12) +
+        ", verbose diagnostics=" +
+        std::to_string(verboseDiagnostics) + ".");
 }
 
 void LoadCameraSettings() {
@@ -690,7 +706,28 @@ bool EnsureStereoEyeColor(IDirect3DDevice9* device) {
         leftSharedHandle = nullptr;
         rightSharedHandle = nullptr;
     }
-    if (!shared &&
+    bool textureBacked = shared;
+    if (!shared) {
+        const HRESULT leftResult = device->CreateTexture(g_stereo.renderWidth, g_stereo.renderHeight, 1,
+            D3DUSAGE_RENDERTARGET, color.Format, D3DPOOL_DEFAULT, &leftTexture, nullptr);
+        const HRESULT rightResult = SUCCEEDED(leftResult) ? device->CreateTexture(g_stereo.renderWidth,
+            g_stereo.renderHeight, 1, D3DUSAGE_RENDERTARGET, color.Format, D3DPOOL_DEFAULT,
+            &rightTexture, nullptr) : leftResult;
+        textureBacked = SUCCEEDED(leftResult) && SUCCEEDED(rightResult) &&
+            SUCCEEDED(leftTexture->GetSurfaceLevel(0, &left)) &&
+            SUCCEEDED(rightTexture->GetSurfaceLevel(0, &right));
+    }
+    if (!textureBacked) {
+        if (left) left->Release();
+        if (right) right->Release();
+        if (leftTexture) leftTexture->Release();
+        if (rightTexture) rightTexture->Release();
+        left = nullptr;
+        right = nullptr;
+        leftTexture = nullptr;
+        rightTexture = nullptr;
+    }
+    if (!textureBacked &&
         (FAILED(device->CreateRenderTarget(g_stereo.renderWidth, g_stereo.renderHeight, color.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &left, nullptr)) ||
          FAILED(device->CreateRenderTarget(g_stereo.renderWidth, g_stereo.renderHeight, color.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &right, nullptr)))) {
         if (left) left->Release();
@@ -705,7 +742,8 @@ bool EnsureStereoEyeColor(IDirect3DDevice9* device) {
     g_stereo.trackedLeftSharedHandle = leftSharedHandle;
     g_stereo.rightColor = right;
     g_stereo.rightSharedHandle = rightSharedHandle;
-    tmoxr::log::Info(std::string("Allocated ") + (shared ? "shared-GPU" : "CPU-readback fallback") +
+    const char* allocation = shared ? "shared-GPU" : (textureBacked ? "texture-backed" : "surface fallback");
+    tmoxr::log::Info(std::string("Allocated ") + allocation +
         " tracked stereo color targets for active scene pass: " + std::to_string(g_stereo.renderWidth) +
         "x" + std::to_string(g_stereo.renderHeight) + ".");
     return true;
@@ -1396,15 +1434,18 @@ void AnalyzeVertexShader(IDirect3DVertexShader9* shader) {
         }
         if (matrixInstructions.size() >= 900 && positionInstructions.size() >= 900) break;
     }
-    if (g_stereo.analyzedShaders.size() <= 32) {
+    if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed) &&
+        g_stereo.analyzedShaders.size() <= 32) {
         tmoxr::log::Info("Perspective scene vertex shader matrix instructions: " +
             (matrixInstructions.empty() ? std::string("none") : matrixInstructions));
     }
-    if (!positionMapped && g_stereo.analyzedShaders.size() <= 64) {
+    if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed) &&
+        !positionMapped && g_stereo.analyzedShaders.size() <= 64) {
         tmoxr::log::Info("Unmapped perspective vertex shader position instructions: " +
             (positionInstructions.empty() ? std::string("none found") : positionInstructions));
     }
-    if (positionMapped && (positionWriteCount != 4 || !standardPositionWrites)) {
+    if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed) &&
+        positionMapped && (positionWriteCount != 4 || !standardPositionWrites)) {
         tmoxr::log::Info("Nonstandard mapped vertex shader position instructions (possible billboard path): " +
             (positionInstructions.empty() ? std::string("none found") : positionInstructions));
     }
@@ -1439,23 +1480,25 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
                 likelyRegister = registerIndex;
             }
         }
-        tmoxr::log::Info("Native stereo replay diagnostic: perspective candidates=" + std::to_string(g_stereo.perspectiveDrawCandidates) +
-            ", vertex-shader candidates=" + std::to_string(g_stereo.shaderPerspectiveCandidates) +
-            ", projection-constant matches=" + std::to_string(g_stereo.shaderProjectionConstantMatches) +
-            " (last c" + std::to_string(g_stereo.lastProjectionConstantRegister) + ")" +
-            ", likely shader projection=c" + std::to_string(likelyRegister) + " (uploads=" + std::to_string(likelyCount) +
-            ", transposed=" + std::to_string(g_stereo.perspectiveMatrixTransposed[likelyRegister]) + ")" +
-            ", replayed=" + std::to_string(g_stereo.replayedDraws) +
-            ", camera-transformed=" + std::to_string(g_stereo.transformedDraws) +
-            ", unmapped-shader=" + std::to_string(g_stereo.untransformedShaderDraws) +
-            ", fixed-function=" + std::to_string(g_stereo.fixedFunctionDraws) +
-            ", suppressed desktop-space lights=" + std::to_string(g_stereo.suppressedDesktopSpaceLightDraws) +
-            ", skipped desktop draws/mirrored passes=" + std::to_string(g_stereo.skippedDesktopDraws) + "/" +
-            std::to_string(g_stereo.mirroredDesktopPasses) +
-            ", captured UI draws=" + std::to_string(g_stereo.capturedUiDraws) +
-            ", shaders analyzed/mapped=" + std::to_string(g_stereo.analyzedShaders.size()) + "/" +
-            std::to_string(g_stereo.shaderPositionInfo.size()) + ".");
-        if (g_stereo.haveHeadPose) {
+        if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed)) {
+            tmoxr::log::Info("Native stereo replay diagnostic: perspective candidates=" + std::to_string(g_stereo.perspectiveDrawCandidates) +
+                ", vertex-shader candidates=" + std::to_string(g_stereo.shaderPerspectiveCandidates) +
+                ", projection-constant matches=" + std::to_string(g_stereo.shaderProjectionConstantMatches) +
+                " (last c" + std::to_string(g_stereo.lastProjectionConstantRegister) + ")" +
+                ", likely shader projection=c" + std::to_string(likelyRegister) + " (uploads=" + std::to_string(likelyCount) +
+                ", transposed=" + std::to_string(g_stereo.perspectiveMatrixTransposed[likelyRegister]) + ")" +
+                ", replayed=" + std::to_string(g_stereo.replayedDraws) +
+                ", camera-transformed=" + std::to_string(g_stereo.transformedDraws) +
+                ", unmapped-shader=" + std::to_string(g_stereo.untransformedShaderDraws) +
+                ", fixed-function=" + std::to_string(g_stereo.fixedFunctionDraws) +
+                ", suppressed desktop-space lights=" + std::to_string(g_stereo.suppressedDesktopSpaceLightDraws) +
+                ", skipped desktop draws/mirrored passes=" + std::to_string(g_stereo.skippedDesktopDraws) + "/" +
+                std::to_string(g_stereo.mirroredDesktopPasses) +
+                ", captured UI draws=" + std::to_string(g_stereo.capturedUiDraws) +
+                ", shaders analyzed/mapped=" + std::to_string(g_stereo.analyzedShaders.size()) + "/" +
+                std::to_string(g_stereo.shaderPositionInfo.size()) + ".");
+        }
+        if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed) && g_stereo.haveHeadPose) {
             tmoxr::log::Info("Tracked camera pose sample " + std::to_string(g_stereo.headPose.sample) +
                 ": position=(" + std::to_string(g_stereo.headPose.position[0]) + "," +
                 std::to_string(g_stereo.headPose.position[1]) + "," + std::to_string(g_stereo.headPose.position[2]) +
@@ -1785,8 +1828,12 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
 
 class D3D9Proxy final : public IDirect3D9 {
 public:
-    explicit D3D9Proxy(IDirect3D9* real) : real_(real) {}
-    ~D3D9Proxy() { real_->Release(); }
+    explicit D3D9Proxy(IDirect3D9* real, IDirect3D9* nativeFallback = nullptr)
+        : real_(real), nativeFallback_(nativeFallback) {}
+    ~D3D9Proxy() {
+        if (nativeFallback_) nativeFallback_->Release();
+        real_->Release();
+    }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** object) override {
         if (id == IID_IUnknown || id == IID_IDirect3D9) { *object = this; AddRef(); return S_OK; }
@@ -1810,7 +1857,19 @@ public:
     HRESULT STDMETHODCALLTYPE CreateDevice(UINT a,D3DDEVTYPE type,HWND window,DWORD flags,D3DPRESENT_PARAMETERS* parameters,IDirect3DDevice9** device) override {
         if (!device) return D3DERR_INVALIDCALL;
         *device = nullptr;
-        const HRESULT result = real_->CreateDevice(a,type,window,flags,parameters,device);
+        const D3DPRESENT_PARAMETERS originalParameters = *parameters;
+        HRESULT result = real_->CreateDevice(a,type,window,flags,parameters,device);
+        if (FAILED(result) && nativeFallback_) {
+            tmoxr::log::Warn("D3D9On12 device creation failed; retrying with native D3D9. HRESULT=" +
+                std::to_string(static_cast<long>(result)) + ".");
+            *parameters = originalParameters;
+            result = nativeFallback_->CreateDevice(a, type, window, flags, parameters, device);
+            if (SUCCEEDED(result)) {
+                real_->Release();
+                real_ = nativeFallback_;
+                nativeFallback_ = nullptr;
+            }
+        }
         if (SUCCEEDED(result) && device && *device) {
             tmoxr::log::Info("D3D9 device created: " + std::to_string(parameters->BackBufferWidth) + "x" +
                 std::to_string(parameters->BackBufferHeight) + ", windowed=" + std::to_string(parameters->Windowed != FALSE) +
@@ -1826,6 +1885,7 @@ public:
     }
 private:
     IDirect3D9* real_;
+    IDirect3D9* nativeFallback_ = nullptr;
     std::atomic<ULONG> references_{1};
 };
 } // namespace
@@ -1836,10 +1896,22 @@ __declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT sdkVersion) {
     InstallVehicleVisibilityHook();
     LoadRealD3D9();
     if (!g_create9) return nullptr;
-    IDirect3D9* real = g_create9(sdkVersion);
+    IDirect3D9* real = nullptr;
+    IDirect3D9* nativeFallback = nullptr;
+    if (g_cameraSettings.d3d9On12.load(std::memory_order_relaxed) && g_create9On12) {
+        D3D9ON12_ARGS arguments{};
+        arguments.Enable9On12 = TRUE;
+        real = g_create9On12(sdkVersion, &arguments, 1);
+        if (real) {
+            tmoxr::log::Info("Created the regular D3D9 game interface through Windows D3D9On12.");
+            nativeFallback = g_create9(sdkVersion);
+        }
+        else tmoxr::log::Warn("Direct3DCreate9On12 failed; falling back to the native D3D9 runtime.");
+    }
+    if (!real) real = g_create9(sdkVersion);
     if (!real) { tmoxr::log::Error("Real Direct3DCreate9 returned null."); return nullptr; }
     tmoxr::log::Info("Direct3DCreate9 intercepted (SDK " + std::to_string(sdkVersion) + ").");
-    return new D3D9Proxy(real);
+    return new D3D9Proxy(real, nativeFallback);
 }
 
 __declspec(dllexport) HRESULT WINAPI Direct3DCreate9Ex(UINT sdkVersion, IDirect3D9Ex** out) {

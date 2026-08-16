@@ -51,6 +51,11 @@ target_compile_features(dinput8_smoke PRIVATE cxx_std_20)
 target_compile_definitions(dinput8_smoke PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX DIRECTINPUT_VERSION=0x0800)
 target_link_libraries(dinput8_smoke PRIVATE dxguid)
 
+add_executable(d3d9on12_compat_smoke EXCLUDE_FROM_ALL tests/d3d9on12_compat_smoke.cpp)
+target_compile_features(d3d9on12_compat_smoke PRIVATE cxx_std_20)
+target_compile_definitions(d3d9on12_compat_smoke PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(d3d9on12_compat_smoke PRIVATE dxguid d3d11 d3d12)
+
 set_target_properties(d3d9 PROPERTIES
   OUTPUT_NAME "d3d9"
   PREFIX ""
