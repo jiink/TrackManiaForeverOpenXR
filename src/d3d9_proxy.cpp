@@ -90,16 +90,20 @@ SetVertexShaderConstantFFn g_originalSetVertexShaderConstantF = nullptr;
 std::atomic<bool> g_hooked = false;
 
 struct CameraSettings {
-    bool cockpitEnabled = true;
+    std::atomic<bool> cockpitEnabled{true};
     // User-facing axes: positive X is right, positive Y is up, and positive Z
     // is forward. TrackMania's reflected projection requires X to be negated
     // when the offset is converted to its camera basis.
-    float cockpitOffsetRight = 0.0f;
-    float cockpitOffsetUp = 0.35f;
-    float cockpitOffsetForward = -1.25f;
-    float cockpitNearClip = 0.05f;
+    std::atomic<float> cockpitOffsetRight{0.0f};
+    std::atomic<float> cockpitOffsetUp{-0.45f};
+    std::atomic<float> cockpitOffsetForward{-0.65f};
+    std::atomic<float> cockpitNearClip{0.05f};
     std::atomic<int> selectedCamera{0};
-    std::array<bool, 8> cameraKeyDown{};
+    std::array<std::atomic<bool>, 8> cameraKeyDown{};
+    std::filesystem::path configurationPath;
+    FILETIME configurationWriteTime{};
+    ULONGLONG nextConfigurationCheck = 0;
+    bool haveConfigurationWriteTime = false;
     bool loaded = false;
 } g_cameraSettings;
 
@@ -118,6 +122,24 @@ float ReadIniFloat(const std::filesystem::path& path, const wchar_t* key, float 
     return end != value && std::isfinite(parsed) ? parsed : defaultValue;
 }
 
+void ReadCameraSettings(bool reloaded) {
+    const auto& path = g_cameraSettings.configurationPath;
+    const bool enabled = GetPrivateProfileIntW(L"Camera", L"CockpitEnabled", 1, path.c_str()) != 0;
+    const float right = ReadIniFloat(path, L"CockpitOffsetRight", 0.0f);
+    const float up = ReadIniFloat(path, L"CockpitOffsetUp", -0.45f);
+    const float forward = ReadIniFloat(path, L"CockpitOffsetForward", -0.65f);
+    const float nearClip = std::clamp(ReadIniFloat(path, L"CockpitNearClip", 0.05f), 0.01f, 0.5f);
+    g_cameraSettings.cockpitEnabled.store(enabled, std::memory_order_relaxed);
+    g_cameraSettings.cockpitOffsetRight.store(right, std::memory_order_relaxed);
+    g_cameraSettings.cockpitOffsetUp.store(up, std::memory_order_relaxed);
+    g_cameraSettings.cockpitOffsetForward.store(forward, std::memory_order_relaxed);
+    g_cameraSettings.cockpitNearClip.store(nearClip, std::memory_order_relaxed);
+    tmoxr::log::Info(std::string(reloaded ? "Reloaded" : "Loaded") +
+        " cockpit camera configuration: enabled=" + std::to_string(enabled) +
+        ", right/up/forward=(" + std::to_string(right) + "," + std::to_string(up) + "," +
+        std::to_string(forward) + ") metres, near clip=" + std::to_string(nearClip) + " metres.");
+}
+
 void LoadCameraSettings() {
     if (g_cameraSettings.loaded) return;
     g_cameraSettings.loaded = true;
@@ -126,17 +148,28 @@ void LoadCameraSettings() {
         tmoxr::log::Warn("Could not locate TMOXR.ini; using the default cockpit camera offset.");
         return;
     }
-    const auto path = std::filesystem::path(executablePath).parent_path() / L"TMOXR.ini";
-    g_cameraSettings.cockpitEnabled = GetPrivateProfileIntW(L"Camera", L"CockpitEnabled", 1, path.c_str()) != 0;
-    g_cameraSettings.cockpitOffsetRight = ReadIniFloat(path, L"CockpitOffsetRight", 0.0f);
-    g_cameraSettings.cockpitOffsetUp = ReadIniFloat(path, L"CockpitOffsetUp", 0.35f);
-    g_cameraSettings.cockpitOffsetForward = ReadIniFloat(path, L"CockpitOffsetForward", -1.25f);
-    g_cameraSettings.cockpitNearClip = std::clamp(ReadIniFloat(path, L"CockpitNearClip", 0.05f), 0.01f, 0.5f);
-    tmoxr::log::Info("Cockpit camera configuration: enabled=" + std::to_string(g_cameraSettings.cockpitEnabled) +
-        ", right/up/forward=(" + std::to_string(g_cameraSettings.cockpitOffsetRight) + "," +
-        std::to_string(g_cameraSettings.cockpitOffsetUp) + "," +
-        std::to_string(g_cameraSettings.cockpitOffsetForward) + ") metres, near clip=" +
-        std::to_string(g_cameraSettings.cockpitNearClip) + " metres.");
+    g_cameraSettings.configurationPath =
+        std::filesystem::path(executablePath).parent_path() / L"TMOXR.ini";
+    ReadCameraSettings(false);
+    WIN32_FILE_ATTRIBUTE_DATA attributes{};
+    if (GetFileAttributesExW(g_cameraSettings.configurationPath.c_str(), GetFileExInfoStandard, &attributes)) {
+        g_cameraSettings.configurationWriteTime = attributes.ftLastWriteTime;
+        g_cameraSettings.haveConfigurationWriteTime = true;
+    }
+}
+
+void ReloadCameraSettingsIfChanged() {
+    if (g_cameraSettings.configurationPath.empty()) return;
+    const ULONGLONG now = GetTickCount64();
+    if (now < g_cameraSettings.nextConfigurationCheck) return;
+    g_cameraSettings.nextConfigurationCheck = now + 250;
+    WIN32_FILE_ATTRIBUTE_DATA attributes{};
+    if (!GetFileAttributesExW(g_cameraSettings.configurationPath.c_str(), GetFileExInfoStandard, &attributes)) return;
+    if (g_cameraSettings.haveConfigurationWriteTime &&
+        CompareFileTime(&attributes.ftLastWriteTime, &g_cameraSettings.configurationWriteTime) == 0) return;
+    g_cameraSettings.configurationWriteTime = attributes.ftLastWriteTime;
+    g_cameraSettings.haveConfigurationWriteTime = true;
+    ReadCameraSettings(true);
 }
 
 bool GameHasKeyboardFocus() {
@@ -149,28 +182,23 @@ bool GameHasKeyboardFocus() {
 
 void UpdateSelectedCameraFromKeyboard() {
     if (!GameHasKeyboardFocus()) return;
-    // The keypad reports navigation virtual keys when Num Lock is off even
-    // though TrackMania still treats the physical keys as camera shortcuts.
-    constexpr std::array<int, 8> navigationKeys = {
-        0, VK_END, VK_DOWN, VK_NEXT, VK_LEFT, VK_CLEAR, VK_RIGHT, VK_HOME};
     for (int camera = 1; camera <= 7; ++camera) {
         const bool down = (GetAsyncKeyState(VK_NUMPAD0 + camera) & 0x8000) != 0 ||
-            (GetAsyncKeyState('0' + camera) & 0x8000) != 0 ||
-            (GetAsyncKeyState(navigationKeys[camera]) & 0x8000) != 0;
-        if (down && !g_cameraSettings.cameraKeyDown[camera]) {
+            (GetAsyncKeyState('0' + camera) & 0x8000) != 0;
+        const bool wasDown = g_cameraSettings.cameraKeyDown[camera].exchange(down, std::memory_order_relaxed);
+        if (down && !wasDown) {
             g_cameraSettings.selectedCamera.store(camera, std::memory_order_relaxed);
             if (camera == 3) {
                 tmoxr::log::Info("Camera 3 selected; applying the VR cockpit seat offset.");
-            } else if (g_cameraSettings.cockpitEnabled) {
+            } else if (g_cameraSettings.cockpitEnabled.load(std::memory_order_relaxed)) {
                 tmoxr::log::Info("Camera " + std::to_string(camera) + " selected; VR cockpit seat offset disabled.");
             }
         }
-        g_cameraSettings.cameraKeyDown[camera] = down;
     }
 }
 
 bool CockpitCameraActive() {
-    return g_cameraSettings.cockpitEnabled &&
+    return g_cameraSettings.cockpitEnabled.load(std::memory_order_relaxed) &&
         g_cameraSettings.selectedCamera.load(std::memory_order_relaxed) == 3;
 }
 
@@ -759,9 +787,10 @@ Matrix4 EyeProjection(bool rightEye) {
     projection[11] = gameProjection[11];
     if (CockpitCameraActive() && gameProjection[10] > 1.0f && gameProjection[11] < 0.0f) {
         const float farClip = -gameProjection[11] / (gameProjection[10] - 1.0f);
-        if (std::isfinite(farClip) && farClip > g_cameraSettings.cockpitNearClip) {
-            projection[10] = farClip / (farClip - g_cameraSettings.cockpitNearClip);
-            projection[11] = -g_cameraSettings.cockpitNearClip * projection[10];
+        const float nearClip = g_cameraSettings.cockpitNearClip.load(std::memory_order_relaxed);
+        if (std::isfinite(farClip) && farClip > nearClip) {
+            projection[10] = farClip / (farClip - nearClip);
+            projection[11] = -nearClip * projection[10];
         }
     }
     projection[14] = gameProjection[14];
@@ -792,9 +821,9 @@ Matrix4 HeadViewMatrix(float eyeOffsetMeters) {
         g_stereo.haveHeadPose ? g_stereo.headPose.position[1] : 0.0f,
         g_stereo.haveHeadPose ? -g_stereo.headPose.position[2] : 0.0f};
     if (CockpitCameraActive()) {
-        cameraPosition[0] -= g_cameraSettings.cockpitOffsetRight;
-        cameraPosition[1] += g_cameraSettings.cockpitOffsetUp;
-        cameraPosition[2] += g_cameraSettings.cockpitOffsetForward;
+        cameraPosition[0] -= g_cameraSettings.cockpitOffsetRight.load(std::memory_order_relaxed);
+        cameraPosition[1] += g_cameraSettings.cockpitOffsetUp.load(std::memory_order_relaxed);
+        cameraPosition[2] += g_cameraSettings.cockpitOffsetForward.load(std::memory_order_relaxed);
     }
     // The eye offset is local to the headset and therefore rotates with it.
     for (UINT row = 0; row < 3; ++row) cameraPosition[row] += rotation[row][0] * eyeOffsetMeters;
@@ -1201,6 +1230,7 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
 
 HRESULT STDMETHODCALLTYPE BeginSceneHook(IDirect3DDevice9* device) {
     tmoxr::VrBridge::Instance().OnBeginScene();
+    ReloadCameraSettingsIfChanged();
     UpdateSelectedCameraFromKeyboard();
     g_stereo.haveHeadPose = tmoxr::VrBridge::Instance().GetHeadPose(g_stereo.headPose);
     tmoxr::RenderConfiguration renderConfiguration{};
