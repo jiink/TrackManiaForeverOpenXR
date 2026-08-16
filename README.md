@@ -105,7 +105,7 @@ The install script places `TMOXR.ini` beside `TmForever.exe` without overwriting
 - `CockpitOffsetUp`: positive moves it upward.
 - `CockpitOffsetForward`: positive moves it toward the front of the car; negative moves it toward the seat.
 - `CockpitNearClip`: nearest visible distance; the 0.05 m default keeps nearby cockpit geometry from being clipped.
-- `HorizonLock`: keeps the headset view level with the world while preserving the car's yaw; vehicle pitch and roll remain visible on the car beneath you.
+- `HorizonLock`: keeps the headset view level with the world while preserving the car's yaw. It releases smoothly between `HorizonLockReleaseStart` and `HorizonLockReleaseEnd` degrees of car tilt, follows the car through loops and inverted sections, then restores stabilization after the car returns upright.
 
 The supplied Stadium starting point is centered, 0.45 m lower, and 0.65 m behind TrackMania's camera-3 position. While camera 3 is selected, the mod also overrides TrackMania's request to hide the native player-vehicle model. Different environments and custom vehicle models have different dimensions, so adjust these values if the view lands inside bodywork. Saving `TMOXR.ini` reloads the cockpit settings automatically while the game is running. Set `CockpitEnabled=0` to turn the feature off.
 

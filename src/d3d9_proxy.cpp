@@ -99,6 +99,8 @@ struct CameraSettings {
     std::atomic<float> cockpitOffsetForward{-0.65f};
     std::atomic<float> cockpitNearClip{0.05f};
     std::atomic<bool> horizonLock{true};
+    std::atomic<float> horizonLockReleaseStart{35.0f};
+    std::atomic<float> horizonLockReleaseEnd{70.0f};
     std::atomic<int> selectedCamera{0};
     std::array<std::atomic<bool>, 8> cameraKeyDown{};
     std::filesystem::path configurationPath;
@@ -132,17 +134,25 @@ void ReadCameraSettings(bool reloaded) {
     const float forward = ReadIniFloat(path, L"CockpitOffsetForward", -0.65f);
     const float nearClip = std::clamp(ReadIniFloat(path, L"CockpitNearClip", 0.05f), 0.01f, 0.5f);
     const bool horizonLock = GetPrivateProfileIntW(L"Camera", L"HorizonLock", 1, path.c_str()) != 0;
+    const float horizonReleaseStart =
+        std::clamp(ReadIniFloat(path, L"HorizonLockReleaseStart", 35.0f), 0.0f, 80.0f);
+    const float horizonReleaseEnd = std::clamp(
+        ReadIniFloat(path, L"HorizonLockReleaseEnd", 70.0f), horizonReleaseStart + 1.0f, 89.0f);
     g_cameraSettings.cockpitEnabled.store(enabled, std::memory_order_relaxed);
     g_cameraSettings.cockpitOffsetRight.store(right, std::memory_order_relaxed);
     g_cameraSettings.cockpitOffsetUp.store(up, std::memory_order_relaxed);
     g_cameraSettings.cockpitOffsetForward.store(forward, std::memory_order_relaxed);
     g_cameraSettings.cockpitNearClip.store(nearClip, std::memory_order_relaxed);
     g_cameraSettings.horizonLock.store(horizonLock, std::memory_order_relaxed);
+    g_cameraSettings.horizonLockReleaseStart.store(horizonReleaseStart, std::memory_order_relaxed);
+    g_cameraSettings.horizonLockReleaseEnd.store(horizonReleaseEnd, std::memory_order_relaxed);
     tmoxr::log::Info(std::string(reloaded ? "Reloaded" : "Loaded") +
         " cockpit camera configuration: enabled=" + std::to_string(enabled) +
         ", right/up/forward=(" + std::to_string(right) + "," + std::to_string(up) + "," +
         std::to_string(forward) + ") metres, near clip=" + std::to_string(nearClip) +
-        " metres, horizon lock=" + std::to_string(horizonLock) + ".");
+        " metres, horizon lock=" + std::to_string(horizonLock) +
+        ", adaptive release=" + std::to_string(horizonReleaseStart) + "-" +
+        std::to_string(horizonReleaseEnd) + " degrees.");
 }
 
 void LoadCameraSettings() {
@@ -819,6 +829,17 @@ Matrix4 HorizonCorrectionMatrix() {
         {g_stereo.view._11, g_stereo.view._12, g_stereo.view._13},
         {g_stereo.view._21, g_stereo.view._22, g_stereo.view._23},
         {g_stereo.view._31, g_stereo.view._32, g_stereo.view._33}};
+    constexpr float radiansToDegrees = 57.29577951308232f;
+    const float tiltDegrees = std::acos(std::clamp(view[1][1], -1.0f, 1.0f)) * radiansToDegrees;
+    const float releaseStart = g_cameraSettings.horizonLockReleaseStart.load(std::memory_order_relaxed);
+    const float releaseEnd = g_cameraSettings.horizonLockReleaseEnd.load(std::memory_order_relaxed);
+    float lockStrength = std::clamp((releaseEnd - tiltDegrees) / (releaseEnd - releaseStart), 0.0f, 1.0f);
+    lockStrength = lockStrength * lockStrength * (3.0f - 2.0f * lockStrength);
+    // At steep, vertical, and inverted attitudes, follow the car completely.
+    // Besides feeling natural in loops, returning here avoids deriving yaw
+    // when the car's forward direction is nearly vertical.
+    if (lockStrength <= 0.0001f) return correction;
+
     const float horizontalForward = std::hypot(view[0][2], view[2][2]);
     if (!std::isfinite(horizontalForward) || horizontalForward < 0.001f) return correction;
     const float yawSin = view[0][2] / horizontalForward;
@@ -838,8 +859,64 @@ Matrix4 HorizonCorrectionMatrix() {
             correction[row * 4 + column] = value;
         }
     }
+
+    // Scale the corrective rotation with a quaternion so the transition does
+    // not shear or shrink the world as the horizon lock releases for a loop.
+    float quaternionW = std::sqrt(std::max(0.0f,
+        1.0f + correction[0] + correction[5] + correction[10])) * 0.5f;
+    float quaternionX = 0.0f;
+    float quaternionY = 0.0f;
+    float quaternionZ = 0.0f;
+    if (quaternionW > 0.0001f) {
+        const float inverseFourW = 0.25f / quaternionW;
+        quaternionX = (correction[9] - correction[6]) * inverseFourW;
+        quaternionY = (correction[2] - correction[8]) * inverseFourW;
+        quaternionZ = (correction[4] - correction[1]) * inverseFourW;
+    } else {
+        // Stable fallback for corrections near 180 degrees.
+        quaternionX = std::sqrt(std::max(0.0f, (1.0f + correction[0] - correction[5] - correction[10]) * 0.25f));
+        quaternionY = std::copysign(
+            std::sqrt(std::max(0.0f, (1.0f - correction[0] + correction[5] - correction[10]) * 0.25f)),
+            correction[1] + correction[4]);
+        quaternionZ = std::copysign(
+            std::sqrt(std::max(0.0f, (1.0f - correction[0] - correction[5] + correction[10]) * 0.25f)),
+            correction[2] + correction[8]);
+    }
+    if (quaternionW < 0.0f) {
+        quaternionX = -quaternionX;
+        quaternionY = -quaternionY;
+        quaternionZ = -quaternionZ;
+        quaternionW = -quaternionW;
+    }
+    const float quaternionLength = std::sqrt(quaternionX * quaternionX + quaternionY * quaternionY +
+        quaternionZ * quaternionZ + quaternionW * quaternionW);
+    if (quaternionLength < 0.0001f) return IdentityMatrix();
+    quaternionX /= quaternionLength;
+    quaternionY /= quaternionLength;
+    quaternionZ /= quaternionLength;
+    quaternionW = std::clamp(quaternionW / quaternionLength, -1.0f, 1.0f);
+    const float halfAngle = std::acos(quaternionW);
+    const float sinHalfAngle = std::sin(halfAngle);
+    if (std::abs(sinHalfAngle) > 0.0001f) {
+        const float scaledHalfAngle = halfAngle * lockStrength;
+        const float vectorScale = std::sin(scaledHalfAngle) / sinHalfAngle;
+        quaternionX *= vectorScale;
+        quaternionY *= vectorScale;
+        quaternionZ *= vectorScale;
+        quaternionW = std::cos(scaledHalfAngle);
+    }
+    correction = IdentityMatrix();
+    correction[0] = 1.0f - 2.0f * (quaternionY * quaternionY + quaternionZ * quaternionZ);
+    correction[1] = 2.0f * (quaternionX * quaternionY - quaternionZ * quaternionW);
+    correction[2] = 2.0f * (quaternionX * quaternionZ + quaternionY * quaternionW);
+    correction[4] = 2.0f * (quaternionX * quaternionY + quaternionZ * quaternionW);
+    correction[5] = 1.0f - 2.0f * (quaternionX * quaternionX + quaternionZ * quaternionZ);
+    correction[6] = 2.0f * (quaternionY * quaternionZ - quaternionX * quaternionW);
+    correction[8] = 2.0f * (quaternionX * quaternionZ - quaternionY * quaternionW);
+    correction[9] = 2.0f * (quaternionY * quaternionZ + quaternionX * quaternionW);
+    correction[10] = 1.0f - 2.0f * (quaternionX * quaternionX + quaternionY * quaternionY);
     if (!g_horizonLockLogged.exchange(true)) {
-        tmoxr::log::Info("Camera 3 horizon lock is active: vehicle pitch and roll are removed from the headset views while yaw is preserved.");
+        tmoxr::log::Info("Camera 3 adaptive horizon lock is active: stabilization releases smoothly for steep and inverted track sections.");
     }
     return correction;
 }
