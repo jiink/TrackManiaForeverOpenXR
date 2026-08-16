@@ -98,6 +98,7 @@ struct CameraSettings {
     std::atomic<float> cockpitOffsetUp{-0.45f};
     std::atomic<float> cockpitOffsetForward{-0.65f};
     std::atomic<float> cockpitNearClip{0.05f};
+    std::atomic<bool> horizonLock{true};
     std::atomic<int> selectedCamera{0};
     std::array<std::atomic<bool>, 8> cameraKeyDown{};
     std::filesystem::path configurationPath;
@@ -111,6 +112,7 @@ using VehicleSetVisibilityFn = void(__thiscall*)(void*, void*, int, int, int);
 VehicleSetVisibilityFn g_originalVehicleSetVisibility = nullptr;
 void** g_vehicleSetVisibilitySlot = nullptr;
 std::atomic<bool> g_vehicleVisibilityOverrideLogged = false;
+std::atomic<bool> g_horizonLockLogged = false;
 
 float ReadIniFloat(const std::filesystem::path& path, const wchar_t* key, float defaultValue) {
     wchar_t defaultText[32]{};
@@ -129,15 +131,18 @@ void ReadCameraSettings(bool reloaded) {
     const float up = ReadIniFloat(path, L"CockpitOffsetUp", -0.45f);
     const float forward = ReadIniFloat(path, L"CockpitOffsetForward", -0.65f);
     const float nearClip = std::clamp(ReadIniFloat(path, L"CockpitNearClip", 0.05f), 0.01f, 0.5f);
+    const bool horizonLock = GetPrivateProfileIntW(L"Camera", L"HorizonLock", 1, path.c_str()) != 0;
     g_cameraSettings.cockpitEnabled.store(enabled, std::memory_order_relaxed);
     g_cameraSettings.cockpitOffsetRight.store(right, std::memory_order_relaxed);
     g_cameraSettings.cockpitOffsetUp.store(up, std::memory_order_relaxed);
     g_cameraSettings.cockpitOffsetForward.store(forward, std::memory_order_relaxed);
     g_cameraSettings.cockpitNearClip.store(nearClip, std::memory_order_relaxed);
+    g_cameraSettings.horizonLock.store(horizonLock, std::memory_order_relaxed);
     tmoxr::log::Info(std::string(reloaded ? "Reloaded" : "Loaded") +
         " cockpit camera configuration: enabled=" + std::to_string(enabled) +
         ", right/up/forward=(" + std::to_string(right) + "," + std::to_string(up) + "," +
-        std::to_string(forward) + ") metres, near clip=" + std::to_string(nearClip) + " metres.");
+        std::to_string(forward) + ") metres, near clip=" + std::to_string(nearClip) +
+        " metres, horizon lock=" + std::to_string(horizonLock) + ".");
 }
 
 void LoadCameraSettings() {
@@ -798,6 +803,47 @@ Matrix4 EyeProjection(bool rightEye) {
     return projection;
 }
 
+Matrix4 HorizonCorrectionMatrix() {
+    Matrix4 correction = IdentityMatrix();
+    if (!CockpitCameraActive() ||
+        !g_cameraSettings.horizonLock.load(std::memory_order_relaxed) ||
+        !g_stereo.haveView) {
+        return correction;
+    }
+
+    // D3D's row-vector view rotation stores the camera's world-space right,
+    // up, and forward axes in its columns. Build a yaw-only target view and
+    // post-correct the game view so the car can pitch and roll beneath a level
+    // headset horizon without changing its heading.
+    const float view[3][3] = {
+        {g_stereo.view._11, g_stereo.view._12, g_stereo.view._13},
+        {g_stereo.view._21, g_stereo.view._22, g_stereo.view._23},
+        {g_stereo.view._31, g_stereo.view._32, g_stereo.view._33}};
+    const float horizontalForward = std::hypot(view[0][2], view[2][2]);
+    if (!std::isfinite(horizontalForward) || horizontalForward < 0.001f) return correction;
+    const float yawSin = view[0][2] / horizontalForward;
+    const float yawCos = view[2][2] / horizontalForward;
+    const float yawOnly[3][3] = {
+        {yawCos, 0.0f, yawSin},
+        {0.0f, 1.0f, 0.0f},
+        {-yawSin, 0.0f, yawCos}};
+
+    // H(row) = inverse(Vrotation) * Vyaw. Camera rotations are orthonormal, so
+    // the inverse is the transpose. Return H transposed for the column-matrix
+    // correction used by both fixed-function and shader stereo paths.
+    for (UINT row = 0; row < 3; ++row) {
+        for (UINT column = 0; column < 3; ++column) {
+            float value = 0.0f;
+            for (UINT inner = 0; inner < 3; ++inner) value += view[inner][column] * yawOnly[inner][row];
+            correction[row * 4 + column] = value;
+        }
+    }
+    if (!g_horizonLockLogged.exchange(true)) {
+        tmoxr::log::Info("Camera 3 horizon lock is active: vehicle pitch and roll are removed from the headset views while yaw is preserved.");
+    }
+    return correction;
+}
+
 Matrix4 HeadViewMatrix(float eyeOffsetMeters) {
     const float x = g_stereo.haveHeadPose ? g_stereo.headPose.orientation[0] : 0.0f;
     const float y = g_stereo.haveHeadPose ? g_stereo.headPose.orientation[1] : 0.0f;
@@ -835,7 +881,7 @@ Matrix4 HeadViewMatrix(float eyeOffsetMeters) {
                                rotation[1][row] * cameraPosition[1] +
                                rotation[2][row] * cameraPosition[2]);
     }
-    return view;
+    return MultiplyMatrix(view, HorizonCorrectionMatrix());
 }
 
 Matrix4 ApplyHeadPoseToCombinedMatrix(const Matrix4& original, float eyeOffsetMeters, bool rightEye) {
