@@ -15,6 +15,7 @@
 #include <atomic>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -22,6 +23,7 @@
 #include <filesystem>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifndef TMOXR_EXPERIMENTAL_CULLING
@@ -65,6 +67,7 @@ using BeginSceneFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*);
 using EndSceneFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*);
 using ResetFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
 using SetTransformFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DTRANSFORMSTATETYPE, const D3DMATRIX*);
+using SetViewportFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, const D3DVIEWPORT9*);
 using SetRenderTargetFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
 using DrawPrimitiveFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT);
 using DrawIndexedPrimitiveFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT);
@@ -85,6 +88,7 @@ BeginSceneFn g_originalBeginScene = nullptr;
 EndSceneFn g_originalEndScene = nullptr;
 ResetFn g_originalReset = nullptr;
 SetTransformFn g_originalSetTransform = nullptr;
+SetViewportFn g_originalSetViewport = nullptr;
 SetRenderTargetFn g_originalSetRenderTarget = nullptr;
 DrawPrimitiveFn g_originalDrawPrimitive = nullptr;
 DrawIndexedPrimitiveFn g_originalDrawIndexedPrimitive = nullptr;
@@ -325,9 +329,11 @@ struct StereoResources {
     IDirect3DSurface9* activeDepth = nullptr;
     D3DMATRIX projection{};
     D3DMATRIX view{};
+    D3DVIEWPORT9 gameViewport{};
     tmoxr::HeadPose headPose{};
     tmoxr::RenderConfiguration renderConfiguration{};
     bool haveView = false;
+    bool haveGameViewport = false;
     bool haveHeadPose = false;
     bool haveRenderConfiguration = false;
     bool perspective = false;
@@ -339,7 +345,13 @@ struct StereoResources {
     UINT lastProjectionConstantRegister = 0;
     std::array<uint32_t, 256> perspectiveMatrixCandidates{};
     std::array<bool, 256> perspectiveMatrixTransposed{};
+    std::array<float, 256 * 4> vertexShaderConstants{};
+    std::array<bool, 256> validVertexShaderConstants{};
     uint32_t replayedDraws = 0;
+    uint64_t replayedPrimitives = 0;
+    double stereoReplayCpuMilliseconds = 0.0;
+    double desktopPresentMilliseconds = 0.0;
+    uint64_t desktopPresentSamples = 0;
     uint32_t transformedDraws = 0;
     uint32_t untransformedShaderDraws = 0;
     uint32_t fixedFunctionDraws = 0;
@@ -825,6 +837,7 @@ bool CreateStereoResources(IDirect3DDevice9* device) {
         ReleaseStereoResources();
         return false;
     }
+    g_stereo.haveGameViewport = SUCCEEDED(device->GetViewport(&g_stereo.gameViewport));
     g_stereo.ready = true;
     tmoxr::log::Info("Experimental native stereo resources initialized: " + std::to_string(color.Width) + "x" + std::to_string(color.Height) + ".");
     tmoxr::log::Info("Stereo camera baseline for TrackMania's reflected X projection: left=0.000 m, right=-0.064 m.");
@@ -1178,7 +1191,17 @@ ShaderEyeState CaptureShaderEyeState(IDirect3DDevice9* device) {
     for (const auto& info : g_stereo.shaderPositionInfo) {
         if (info.shader != g_stereo.vertexShader) continue;
         state.baseRegister = info.baseRegister;
-        state.active = SUCCEEDED(device->GetVertexShaderConstantF(info.baseRegister, state.original.data(), 4));
+        bool cached = info.baseRegister + 4 <= g_stereo.validVertexShaderConstants.size();
+        for (UINT row = 0; cached && row < 4; ++row) {
+            cached = g_stereo.validVertexShaderConstants[info.baseRegister + row];
+        }
+        if (cached) {
+            std::memcpy(state.original.data(),
+                g_stereo.vertexShaderConstants.data() + info.baseRegister * 4, sizeof(float) * 16);
+            state.active = true;
+        } else {
+            state.active = SUCCEEDED(device->GetVertexShaderConstantF(info.baseRegister, state.original.data(), 4));
+        }
         return state;
     }
     return state;
@@ -1214,7 +1237,7 @@ void BeginTrackedEye(IDirect3DDevice9* device, bool rightEye, bool applyFixedFun
     }
     if (setEyeViewport) {
         D3DVIEWPORT9 viewport{0, 0, g_stereo.renderWidth, g_stereo.renderHeight, 0.0f, 1.0f};
-        device->SetViewport(&viewport);
+        g_originalSetViewport(device, &viewport);
     }
     // TrackMania's projection reflects X, so its right-eye camera translation
     // has the opposite sign from an ordinary positive-X projection.
@@ -1295,7 +1318,7 @@ void CaptureUiDraw(IDirect3DDevice9* device, Draw&& draw) {
         g_originalClear(device, 0, nullptr, D3DCLEAR_TARGET, 0x00000000u, 1.0f, 0);
         g_stereo.uiOverlayClearedThisFrame = true;
     }
-    device->SetViewport(&viewport);
+    g_originalSetViewport(device, &viewport);
     device->SetRenderState(D3DRS_COLORWRITEENABLE, colorWrite | D3DCOLORWRITEENABLE_ALPHA);
 
     DWORD alphaBlend = FALSE;
@@ -1320,7 +1343,7 @@ void CaptureUiDraw(IDirect3DDevice9* device, Draw&& draw) {
     g_originalSetDepthStencilSurface(device, nullptr);
     g_originalSetRenderTarget(device, 0, g_stereo.activeColor);
     g_originalSetDepthStencilSurface(device, g_stereo.activeDepth);
-    device->SetViewport(&viewport);
+    g_originalSetViewport(device, &viewport);
 }
 
 bool IsDesktopSpaceAdditiveSprite(IDirect3DDevice9* device) {
@@ -1506,12 +1529,26 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
                 std::to_string(g_stereo.headPose.orientation[1]) + "," + std::to_string(g_stereo.headPose.orientation[2]) +
                 "," + std::to_string(g_stereo.headPose.orientation[3]) + ").");
         }
+        constexpr double diagnosticFrames = 180.0;
+        tmoxr::log::Info("Stereo workload: replay draws/frame=" +
+            std::to_string(static_cast<double>(g_stereo.replayedDraws) / diagnosticFrames) +
+            ", primitives/frame=" +
+            std::to_string(static_cast<double>(g_stereo.replayedPrimitives) / diagnosticFrames) +
+            ", replay CPU=" +
+            std::to_string(g_stereo.stereoReplayCpuMilliseconds / diagnosticFrames) +
+            " ms/frame, desktop Present=" +
+            std::to_string(g_stereo.desktopPresentSamples ? g_stereo.desktopPresentMilliseconds /
+                static_cast<double>(g_stereo.desktopPresentSamples) : 0.0) + " ms.");
         g_stereo.perspectiveDrawCandidates = 0;
         g_stereo.shaderPerspectiveCandidates = 0;
         g_stereo.shaderProjectionConstantMatches = 0;
         g_stereo.perspectiveMatrixCandidates.fill(0);
         g_stereo.perspectiveMatrixTransposed.fill(false);
         g_stereo.replayedDraws = 0;
+        g_stereo.replayedPrimitives = 0;
+        g_stereo.stereoReplayCpuMilliseconds = 0.0;
+        g_stereo.desktopPresentMilliseconds = 0.0;
+        g_stereo.desktopPresentSamples = 0;
         g_stereo.transformedDraws = 0;
         g_stereo.untransformedShaderDraws = 0;
         g_stereo.fixedFunctionDraws = 0;
@@ -1520,7 +1557,11 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
         g_stereo.mirroredDesktopPasses = 0;
         g_stereo.capturedUiDraws = 0;
     }
+    const auto desktopPresentStart = std::chrono::steady_clock::now();
     const HRESULT result = g_originalPresent(device, source, destination, window, dirtyRegion);
+    g_stereo.desktopPresentMilliseconds += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - desktopPresentStart).count();
+    ++g_stereo.desktopPresentSamples;
     // The next clear starts a new frame. Keep the completed right-eye 3D scene
     // intact when TrackMania subsequently clears its left-eye UI pass.
     g_stereo.perspectivePassSeen = false;
@@ -1560,13 +1601,15 @@ HRESULT STDMETHODCALLTYPE ResetHook(IDirect3DDevice9* device, D3DPRESENT_PARAMET
     const HRESULT result = g_originalReset(device, parameters);
     if (SUCCEEDED(result)) {
         CreateStereoResources(device);
+        g_stereo.haveGameViewport = SUCCEEDED(device->GetViewport(&g_stereo.gameViewport));
         tmoxr::VrBridge::Instance().OnDeviceCreated(device, *parameters);
     }
     return result;
 }
 
 HRESULT STDMETHODCALLTYPE SetTransformHook(IDirect3DDevice9* device, D3DTRANSFORMSTATETYPE state, const D3DMATRIX* matrix) {
-    if (matrix && (state == D3DTS_VIEW || state == D3DTS_PROJECTION)) {
+    if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed) && matrix &&
+        (state == D3DTS_VIEW || state == D3DTS_PROJECTION)) {
         tmoxr::VrBridge::Instance().OnTransform(state, *matrix);
     }
     if (state == D3DTS_PROJECTION && matrix) {
@@ -1586,9 +1629,19 @@ HRESULT STDMETHODCALLTYPE SetTransformHook(IDirect3DDevice9* device, D3DTRANSFOR
     return g_originalSetTransform(device, state, matrix);
 }
 
+HRESULT STDMETHODCALLTYPE SetViewportHook(IDirect3DDevice9* device, const D3DVIEWPORT9* viewport) {
+    if (viewport) {
+        g_stereo.gameViewport = *viewport;
+        g_stereo.haveGameViewport = true;
+    }
+    return g_originalSetViewport(device, viewport);
+}
+
 HRESULT STDMETHODCALLTYPE SetRenderTargetHook(IDirect3DDevice9* device, DWORD index, IDirect3DSurface9* surface) {
     if (index == 0 && surface != g_stereo.activeColor) FlushDesktopEyeMirror(device);
-    if (index == 0 && surface) tmoxr::VrBridge::Instance().OnRenderTarget(surface);
+    if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed) && index == 0 && surface) {
+        tmoxr::VrBridge::Instance().OnRenderTarget(surface);
+    }
     if (index == 0) g_stereo.activeColor = surface;
     return g_originalSetRenderTarget(device, index, surface);
 }
@@ -1605,6 +1658,15 @@ HRESULT STDMETHODCALLTYPE SetVertexShaderHook(IDirect3DDevice9* device, IDirect3
 }
 
 HRESULT STDMETHODCALLTYPE SetVertexShaderConstantFHook(IDirect3DDevice9* device, UINT startRegister, const float* data, UINT vectorCount) {
+    if (data && startRegister < g_stereo.validVertexShaderConstants.size()) {
+        const UINT cachedVectors = std::min<UINT>(vectorCount,
+            static_cast<UINT>(g_stereo.validVertexShaderConstants.size()) - startRegister);
+        std::memcpy(g_stereo.vertexShaderConstants.data() + startRegister * 4,
+            data, static_cast<size_t>(cachedVectors) * 4 * sizeof(float));
+        for (UINT vector = 0; vector < cachedVectors; ++vector) {
+            g_stereo.validVertexShaderConstants[startRegister + vector] = true;
+        }
+    }
     if (g_stereo.perspective && g_stereo.customVertexShaderBound && data && vectorCount >= 4) {
         const auto* expected = &g_stereo.projection._11;
         for (UINT vector = 0; vector + 4 <= vectorCount; ++vector) {
@@ -1632,7 +1694,9 @@ HRESULT STDMETHODCALLTYPE SetVertexShaderConstantFHook(IDirect3DDevice9* device,
 }
 
 HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITIVETYPE type, UINT startVertex, UINT primitiveCount) {
-    tmoxr::VrBridge::Instance().OnDraw(false);
+    if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed)) {
+        tmoxr::VrBridge::Instance().OnDraw(false);
+    }
     if (g_stereo.perspective) {
         ++g_stereo.perspectiveDrawCandidates;
         if (g_stereo.customVertexShaderBound) ++g_stereo.shaderPerspectiveCandidates;
@@ -1645,14 +1709,16 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITI
         }
         return game;
     }
+    const auto replayStart = std::chrono::steady_clock::now();
     AnalyzeVertexShader(g_stereo.vertexShader);
     const ShaderEyeState shaderEye = CaptureShaderEyeState(device);
-    D3DVIEWPORT9 gameViewport{};
-    const bool haveGameViewport = SUCCEEDED(device->GetViewport(&gameViewport));
+    const D3DVIEWPORT9 gameViewport = g_stereo.gameViewport;
+    const bool haveGameViewport = g_stereo.haveGameViewport;
     const bool setEyeViewport = !haveGameViewport || gameViewport.X != 0 || gameViewport.Y != 0 ||
         gameViewport.Width != g_stereo.renderWidth || gameViewport.Height != g_stereo.renderHeight ||
         gameViewport.MinZ != 0.0f || gameViewport.MaxZ != 1.0f;
     ++g_stereo.replayedDraws;
+    g_stereo.replayedPrimitives += primitiveCount;
     if (shaderEye.active) ++g_stereo.transformedDraws;
     else if (g_stereo.vertexShader) ++g_stereo.untransformedShaderDraws;
     else ++g_stereo.fixedFunctionDraws;
@@ -1661,12 +1727,14 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITI
         g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
     if (IsDesktopSpaceAdditiveSprite(device)) {
         ++g_stereo.suppressedDesktopSpaceLightDraws;
+        g_stereo.stereoReplayCpuMilliseconds += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - replayStart).count();
         return game;
     }
     BeginTrackedEye(device, false, !shaderEye.active, setEyeViewport);
     ApplyShaderEyeState(device, shaderEye, 0.0f, false);
     const HRESULT left = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
-    BeginTrackedEye(device, true, !shaderEye.active, setEyeViewport);
+    BeginTrackedEye(device, true, !shaderEye.active, false);
     ApplyShaderEyeState(device, shaderEye, -0.064f, true);
     const HRESULT right = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
     if (FAILED(right) && !g_stereo.rightDrawFailureLogged) {
@@ -1675,17 +1743,21 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITI
     }
     RestoreShaderEyeState(device, shaderEye);
     RestoreGameEye(device, !shaderEye.active);
-    if (setEyeViewport && haveGameViewport) device->SetViewport(&gameViewport);
+    if (setEyeViewport && haveGameViewport) g_originalSetViewport(device, &gameViewport);
     if (mirrorEyeToDesktop && SUCCEEDED(left)) {
         g_stereo.desktopMirrorDirty = true;
         ++g_stereo.skippedDesktopDraws;
     }
+    g_stereo.stereoReplayCpuMilliseconds += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - replayStart).count();
     return mirrorEyeToDesktop ? left : game;
 }
 
 HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITIVETYPE type, INT baseVertex, UINT minVertex,
                                                     UINT vertexCount, UINT startIndex, UINT primitiveCount) {
-    tmoxr::VrBridge::Instance().OnDraw(true);
+    if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed)) {
+        tmoxr::VrBridge::Instance().OnDraw(true);
+    }
     if (g_stereo.perspective) {
         ++g_stereo.perspectiveDrawCandidates;
         if (g_stereo.customVertexShaderBound) ++g_stereo.shaderPerspectiveCandidates;
@@ -1698,14 +1770,16 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3D
         }
         return game;
     }
+    const auto replayStart = std::chrono::steady_clock::now();
     AnalyzeVertexShader(g_stereo.vertexShader);
     const ShaderEyeState shaderEye = CaptureShaderEyeState(device);
-    D3DVIEWPORT9 gameViewport{};
-    const bool haveGameViewport = SUCCEEDED(device->GetViewport(&gameViewport));
+    const D3DVIEWPORT9 gameViewport = g_stereo.gameViewport;
+    const bool haveGameViewport = g_stereo.haveGameViewport;
     const bool setEyeViewport = !haveGameViewport || gameViewport.X != 0 || gameViewport.Y != 0 ||
         gameViewport.Width != g_stereo.renderWidth || gameViewport.Height != g_stereo.renderHeight ||
         gameViewport.MinZ != 0.0f || gameViewport.MaxZ != 1.0f;
     ++g_stereo.replayedDraws;
+    g_stereo.replayedPrimitives += primitiveCount;
     if (shaderEye.active) ++g_stereo.transformedDraws;
     else if (g_stereo.vertexShader) ++g_stereo.untransformedShaderDraws;
     else ++g_stereo.fixedFunctionDraws;
@@ -1714,12 +1788,14 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3D
         g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
     if (IsDesktopSpaceAdditiveSprite(device)) {
         ++g_stereo.suppressedDesktopSpaceLightDraws;
+        g_stereo.stereoReplayCpuMilliseconds += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - replayStart).count();
         return game;
     }
     BeginTrackedEye(device, false, !shaderEye.active, setEyeViewport);
     ApplyShaderEyeState(device, shaderEye, 0.0f, false);
     const HRESULT left = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
-    BeginTrackedEye(device, true, !shaderEye.active, setEyeViewport);
+    BeginTrackedEye(device, true, !shaderEye.active, false);
     ApplyShaderEyeState(device, shaderEye, -0.064f, true);
     const HRESULT right = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
     if (FAILED(right) && !g_stereo.rightDrawFailureLogged) {
@@ -1728,17 +1804,21 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3D
     }
     RestoreShaderEyeState(device, shaderEye);
     RestoreGameEye(device, !shaderEye.active);
-    if (setEyeViewport && haveGameViewport) device->SetViewport(&gameViewport);
+    if (setEyeViewport && haveGameViewport) g_originalSetViewport(device, &gameViewport);
     if (mirrorEyeToDesktop && SUCCEEDED(left)) {
         g_stereo.desktopMirrorDirty = true;
         ++g_stereo.skippedDesktopDraws;
     }
+    g_stereo.stereoReplayCpuMilliseconds += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - replayStart).count();
     return mirrorEyeToDesktop ? left : game;
 }
 
 HRESULT STDMETHODCALLTYPE DrawPrimitiveUPHook(IDirect3DDevice9* device, D3DPRIMITIVETYPE type, UINT primitiveCount,
                                                const void* vertexData, UINT stride) {
-    tmoxr::VrBridge::Instance().OnDraw(false);
+    if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed)) {
+        tmoxr::VrBridge::Instance().OnDraw(false);
+    }
     FlushDesktopEyeMirror(device);
     const HRESULT game = g_originalDrawPrimitiveUP(device, type, primitiveCount, vertexData, stride);
     if (SUCCEEDED(game) && CanCaptureUiDraw(device)) {
@@ -1750,7 +1830,9 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveUPHook(IDirect3DDevice9* device, D3DPRIMI
 HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveUPHook(IDirect3DDevice9* device, D3DPRIMITIVETYPE type,
     UINT minVertex, UINT vertexCount, UINT primitiveCount, const void* indexData, D3DFORMAT indexFormat,
     const void* vertexData, UINT stride) {
-    tmoxr::VrBridge::Instance().OnDraw(true);
+    if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed)) {
+        tmoxr::VrBridge::Instance().OnDraw(true);
+    }
     FlushDesktopEyeMirror(device);
     const HRESULT game = g_originalDrawIndexedPrimitiveUP(device, type, minVertex, vertexCount, primitiveCount,
         indexData, indexFormat, vertexData, stride);
@@ -1796,6 +1878,7 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
     g_originalBeginScene = reinterpret_cast<BeginSceneFn>(table[41]);
     g_originalEndScene = reinterpret_cast<EndSceneFn>(table[42]);
     g_originalSetTransform = reinterpret_cast<SetTransformFn>(table[44]);
+    g_originalSetViewport = reinterpret_cast<SetViewportFn>(table[47]);
     g_originalSetRenderTarget = reinterpret_cast<SetRenderTargetFn>(table[37]);
     g_originalSetDepthStencilSurface = reinterpret_cast<SetDepthStencilSurfaceFn>(table[39]);
     g_originalClear = reinterpret_cast<ClearFn>(table[43]);
@@ -1805,11 +1888,13 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
     g_originalDrawIndexedPrimitive = reinterpret_cast<DrawIndexedPrimitiveFn>(table[82]);
     g_originalDrawPrimitiveUP = reinterpret_cast<DrawPrimitiveUPFn>(table[83]);
     g_originalDrawIndexedPrimitiveUP = reinterpret_cast<DrawIndexedPrimitiveUPFn>(table[84]);
+    g_stereo.haveGameViewport = SUCCEEDED(device->GetViewport(&g_stereo.gameViewport));
     table[16] = reinterpret_cast<void*>(&ResetHook);
     table[17] = reinterpret_cast<void*>(&PresentHook);
     table[41] = reinterpret_cast<void*>(&BeginSceneHook);
     table[42] = reinterpret_cast<void*>(&EndSceneHook);
     table[44] = reinterpret_cast<void*>(&SetTransformHook);
+    table[47] = reinterpret_cast<void*>(&SetViewportHook);
     table[37] = reinterpret_cast<void*>(&SetRenderTargetHook);
     table[39] = reinterpret_cast<void*>(&SetDepthStencilSurfaceHook);
     table[43] = reinterpret_cast<void*>(&ClearHook);
