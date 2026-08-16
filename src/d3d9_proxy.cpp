@@ -99,6 +99,65 @@ ClearFn g_originalClear = nullptr;
 SetVertexShaderFn g_originalSetVertexShader = nullptr;
 SetVertexShaderConstantFFn g_originalSetVertexShaderConstantF = nullptr;
 std::atomic<bool> g_hooked = false;
+HWND g_lockedGameWindow = nullptr;
+WNDPROC g_originalGameWindowProcedure = nullptr;
+LONG g_lockedWindowWidth = 0;
+LONG g_lockedWindowHeight = 0;
+
+bool IsResizeHitTest(LRESULT hitTest) {
+    return hitTest == HTLEFT || hitTest == HTRIGHT || hitTest == HTTOP || hitTest == HTBOTTOM ||
+        hitTest == HTTOPLEFT || hitTest == HTTOPRIGHT || hitTest == HTBOTTOMLEFT || hitTest == HTBOTTOMRIGHT;
+}
+
+LRESULT CALLBACK FixedSizeGameWindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    WNDPROC original = g_originalGameWindowProcedure;
+    if (!original) return DefWindowProcW(window, message, wParam, lParam);
+
+    if (message == WM_SYSCOMMAND) {
+        const WPARAM command = wParam & 0xfff0;
+        if (command == SC_SIZE || command == SC_MAXIMIZE) return 0;
+    }
+    if (message == WM_NCHITTEST) {
+        const LRESULT hitTest = CallWindowProcW(original, window, message, wParam, lParam);
+        return IsResizeHitTest(hitTest) ? HTBORDER : hitTest;
+    }
+    if (message == WM_WINDOWPOSCHANGING && window == g_lockedGameWindow) {
+        const LRESULT result = CallWindowProcW(original, window, message, wParam, lParam);
+        auto* position = reinterpret_cast<WINDOWPOS*>(lParam);
+        if (position && (position->flags & SWP_NOSIZE) == 0) {
+            position->cx = g_lockedWindowWidth;
+            position->cy = g_lockedWindowHeight;
+        }
+        return result;
+    }
+    if (message == WM_NCDESTROY && window == g_lockedGameWindow) {
+        SetWindowLongPtrW(window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(original));
+        g_lockedGameWindow = nullptr;
+        g_originalGameWindowProcedure = nullptr;
+        g_lockedWindowWidth = 0;
+        g_lockedWindowHeight = 0;
+        return CallWindowProcW(original, window, message, wParam, lParam);
+    }
+    return CallWindowProcW(original, window, message, wParam, lParam);
+}
+
+void LockGameWindowSize(HWND window) {
+    if (!window || !IsWindow(window) || g_lockedGameWindow == window) return;
+    RECT bounds{};
+    if (!GetWindowRect(window, &bounds)) return;
+    SetLastError(ERROR_SUCCESS);
+    const LONG_PTR previous = SetWindowLongPtrW(window, GWLP_WNDPROC,
+        reinterpret_cast<LONG_PTR>(&FixedSizeGameWindowProcedure));
+    if (!previous && GetLastError() != ERROR_SUCCESS) {
+        tmoxr::log::Warn("Could not lock the TrackMania window size; accidental resizing may reset VR rendering.");
+        return;
+    }
+    g_lockedGameWindow = window;
+    g_originalGameWindowProcedure = reinterpret_cast<WNDPROC>(previous);
+    g_lockedWindowWidth = bounds.right - bounds.left;
+    g_lockedWindowHeight = bounds.bottom - bounds.top;
+    tmoxr::log::Info("Locked the TrackMania window size while VR is active; moving and minimizing remain available.");
+}
 
 struct CameraSettings {
     std::atomic<bool> cockpitEnabled{true};
@@ -838,17 +897,6 @@ bool CreateStereoResources(IDirect3DDevice9* device) {
         return false;
     }
     g_stereo.haveGameViewport = SUCCEEDED(device->GetViewport(&g_stereo.gameViewport));
-    if (SUCCEEDED(device->GetTransform(D3DTS_PROJECTION, &g_stereo.projection))) {
-        g_stereo.perspective = std::abs(g_stereo.projection._34) > 0.5f;
-        g_stereo.perspectivePassSeen = g_stereo.perspective;
-    }
-    g_stereo.haveView = SUCCEEDED(device->GetTransform(D3DTS_VIEW, &g_stereo.view));
-    IDirect3DVertexShader9* activeShader = nullptr;
-    if (SUCCEEDED(device->GetVertexShader(&activeShader))) {
-        g_stereo.vertexShader = activeShader;
-        g_stereo.customVertexShaderBound = activeShader != nullptr;
-        if (activeShader) activeShader->Release();
-    }
     g_stereo.ready = true;
     tmoxr::log::Info("Experimental native stereo resources initialized: " + std::to_string(color.Width) + "x" + std::to_string(color.Height) + ".");
     tmoxr::log::Info("Stereo camera baseline for TrackMania's reflected X projection: left=0.000 m, right=-0.064 m.");
@@ -1875,7 +1923,7 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITI
 }
 
 HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITIVETYPE type, INT baseVertex, UINT minVertex,
-                                                    UINT vertexCount, UINT startIndex, UINT primitiveCount) {
+                                                     UINT vertexCount, UINT startIndex, UINT primitiveCount) {
     if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed)) {
         tmoxr::VrBridge::Instance().OnDraw(true);
     }
@@ -2081,6 +2129,7 @@ public:
                 std::to_string(parameters->BackBufferHeight) + ", windowed=" + std::to_string(parameters->Windowed != FALSE) +
                 ", presentation interval=" + std::to_string(parameters->PresentationInterval) + ".");
             if (InstallDeviceHooks(*device)) {
+                LockGameWindowSize(parameters->hDeviceWindow ? parameters->hDeviceWindow : window);
                 tmoxr::VrBridge::Instance().OnDeviceCreated(*device, *parameters);
                 CreateStereoResources(*device);
             }
