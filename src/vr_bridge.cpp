@@ -200,8 +200,19 @@ struct VrBridge::Impl {
     IDirect3DSurface9* leftEyeSource = nullptr;
     IDirect3DSurface9* rightEyeSource = nullptr;
     IDirect3DSurface9* uiSource = nullptr;
+    HANDLE leftEyeSharedHandle = nullptr;
+    HANDLE rightEyeSharedHandle = nullptr;
+    HANDLE uiSharedHandle = nullptr;
+    HANDLE leftEyeOpenAttempted = nullptr;
+    HANDLE rightEyeOpenAttempted = nullptr;
+    HANDLE uiOpenAttempted = nullptr;
     ID3D11Device* d3d11Device = nullptr;
     ID3D11DeviceContext* d3d11Context = nullptr;
+    ID3D11Texture2D* leftEyeSharedTexture = nullptr;
+    ID3D11Texture2D* rightEyeSharedTexture = nullptr;
+    ID3D11Texture2D* uiSharedTexture = nullptr;
+    IDirect3DQuery9* d3d9SharedReady = nullptr;
+    ID3D11Query* d3d11SharedCopyDone = nullptr;
     UINT sourceWidth = 0;
     UINT sourceHeight = 0;
     D3DPRESENT_PARAMETERS present{};
@@ -215,6 +226,8 @@ struct VrBridge::Impl {
     uint64_t frames = 0;
     uint64_t diagnosticStartFrame = 0;
     std::chrono::steady_clock::time_point diagnosticStartTime = std::chrono::steady_clock::now();
+    double transferMilliseconds = 0.0;
+    uint64_t transferSamples = 0;
     uint32_t viewTransformsThisFrame = 0;
     uint32_t projectionTransformsThisFrame = 0;
     uint32_t perspectiveProjectionsThisFrame = 0;
@@ -248,6 +261,55 @@ struct VrBridge::Impl {
     bool frameBegun = false;
     bool activeViewsLocated = false;
     std::mutex mutex;
+
+    bool OpenSharedTexture(HANDLE handle, HANDLE& attempted, ID3D11Texture2D*& texture, const char* label) {
+        if (!handle || !d3d11Device) return false;
+        if (texture) return true;
+        if (attempted == handle) return false;
+        attempted = handle;
+        const HRESULT result = d3d11Device->OpenSharedResource(handle, IID_PPV_ARGS(&texture));
+        if (FAILED(result)) {
+            log::Warn(std::string("Could not open the shared D3D9 ") + label +
+                " texture in D3D11; retaining the CPU readback fallback. HRESULT=" +
+                std::to_string(static_cast<long>(result)));
+            return false;
+        }
+        log::Info(std::string("Opened the shared D3D9 ") + label + " texture in D3D11 (zero-copy path active).");
+        return true;
+    }
+
+    bool WaitForD3D9SharedProducer() {
+        if (!d3d9SharedReady && FAILED(device->CreateQuery(D3DQUERYTYPE_EVENT, &d3d9SharedReady))) {
+            log::Warn("Could not create the D3D9 shared-texture synchronization query; using CPU readback.");
+            return false;
+        }
+        if (FAILED(d3d9SharedReady->Issue(D3DISSUE_END))) return false;
+        HRESULT result = S_FALSE;
+        while (result == S_FALSE) {
+            result = d3d9SharedReady->GetData(nullptr, 0, D3DGETDATA_FLUSH);
+            if (result == S_FALSE) SwitchToThread();
+        }
+        return SUCCEEDED(result);
+    }
+
+    bool WaitForD3D11SharedConsumer() {
+        if (!d3d11SharedCopyDone) {
+            D3D11_QUERY_DESC description{};
+            description.Query = D3D11_QUERY_EVENT;
+            if (FAILED(d3d11Device->CreateQuery(&description, &d3d11SharedCopyDone))) {
+                d3d11Context->Flush();
+                return false;
+            }
+        }
+        d3d11Context->End(d3d11SharedCopyDone);
+        d3d11Context->Flush();
+        HRESULT result = S_FALSE;
+        while (result == S_FALSE) {
+            result = d3d11Context->GetData(d3d11SharedCopyDone, nullptr, 0, 0);
+            if (result == S_FALSE) SwitchToThread();
+        }
+        return SUCCEEDED(result);
+    }
 
     void ShowStartupFailure(const std::string& stage, const std::string& error, const std::string& guidance) {
         if (startupFailureShown) return;
@@ -563,6 +625,19 @@ struct VrBridge::Impl {
         rightReadback = nullptr;
         if (uiReadback) uiReadback->Release();
         uiReadback = nullptr;
+        if (d3d9SharedReady) d3d9SharedReady->Release();
+        d3d9SharedReady = nullptr;
+        if (d3d11SharedCopyDone) d3d11SharedCopyDone->Release();
+        d3d11SharedCopyDone = nullptr;
+        if (leftEyeSharedTexture) leftEyeSharedTexture->Release();
+        leftEyeSharedTexture = nullptr;
+        if (rightEyeSharedTexture) rightEyeSharedTexture->Release();
+        rightEyeSharedTexture = nullptr;
+        if (uiSharedTexture) uiSharedTexture->Release();
+        uiSharedTexture = nullptr;
+        leftEyeOpenAttempted = nullptr;
+        rightEyeOpenAttempted = nullptr;
+        uiOpenAttempted = nullptr;
         if (d3d11Context) d3d11Context->Release();
         d3d11Context = nullptr;
         if (d3d11Device) d3d11Device->Release();
@@ -950,6 +1025,13 @@ struct VrBridge::Impl {
                     " ms, TrackMania Present rate=" + std::to_string(applicationRate) +
                     " Hz; pose was located before scene rendering.");
             }
+            if (transferSamples) {
+                log::Info("OpenXR frame transfer/submission CPU time: average=" +
+                    std::to_string(transferMilliseconds / static_cast<double>(transferSamples)) +
+                    " ms across " + std::to_string(transferSamples) + " rendered frames.");
+                transferMilliseconds = 0.0;
+                transferSamples = 0;
+            }
             diagnosticStartTime = diagnosticNow;
             diagnosticStartFrame = frames;
         }
@@ -969,13 +1051,30 @@ struct VrBridge::Impl {
         XrCompositionLayerQuad uiLayer{XR_TYPE_COMPOSITION_LAYER_QUAD};
         std::array<const XrCompositionLayerBaseHeader*, 2> layers{};
         uint32_t layerCount = 0;
+        const auto transferStart = std::chrono::steady_clock::now();
         if (activeFrameState.shouldRender && activeViewsLocated) {
             const uint32_t viewCount = static_cast<uint32_t>(activeViews.size());
+                OpenSharedTexture(leftEyeSharedHandle, leftEyeOpenAttempted, leftEyeSharedTexture, "left-eye");
+                OpenSharedTexture(rightEyeSharedHandle, rightEyeOpenAttempted, rightEyeSharedTexture, "right-eye");
+                OpenSharedTexture(uiSharedHandle, uiOpenAttempted, uiSharedTexture, "UI");
+                bool sharedProducerWaited = false;
+                bool sharedProducerReady = false;
+                bool sharedCopyIssued = false;
+                bool d3d11TransferIssued = false;
+                std::vector<XrSwapchain> acquiredSwapchains;
+                auto ensureSharedProducerReady = [&]() {
+                    if (!sharedProducerWaited) {
+                        sharedProducerWaited = true;
+                        sharedProducerReady = WaitForD3D9SharedProducer();
+                    }
+                    return sharedProducerReady;
+                };
                 IDirect3DSurface9* gameBackbuffer = nullptr;
                 const HRESULT backBufferResult = device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &gameBackbuffer);
                 if (SUCCEEDED(backBufferResult)) {
                     projectionViews.resize(viewCount);
-                    auto uploadEye = [&](uint32_t eye, IDirect3DSurface9* source, IDirect3DSurface9*& eyeReadback) {
+                    auto uploadEye = [&](uint32_t eye, IDirect3DSurface9* source, IDirect3DSurface9*& eyeReadback,
+                                         ID3D11Texture2D* sharedTexture) {
                         if (!source) return false;
                         D3DSURFACE_DESC sourceDescription{};
                         if (FAILED(source->GetDesc(&sourceDescription))) return false;
@@ -983,7 +1082,9 @@ struct VrBridge::Impl {
                             sourceDescription.Height != viewConfigs[eye].recommendedImageRectHeight) {
                             return false;
                         }
-                        if (eyeReadback) {
+                        const bool useSharedTexture = sharedTexture && ensureSharedProducerReady();
+                        D3DLOCKED_RECT locked{};
+                        if (!useSharedTexture && eyeReadback) {
                             D3DSURFACE_DESC readbackDescription{};
                             if (FAILED(eyeReadback->GetDesc(&readbackDescription)) ||
                                 readbackDescription.Width != sourceDescription.Width ||
@@ -993,7 +1094,7 @@ struct VrBridge::Impl {
                                 eyeReadback = nullptr;
                             }
                         }
-                        if (!eyeReadback) {
+                        if (!useSharedTexture && !eyeReadback) {
                             const HRESULT create = device->CreateOffscreenPlainSurface(sourceDescription.Width, sourceDescription.Height,
                                 sourceDescription.Format,
                                 D3DPOOL_SYSTEMMEM, &eyeReadback, nullptr);
@@ -1002,36 +1103,44 @@ struct VrBridge::Impl {
                                 return false;
                             }
                         }
-                        const HRESULT read = device->GetRenderTargetData(source, eyeReadback);
-                        D3DLOCKED_RECT locked{};
-                        const HRESULT lock = SUCCEEDED(read) ? eyeReadback->LockRect(&locked, nullptr, D3DLOCK_READONLY) : read;
-                        if (FAILED(lock)) {
-                            if (!copyFailureLogged) log::Error("D3D9 readback/lock failed. Disable MSAA in TrackMania if it is enabled. HRESULT=" + std::to_string(static_cast<long>(lock)));
-                            copyFailureLogged = true;
-                            return false;
-                        }
-                        uint32_t nonBlackSamples = 0;
-                        constexpr UINT sampleColumns = 32;
-                        constexpr UINT sampleRows = 24;
-                        for (UINT y = 0; y < sampleRows; ++y) {
-                            const auto* row = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(locked.pBits) +
-                                static_cast<size_t>(y) * sourceDescription.Height / sampleRows * locked.Pitch);
-                            for (UINT x = 0; x < sampleColumns; ++x) {
-                                if ((row[x * sourceDescription.Width / sampleColumns] & 0x00FFFFFFu) != 0) ++nonBlackSamples;
+                        if (!useSharedTexture) {
+                            const HRESULT read = device->GetRenderTargetData(source, eyeReadback);
+                            const HRESULT lock = SUCCEEDED(read) ? eyeReadback->LockRect(&locked, nullptr, D3DLOCK_READONLY) : read;
+                            if (FAILED(lock)) {
+                                if (!copyFailureLogged) log::Error("D3D9 readback/lock failed. Disable MSAA in TrackMania if it is enabled. HRESULT=" + std::to_string(static_cast<long>(lock)));
+                                copyFailureLogged = true;
+                                return false;
+                            }
+                            if (frames % 180 == 0) {
+                                uint32_t nonBlackSamples = 0;
+                                constexpr UINT sampleColumns = 32;
+                                constexpr UINT sampleRows = 24;
+                                for (UINT y = 0; y < sampleRows; ++y) {
+                                    const auto* row = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(locked.pBits) +
+                                        static_cast<size_t>(y) * sourceDescription.Height / sampleRows * locked.Pitch);
+                                    for (UINT x = 0; x < sampleColumns; ++x) {
+                                        if ((row[x * sourceDescription.Width / sampleColumns] & 0x00FFFFFFu) != 0) ++nonBlackSamples;
+                                    }
+                                }
+                                if (eye == 0) leftSourceSamples = nonBlackSamples;
+                                else rightSourceSamples = nonBlackSamples;
                             }
                         }
-                        if (eye == 0) leftSourceSamples = nonBlackSamples;
-                        else rightSourceSamples = nonBlackSamples;
                         uint32_t imageIndex = 0;
                         XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
                         XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
                         wait.timeout = XR_INFINITE_DURATION;
-                        XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
                         const bool acquired = Check(acquireImage(swapchains[eye], &acquire, &imageIndex), "xrAcquireSwapchainImage") &&
                             Check(waitImage(swapchains[eye], &wait), "xrWaitSwapchainImage");
                         if (acquired) {
-                            d3d11Context->UpdateSubresource(images[eye][imageIndex].texture, 0, nullptr, locked.pBits, locked.Pitch, 0);
-                            releaseImage(swapchains[eye], &release);
+                            if (useSharedTexture) {
+                                d3d11Context->CopyResource(images[eye][imageIndex].texture, sharedTexture);
+                                sharedCopyIssued = true;
+                            } else {
+                                d3d11Context->UpdateSubresource(images[eye][imageIndex].texture, 0, nullptr, locked.pBits, locked.Pitch, 0);
+                            }
+                            d3d11TransferIssued = true;
+                            acquiredSwapchains.push_back(swapchains[eye]);
                             projectionViews[eye] = XrCompositionLayerProjectionView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
                             projectionViews[eye].pose = activeViews[eye].pose;
                             projectionViews[eye].fov = activeViews[eye].fov;
@@ -1039,16 +1148,20 @@ struct VrBridge::Impl {
                             projectionViews[eye].subImage.imageRect.extent.width = static_cast<int32_t>(sourceDescription.Width);
                             projectionViews[eye].subImage.imageRect.extent.height = static_cast<int32_t>(sourceDescription.Height);
                         }
-                        eyeReadback->UnlockRect();
+                        if (!useSharedTexture) eyeReadback->UnlockRect();
                         if (eye == 1 && frames % 180 == 0) {
-                            log::Info("Stereo source pixel samples (non-black / 768): left=" + std::to_string(leftSourceSamples) +
-                                ", right=" + std::to_string(rightSourceSamples) + ".");
+                            if (useSharedTexture) {
+                                log::Info("Stereo frame transfer is using shared GPU textures (no D3D9 CPU readback).");
+                            } else {
+                                log::Info("Stereo source pixel samples (non-black / 768): left=" + std::to_string(leftSourceSamples) +
+                                    ", right=" + std::to_string(rightSourceSamples) + ".");
+                            }
                         }
                         return acquired;
                     };
                     IDirect3DSurface9* leftSource = leftEyeSource ? leftEyeSource : gameBackbuffer;
-                    const bool allEyesUploaded = uploadEye(0, leftSource, readback) && uploadEye(1, rightEyeSource, rightReadback);
-                    d3d11Context->Flush();
+                    const bool allEyesUploaded = uploadEye(0, leftSource, readback, leftEyeSharedTexture) &&
+                        uploadEye(1, rightEyeSource, rightReadback, rightEyeSharedTexture);
                     if (!allEyesUploaded) projectionViews.clear();
                     gameBackbuffer->Release();
                     layer.space = space;
@@ -1065,7 +1178,9 @@ struct VrBridge::Impl {
                 D3DSURFACE_DESC description{};
                 if (SUCCEEDED(uiSource->GetDesc(&description)) && description.Width == sourceWidth &&
                     description.Height == sourceHeight) {
-                    if (uiReadback) {
+                    OpenSharedTexture(uiSharedHandle, uiOpenAttempted, uiSharedTexture, "UI");
+                    const bool useSharedUi = uiSharedTexture && ensureSharedProducerReady();
+                    if (!useSharedUi && uiReadback) {
                         D3DSURFACE_DESC readbackDescription{};
                         if (FAILED(uiReadback->GetDesc(&readbackDescription)) ||
                             readbackDescription.Width != description.Width ||
@@ -1075,25 +1190,31 @@ struct VrBridge::Impl {
                             uiReadback = nullptr;
                         }
                     }
-                    if (!uiReadback) {
+                    if (!useSharedUi && !uiReadback) {
                         device->CreateOffscreenPlainSurface(description.Width, description.Height, description.Format,
                             D3DPOOL_SYSTEMMEM, &uiReadback, nullptr);
                     }
-                    const HRESULT read = uiReadback ? device->GetRenderTargetData(uiSource, uiReadback) : E_FAIL;
                     D3DLOCKED_RECT locked{};
-                    const HRESULT lock = SUCCEEDED(read) ? uiReadback->LockRect(&locked, nullptr, D3DLOCK_READONLY) : read;
+                    const HRESULT read = useSharedUi ? S_OK :
+                        (uiReadback ? device->GetRenderTargetData(uiSource, uiReadback) : E_FAIL);
+                    const HRESULT lock = useSharedUi ? S_OK :
+                        (SUCCEEDED(read) ? uiReadback->LockRect(&locked, nullptr, D3DLOCK_READONLY) : read);
                     if (SUCCEEDED(lock)) {
                         uint32_t imageIndex = 0;
                         XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
                         XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
                         wait.timeout = XR_INFINITE_DURATION;
-                        XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
                         if (Check(acquireImage(uiSwapchain, &acquire, &imageIndex), "xrAcquireSwapchainImage(UI)") &&
                             Check(waitImage(uiSwapchain, &wait), "xrWaitSwapchainImage(UI)")) {
-                            d3d11Context->UpdateSubresource(uiImages[imageIndex].texture, 0, nullptr,
-                                locked.pBits, locked.Pitch, 0);
-                            d3d11Context->Flush();
-                            releaseImage(uiSwapchain, &release);
+                            if (useSharedUi) {
+                                d3d11Context->CopyResource(uiImages[imageIndex].texture, uiSharedTexture);
+                                sharedCopyIssued = true;
+                            } else {
+                                d3d11Context->UpdateSubresource(uiImages[imageIndex].texture, 0, nullptr,
+                                    locked.pBits, locked.Pitch, 0);
+                            }
+                            d3d11TransferIssued = true;
+                            acquiredSwapchains.push_back(uiSwapchain);
                             const XrVector3f screenOffset = Rotate(baseHeadPose.orientation, {0.0f, 0.0f, -2.0f});
                             uiLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
                             uiLayer.space = space;
@@ -1110,14 +1231,25 @@ struct VrBridge::Impl {
                             uiLayer.subImage.imageRect.extent.height = static_cast<int32_t>(sourceHeight);
                             layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&uiLayer);
                         }
-                        uiReadback->UnlockRect();
+                        if (!useSharedUi) uiReadback->UnlockRect();
                     } else if (!copyFailureLogged) {
                         log::Error("D3D9 UI readback/lock failed: HRESULT=" + std::to_string(static_cast<long>(lock)));
                         copyFailureLogged = true;
                     }
                 }
             }
+            if (d3d11TransferIssued) {
+                if (sharedCopyIssued) WaitForD3D11SharedConsumer();
+                else d3d11Context->Flush();
+            }
+            XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            for (const XrSwapchain acquiredSwapchain : acquiredSwapchains) {
+                Check(releaseImage(acquiredSwapchain, &release), "xrReleaseSwapchainImage");
+            }
         }
+        transferMilliseconds += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - transferStart).count();
+        ++transferSamples;
         XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
         end.displayTime = activeFrameState.predictedDisplayTime;
         end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
@@ -1198,33 +1330,51 @@ void VrBridge::OnGameProjection(const D3DMATRIX& matrix) {
     impl_->haveGameFov = true;
 }
 
-void VrBridge::SetRightEyeSurface(IDirect3DSurface9* surface) {
+void VrBridge::SetRightEyeSurface(IDirect3DSurface9* surface, HANDLE sharedHandle) {
     if (!impl_) impl_ = new Impl;
     std::scoped_lock lock(impl_->mutex);
-    if (impl_->rightEyeSource == surface) return;
-    if (surface) surface->AddRef();
-    if (impl_->rightEyeSource) impl_->rightEyeSource->Release();
-    impl_->rightEyeSource = surface;
-    log::Info(surface ? "Right-eye native stereo source changed." : "Right-eye native stereo source detached.");
+    if (impl_->rightEyeSource != surface || impl_->rightEyeSharedHandle != sharedHandle) {
+        if (surface) surface->AddRef();
+        if (impl_->rightEyeSource) impl_->rightEyeSource->Release();
+        impl_->rightEyeSource = surface;
+        impl_->rightEyeSharedHandle = sharedHandle;
+        impl_->rightEyeOpenAttempted = nullptr;
+        if (impl_->rightEyeSharedTexture) impl_->rightEyeSharedTexture->Release();
+        impl_->rightEyeSharedTexture = nullptr;
+        log::Info(surface ? "Right-eye native stereo source changed." : "Right-eye native stereo source detached.");
+    }
+    impl_->OpenSharedTexture(sharedHandle, impl_->rightEyeOpenAttempted, impl_->rightEyeSharedTexture, "right-eye");
 }
 
-void VrBridge::SetLeftEyeSurface(IDirect3DSurface9* surface) {
+void VrBridge::SetLeftEyeSurface(IDirect3DSurface9* surface, HANDLE sharedHandle) {
     if (!impl_) impl_ = new Impl;
     std::scoped_lock lock(impl_->mutex);
-    if (impl_->leftEyeSource == surface) return;
-    if (surface) surface->AddRef();
-    if (impl_->leftEyeSource) impl_->leftEyeSource->Release();
-    impl_->leftEyeSource = surface;
-    log::Info(surface ? "Left-eye tracked stereo source changed." : "Left-eye tracked stereo source detached.");
+    if (impl_->leftEyeSource != surface || impl_->leftEyeSharedHandle != sharedHandle) {
+        if (surface) surface->AddRef();
+        if (impl_->leftEyeSource) impl_->leftEyeSource->Release();
+        impl_->leftEyeSource = surface;
+        impl_->leftEyeSharedHandle = sharedHandle;
+        impl_->leftEyeOpenAttempted = nullptr;
+        if (impl_->leftEyeSharedTexture) impl_->leftEyeSharedTexture->Release();
+        impl_->leftEyeSharedTexture = nullptr;
+        log::Info(surface ? "Left-eye tracked stereo source changed." : "Left-eye tracked stereo source detached.");
+    }
+    impl_->OpenSharedTexture(sharedHandle, impl_->leftEyeOpenAttempted, impl_->leftEyeSharedTexture, "left-eye");
 }
 
-void VrBridge::SetUiSurface(IDirect3DSurface9* surface) {
+void VrBridge::SetUiSurface(IDirect3DSurface9* surface, HANDLE sharedHandle) {
     if (!impl_) impl_ = new Impl;
     std::scoped_lock lock(impl_->mutex);
-    if (impl_->uiSource == surface) return;
-    if (surface) surface->AddRef();
-    if (impl_->uiSource) impl_->uiSource->Release();
-    impl_->uiSource = surface;
+    if (impl_->uiSource != surface || impl_->uiSharedHandle != sharedHandle) {
+        if (surface) surface->AddRef();
+        if (impl_->uiSource) impl_->uiSource->Release();
+        impl_->uiSource = surface;
+        impl_->uiSharedHandle = sharedHandle;
+        impl_->uiOpenAttempted = nullptr;
+        if (impl_->uiSharedTexture) impl_->uiSharedTexture->Release();
+        impl_->uiSharedTexture = nullptr;
+    }
+    impl_->OpenSharedTexture(sharedHandle, impl_->uiOpenAttempted, impl_->uiSharedTexture, "UI");
 }
 
 bool VrBridge::GetHeadPose(HeadPose& pose) {

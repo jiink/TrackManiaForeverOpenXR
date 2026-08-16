@@ -37,7 +37,7 @@ The bridge renders private D3D9 eye surfaces, reads them back through system mem
 - TrackMania still performs frustum culling for its original camera. Objects can disappear near the edges when looking far away from the driving direction.
 - A small number of unusual vertex shaders are not camera-mapped yet. Some distant decorations, such as Island boulders, may not follow the tracked camera correctly.
 - The headset UI screen size and two-metre distance are currently fixed rather than user-configurable.
-- Stereo replay renders the scene three times: once for the desktop and once per eye. Native-resolution D3D9 readback and upload are also expensive, so the game render rate can be well below the headset refresh rate. Correct OpenXR pose timing allows the runtime to reproject those frames.
+- Stereo replay renders the scene three times by default: once for the desktop and once per eye, so VR remains substantially more expensive than vanilla rendering. The bridge batches eye/UI uploads and avoids redundant D3D9 state changes, but TrackMania requires a legacy D3D9 device and therefore cannot safely use D3D9Ex cross-API texture sharing. `MirrorEyeToDesktop` can remove the third scene render experimentally.
 - The initial valid headset pose becomes the session's camera origin. Restart the game to recenter.
 
 ## Requirements
@@ -108,6 +108,12 @@ The install script places `TMOXR.ini` beside `TmForever.exe` without overwriting
 - `HorizonLock`: keeps the headset view level with the world while preserving the car's yaw. It releases smoothly between `HorizonLockReleaseStart` and `HorizonLockReleaseEnd` degrees of car tilt, follows the car through loops and inverted sections, then restores stabilization after the car returns upright.
 
 The supplied Stadium starting point is centered, 0.45 m lower, and 0.65 m behind TrackMania's camera-3 position. While camera 3 is selected, the mod also overrides TrackMania's request to hide the native player-vehicle model. Different environments and custom vehicle models have different dimensions, so adjust these values if the view lands inside bodywork. Saving `TMOXR.ini` reloads the cockpit settings automatically while the game is running. Set `CockpitEnabled=0` to turn the feature off.
+
+## Performance
+
+The mod always honors the eye resolution recommended by the active OpenXR runtime. Adjust headset render resolution in Virtual Desktop, SteamVR, or the relevant runtime rather than applying a second scale in the mod.
+
+`MirrorEyeToDesktop=1` skips TrackMania's redundant original perspective draw, renders the two tracked headset eyes, and mirrors the completed center/left-eye scene through the game's normal post-processing path for the monitor. This reduces scene geometry work from three views to two. The setting reloads live when `TMOXR.ini` is saved; set it to `0` if a track or unusual post-processing effect does not mirror correctly.
 
 The first version recognizes camera mode from manual 1–7 key presses. A camera change forced by a track's MediaTracker does not yet notify the mod, so it does not automatically toggle the seat offset.
 

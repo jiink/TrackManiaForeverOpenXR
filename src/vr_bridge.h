@@ -37,9 +37,9 @@ public:
     void OnGameProjection(const D3DMATRIX& matrix);
     void OnRenderTarget(IDirect3DSurface9* surface);
     void OnDraw(bool indexed);
-    void SetLeftEyeSurface(IDirect3DSurface9* surface);
-    void SetRightEyeSurface(IDirect3DSurface9* surface);
-    void SetUiSurface(IDirect3DSurface9* surface);
+    void SetLeftEyeSurface(IDirect3DSurface9* surface, HANDLE sharedHandle = nullptr);
+    void SetRightEyeSurface(IDirect3DSurface9* surface, HANDLE sharedHandle = nullptr);
+    void SetUiSurface(IDirect3DSurface9* surface, HANDLE sharedHandle = nullptr);
     bool GetHeadPose(HeadPose& pose);
     bool GetRenderConfiguration(RenderConfiguration& configuration);
     bool GetGamepadState(GamepadState& state);
