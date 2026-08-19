@@ -1,6 +1,6 @@
 # TrackMania United Forever OpenXR mod
 
-https://github.com/user-attachments/assets/af46091f-3f3d-45b9-ac23-9a4004db7dac
+https://github.com/user-attachments/assets/5b76c802-7499-458f-a74e-979e9e26bcc3
 
 > [!WARNING]
 > HUMAN-WRITTEN NOTE:
