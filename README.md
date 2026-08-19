@@ -115,7 +115,7 @@ The mod always honors the eye resolution recommended by the active OpenXR runtim
 
 `MirrorEyeToDesktop=1` skips TrackMania's redundant original perspective draw, renders the two tracked headset eyes, and mirrors the completed center/left-eye scene through the game's normal post-processing path for the monitor. This reduces scene geometry work from three views to two. The setting reloads live when `TMOXR.ini` is saved; set it to `0` if a track or unusual post-processing effect does not mirror correctly.
 
-The first version recognizes camera mode from manual 1–7 key presses. A camera change forced by a track's MediaTracker does not yet notify the mod, so it does not automatically toggle the seat offset.
+The mod tracks manual camera keys 1–7. While its camera state is initially unknown, TrackMania's first native vehicle-hide request can identify a persisted camera 3 selection. This restores the cockpit offset and visible car before the first race frame without allowing unrelated visibility changes later in the race to disturb the camera.
 
 ## Quest Touch gamepad mapping
 

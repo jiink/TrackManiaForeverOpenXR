@@ -435,12 +435,28 @@ bool CockpitCameraActive() {
         g_cameraSettings.selectedCamera.load(std::memory_order_relaxed) == 3;
 }
 
+void InitializeCameraFromVehicleVisibility(int visible) {
+    // Vehicle visibility also changes for non-camera reasons throughout a race,
+    // so it is only a safe camera signal while our state is still unknown. A
+    // camera-3 race start issues a hide before its first rendered frame.
+    if (visible) return;
+    int expected = 0;
+    if (g_cameraSettings.selectedCamera.compare_exchange_strong(
+            expected, 3, std::memory_order_relaxed)) {
+        tmoxr::log::Info("TrackMania's initial vehicle-hide request identified persisted camera 3; enabling the VR cockpit before the first race frame.");
+    }
+}
+
 void __fastcall VehicleSetVisibilityHook(void* game, void*, void* vehicleMobil,
                                          int visible, int context, int recursive) {
     // Camera input is processed before D3D BeginScene, so sample the shortcut
     // here as well or the first camera-3 hide request can arrive one frame
     // before the renderer has recorded the new camera mode.
     UpdateSelectedCameraFromKeyboard();
+    // TrackMania persists camera 3 without replaying its key event. Use its first
+    // hide request to initialize an unknown camera state, but never let later
+    // visibility churn override an established/manual camera selection.
+    if (vehicleMobil) InitializeCameraFromVehicleVisibility(visible);
     // The active challenge belongs to the game object, so any visibility update
     // can safely refresh the environment without inspecting a vehicle instance.
     if (visible == 0) DetectActiveVehicleProfile(game);
