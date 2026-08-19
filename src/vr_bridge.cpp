@@ -70,38 +70,91 @@ bool FileExists(const std::wstring& path) {
     return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
-void LogOpenXrDiscovery() {
+void ReadWin32ImplicitApiLayers(HKEY hive, const char* hiveName, std::vector<std::string>& enabledLayers) {
+    constexpr wchar_t registryPath[] = L"SOFTWARE\\Khronos\\OpenXR\\1\\ApiLayers\\Implicit";
+    HKEY key = nullptr;
+    const LONG openResult = RegOpenKeyExW(hive, registryPath, 0, KEY_QUERY_VALUE | KEY_WOW64_32KEY, &key);
+    if (openResult == ERROR_FILE_NOT_FOUND) return;
+    if (openResult != ERROR_SUCCESS) {
+        log::Warn(std::string("Could not inspect ") + hiveName +
+            " Win32 implicit OpenXR API layers. Windows error=" + std::to_string(openResult) + ".");
+        return;
+    }
+
+    std::vector<wchar_t> valueName(32768);
+    for (DWORD index = 0; ; ++index) {
+        DWORD valueNameLength = static_cast<DWORD>(valueName.size());
+        DWORD type = 0;
+        DWORD registrationValue = 0;
+        DWORD registrationValueBytes = sizeof(registrationValue);
+        const LONG result = RegEnumValueW(key, index, valueName.data(), &valueNameLength, nullptr, &type,
+            reinterpret_cast<BYTE*>(&registrationValue), &registrationValueBytes);
+        if (result == ERROR_NO_MORE_ITEMS) break;
+        if (result != ERROR_SUCCESS) {
+            log::Warn(std::string("Could not enumerate ") + hiveName +
+                " Win32 implicit OpenXR API layer entry " + std::to_string(index) +
+                ". Windows error=" + std::to_string(result) + ".");
+            continue;
+        }
+
+        const std::wstring manifestPath(valueName.data(), valueNameLength);
+        const std::string manifestPathUtf8 = Utf8(manifestPath.c_str());
+        if (type != REG_DWORD || registrationValueBytes != sizeof(DWORD)) {
+            log::Warn(std::string("Malformed Win32 implicit OpenXR API layer registration (") + hiveName +
+                "): " + manifestPathUtf8 + " does not have a DWORD enable/disable value.");
+            continue;
+        }
+
+        if (registrationValue == 0) {
+            enabledLayers.push_back(manifestPathUtf8);
+            log::Info(std::string("Enabled Win32 implicit OpenXR API layer (") + hiveName +
+                ", registry DWORD=0): " + manifestPathUtf8 +
+                (FileExists(manifestPath) ? "." : " (manifest file does not exist)."));
+        } else {
+            log::Info(std::string("Disabled Win32 implicit OpenXR API layer (") + hiveName +
+                ", registry DWORD=" + std::to_string(registrationValue) + "): " + manifestPathUtf8 + ".");
+        }
+    }
+    RegCloseKey(key);
+}
+
+std::vector<std::string> LogOpenXrDiscovery() {
+    std::vector<std::string> enabledImplicitLayers;
     const std::wstring environmentOverride = EnvironmentValue(L"XR_RUNTIME_JSON");
     if (!environmentOverride.empty()) {
         log::Info("OpenXR runtime override XR_RUNTIME_JSON=" + Utf8(environmentOverride.c_str()) +
             (FileExists(environmentOverride) ? "." : " (file does not exist)."));
-        return;
+    } else {
+        constexpr wchar_t registryPath[] = L"SOFTWARE\\Khronos\\OpenXR\\1";
+        HKEY key = nullptr;
+        const LONG openResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, registryPath, 0,
+            KEY_QUERY_VALUE | KEY_WOW64_32KEY, &key);
+        if (openResult != ERROR_SUCCESS) {
+            log::Warn("No Win32 OpenXR ActiveRuntime registry key was found (HKLM\\SOFTWARE\\WOW6432Node\\Khronos\\OpenXR\\1). Windows error=" +
+                std::to_string(openResult) + ".");
+        } else {
+            std::vector<wchar_t> activeRuntime(32768);
+            DWORD bytes = static_cast<DWORD>(activeRuntime.size() * sizeof(wchar_t));
+            const LONG readResult = RegGetValueW(key, nullptr, L"ActiveRuntime",
+                RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, nullptr, activeRuntime.data(), &bytes);
+            RegCloseKey(key);
+            if (readResult != ERROR_SUCCESS) {
+                log::Warn("The Win32 OpenXR registry key has no readable ActiveRuntime value. Windows error=" +
+                    std::to_string(readResult) + ".");
+            } else {
+                const std::wstring path = activeRuntime.data();
+                log::Info("Win32 OpenXR ActiveRuntime=" + Utf8(path.c_str()) +
+                    (FileExists(path) ? "." : " (manifest file does not exist)."));
+            }
+        }
     }
 
-    constexpr wchar_t registryPath[] = L"SOFTWARE\\Khronos\\OpenXR\\1";
-    HKEY key = nullptr;
-    const LONG openResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, registryPath, 0,
-        KEY_QUERY_VALUE | KEY_WOW64_32KEY, &key);
-    if (openResult != ERROR_SUCCESS) {
-        log::Warn("No Win32 OpenXR ActiveRuntime registry key was found (HKLM\\SOFTWARE\\WOW6432Node\\Khronos\\OpenXR\\1). Windows error=" +
-            std::to_string(openResult) + ".");
-        return;
+    ReadWin32ImplicitApiLayers(HKEY_LOCAL_MACHINE, "HKLM", enabledImplicitLayers);
+    ReadWin32ImplicitApiLayers(HKEY_CURRENT_USER, "HKCU", enabledImplicitLayers);
+    if (enabledImplicitLayers.empty()) {
+        log::Info("No enabled Win32 implicit OpenXR API layers were found.");
     }
-
-    std::vector<wchar_t> activeRuntime(32768);
-    DWORD bytes = static_cast<DWORD>(activeRuntime.size() * sizeof(wchar_t));
-    const LONG readResult = RegGetValueW(key, nullptr, L"ActiveRuntime",
-        RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, nullptr, activeRuntime.data(), &bytes);
-    RegCloseKey(key);
-    if (readResult != ERROR_SUCCESS) {
-        log::Warn("The Win32 OpenXR registry key has no readable ActiveRuntime value. Windows error=" +
-            std::to_string(readResult) + ".");
-        return;
-    }
-
-    const std::wstring path = activeRuntime.data();
-    log::Info("Win32 OpenXR ActiveRuntime=" + Utf8(path.c_str()) +
-        (FileExists(path) ? "." : " (manifest file does not exist)."));
+    return enabledImplicitLayers;
 }
 
 std::string ModulePath(HMODULE module) {
@@ -236,6 +289,7 @@ struct VrBridge::Impl {
     bool initialized = false;
     bool permanentlyDisabled = false;
     bool startupFailureShown = false;
+    std::vector<std::string> enabledImplicitApiLayers;
     bool sessionRunning = false;
     bool copyFailureLogged = false;
     uint64_t frames = 0;
@@ -452,6 +506,26 @@ struct VrBridge::Impl {
         DestroyOpenXR();
         ShowStartupFailure(stage, error, guidance);
         return false;
+    }
+
+    std::string FileAccessFailureGuidance() const {
+        if (enabledImplicitApiLayers.empty()) {
+            return "OpenXR could not access or load a required file. No enabled Win32 implicit API layers were found, so repair or reinstall the active OpenXR runtime and inspect its own log.";
+        }
+
+        std::string guidance =
+            "OpenXR could not load a required file. An enabled Win32 implicit OpenXR API layer is the likely cause. Disable, remove, or reinstall the listed layer, then relaunch the game. Registry DWORD 0 means enabled.\n\nEnabled layer";
+        guidance += enabledImplicitApiLayers.size() == 1 ? ":\n" : "s:\n";
+        constexpr size_t maximumDisplayedLayers = 4;
+        const size_t displayedLayers = std::min(enabledImplicitApiLayers.size(), maximumDisplayedLayers);
+        for (size_t index = 0; index < displayedLayers; ++index) {
+            guidance += enabledImplicitApiLayers[index] + "\n";
+        }
+        if (enabledImplicitApiLayers.size() > displayedLayers) {
+            guidance += "...and " + std::to_string(enabledImplicitApiLayers.size() - displayedLayers) +
+                " more; see TMOXR.log.\n";
+        }
+        return guidance;
     }
 
     void EndActiveFrameWithoutLayers() {
@@ -977,7 +1051,7 @@ struct VrBridge::Impl {
         if (initialized || permanentlyDisabled) return initialized;
         if (!device) return false;
         log::Info("Beginning OpenXR initialization; Direct3D 9 frames will be uploaded to a D3D11 bridge device.");
-        LogOpenXrDiscovery();
+        enabledImplicitApiLayers = LogOpenXrDiscovery();
         loader = LoadLibraryW(L"openxr_loader.dll");
         if (!loader) {
             const DWORD error = GetLastError();
@@ -1037,6 +1111,11 @@ struct VrBridge::Impl {
         instanceInfo.enabledExtensionNames = enabledExtensions;
         const XrResult instanceResult = createInstance(&instanceInfo, &instance);
         if (!Check(instanceResult, "xrCreateInstance")) {
+            if (instanceResult == XR_ERROR_FILE_ACCESS_ERROR) {
+                const std::string guidance = FileAccessFailureGuidance();
+                log::Error(guidance);
+                return DisableAfterStartupFailure("creating the OpenXR instance", Result(instanceResult), guidance);
+            }
             return DisableAfterStartupFailure("creating the OpenXR instance", Result(instanceResult),
                 "Check that the selected Win32 OpenXR runtime is installed and running correctly.");
         }

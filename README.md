@@ -142,6 +142,7 @@ Common messages:
 
 - `Could not load the Win32 openxr_loader.dll`: run the install script or follow the manual Win32 loader steps above; ensure the DLL is the Win32 build rather than x64.
 - `XR_ERROR_RUNTIME_UNAVAILABLE (-51)`: the Win32 loader is present, but it could not find or load the registered Win32 OpenXR runtime. Check the `Win32 OpenXR ActiveRuntime=...` line immediately above it.
+- `XR_ERROR_FILE_ACCESS_ERROR (-32)` during `xrCreateInstance`: an enabled Win32 implicit OpenXR API layer may have a missing, inaccessible, or incompatible DLL. The dialog and log list all enabled layer manifests. Disable, remove, or reinstall the affected layer; a registry DWORD value of `0` means the layer is enabled.
 - `XR_ERROR_FORM_FACTOR_UNAVAILABLE (-35)`: the runtime loaded, but it cannot currently see a headset. Ensure the headset is connected through the runtime named by the `OpenXR runtime: ...` line. In particular, VDXR only sees headsets connected through Virtual Desktop, not Steam Link.
 - `XR_ERROR_API_VERSION_UNSUPPORTED (-4)`: the requested OpenXR API version is unsupported. Current builds request OpenXR 1.0; confirm that the deployed `d3d9.dll` is current.
 - `XR_KHR_D3D11_enable is unavailable`: switch to a Win32 OpenXR runtime that supports D3D11, such as VDXR.
