@@ -328,19 +328,11 @@ void ReadCameraSettings(bool reloaded) {
     const float legacyForward = ReadIniFloat(path, L"CockpitOffsetForward", -0.65f);
     for (size_t index = 0; index < kVehicleProfileCount; ++index) {
         auto& profile = g_cameraSettings.vehicleProfiles[index];
-        // Accept the short names emitted by the first profile build, but prefer
-        // the established CockpitOffset... spelling used by existing configs.
-        const float shortRight = ReadIniFloat(path, L"OffsetRight", legacyRight,
-            kVehicleProfileSections[index]);
-        const float shortUp = ReadIniFloat(path, L"OffsetUp", legacyUp,
-            kVehicleProfileSections[index]);
-        const float shortForward = ReadIniFloat(path, L"OffsetForward", legacyForward,
-            kVehicleProfileSections[index]);
-        profile.right.store(ReadIniFloat(path, L"CockpitOffsetRight", shortRight,
+        profile.right.store(ReadIniFloat(path, L"CockpitOffsetRight", legacyRight,
             kVehicleProfileSections[index]), std::memory_order_relaxed);
-        profile.up.store(ReadIniFloat(path, L"CockpitOffsetUp", shortUp,
+        profile.up.store(ReadIniFloat(path, L"CockpitOffsetUp", legacyUp,
             kVehicleProfileSections[index]), std::memory_order_relaxed);
-        profile.forward.store(ReadIniFloat(path, L"CockpitOffsetForward", shortForward,
+        profile.forward.store(ReadIniFloat(path, L"CockpitOffsetForward", legacyForward,
             kVehicleProfileSections[index]), std::memory_order_relaxed);
     }
     const float nearClip = std::clamp(ReadIniFloat(path, L"CockpitNearClip", 0.05f), 0.01f, 0.5f);

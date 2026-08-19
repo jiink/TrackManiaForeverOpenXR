@@ -107,7 +107,7 @@ The install script places `TMOXR.ini` beside `TmForever.exe`. It preserves exist
 - `CockpitNearClip`: nearest visible distance; the 0.05 m default keeps nearby cockpit geometry from being clipped.
 - `HorizonLock`: keeps the headset view level with the world while preserving the car's yaw. It releases smoothly between `HorizonLockReleaseStart` and `HorizonLockReleaseEnd` degrees of car tilt, follows the car through loops and inverted sections, then restores stabilization after the car returns upright.
 
-Each supplied profile has its own starting position. Tune the seven sections for their car interiors; saving `TMOXR.ini` reloads every profile automatically while the game is running. The shorter `OffsetRight`, `OffsetUp`, and `OffsetForward` spelling from the first profile build is also accepted for compatibility. Keys under `[Camera]` remain supported as fallbacks when a named section is absent. While camera 3 is selected, the mod also overrides TrackMania's request to hide the native player-vehicle model. Set `CockpitEnabled=0` to turn the feature off.
+Each supplied profile has its own starting position. Tune the seven sections for their car interiors; saving `TMOXR.ini` reloads every profile automatically while the game is running. Keys under `[Camera]` remain supported as fallbacks when a named section is absent. While camera 3 is selected, the mod also overrides TrackMania's request to hide the native player-vehicle model. Set `CockpitEnabled=0` to turn the feature off.
 
 ## Performance
 
