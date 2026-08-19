@@ -99,7 +99,7 @@ The loader package being version 1.1.62 does not require the application or acti
 
 Press camera key **3** (the numeric keypad key used by TrackMania, or a top-row 3 binding) to enable the VR driver-seat offset. Pressing camera keys 1, 2, or 4–7 disables it. The seat transform affects only the two headset views. The native-car visibility override is game-wide, so the monitor may also show parts of the car while camera 3 is selected.
 
-The install script places `TMOXR.ini` beside `TmForever.exe` without overwriting an existing copy. Its offsets are measured in metres in the camera's local axes:
+The install script places `TMOXR.ini` beside `TmForever.exe`. It preserves existing settings and adds any missing per-environment camera sections. The mod detects the active Stadium, Island, Desert, Rally, Bay, Coast, or Snow vehicle and selects the matching `[Camera.<Environment>]` section automatically. Each section contains offsets measured in metres in the camera's local axes:
 
 - `CockpitOffsetRight`: positive moves the viewpoint to the right.
 - `CockpitOffsetUp`: positive moves it upward.
@@ -107,7 +107,7 @@ The install script places `TMOXR.ini` beside `TmForever.exe` without overwriting
 - `CockpitNearClip`: nearest visible distance; the 0.05 m default keeps nearby cockpit geometry from being clipped.
 - `HorizonLock`: keeps the headset view level with the world while preserving the car's yaw. It releases smoothly between `HorizonLockReleaseStart` and `HorizonLockReleaseEnd` degrees of car tilt, follows the car through loops and inverted sections, then restores stabilization after the car returns upright.
 
-The supplied Stadium starting point is centered, 0.45 m lower, and 0.65 m behind TrackMania's camera-3 position. While camera 3 is selected, the mod also overrides TrackMania's request to hide the native player-vehicle model. Different environments and custom vehicle models have different dimensions, so adjust these values if the view lands inside bodywork. Saving `TMOXR.ini` reloads the cockpit settings automatically while the game is running. Set `CockpitEnabled=0` to turn the feature off.
+Each supplied profile has its own starting position. Tune the seven sections for their car interiors; saving `TMOXR.ini` reloads every profile automatically while the game is running. The shorter `OffsetRight`, `OffsetUp`, and `OffsetForward` spelling from the first profile build is also accepted for compatibility. Keys under `[Camera]` remain supported as fallbacks when a named section is absent. While camera 3 is selected, the mod also overrides TrackMania's request to hide the native player-vehicle model. Set `CockpitEnabled=0` to turn the feature off.
 
 ## Performance
 

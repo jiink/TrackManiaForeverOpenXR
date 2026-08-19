@@ -90,6 +90,27 @@ if ((Test-Path -LiteralPath $sourceConfiguration -PathType Leaf) -and
     Copy-Item -LiteralPath $sourceConfiguration -Destination $destinationConfiguration
     Write-Host "Installed editable VR camera configuration: '$destinationConfiguration'."
 }
+elseif ((Test-Path -LiteralPath $sourceConfiguration -PathType Leaf) -and
+        (Test-Path -LiteralPath $destinationConfiguration -PathType Leaf)) {
+    $sourceText = [System.IO.File]::ReadAllText($sourceConfiguration)
+    $destinationText = [System.IO.File]::ReadAllText($destinationConfiguration)
+    $addedSections = [System.Collections.Generic.List[string]]::new()
+    foreach ($section in @('Camera.Stadium', 'Camera.Island', 'Camera.Desert', 'Camera.Rally', 'Camera.Bay', 'Camera.Coast', 'Camera.Snow')) {
+        $escapedSection = [regex]::Escape($section)
+        if ($destinationText -match "(?im)^\s*\[$escapedSection\]\s*$") { continue }
+        $sectionMatch = [regex]::Match(
+            $sourceText,
+            "(?ims)^\s*\[$escapedSection\]\s*\r?\n.*?(?=^\s*\[|\z)")
+        if (-not $sectionMatch.Success) { continue }
+        $destinationText = $destinationText.TrimEnd() + [Environment]::NewLine + [Environment]::NewLine +
+            $sectionMatch.Value.Trim() + [Environment]::NewLine
+        $addedSections.Add($section)
+    }
+    if ($addedSections.Count -gt 0) {
+        [System.IO.File]::WriteAllText($destinationConfiguration, $destinationText)
+        Write-Host "Added missing vehicle camera sections to '$destinationConfiguration': $($addedSections -join ', ')."
+    }
+}
 
 $loaderIsWin32 = (Test-Path -LiteralPath $destinationLoader -PathType Leaf) -and
     ((Get-PeMachine -Path $destinationLoader) -eq $x86Machine)

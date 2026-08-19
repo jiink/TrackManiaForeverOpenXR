@@ -159,14 +159,37 @@ void LockGameWindowSize(HWND window) {
     tmoxr::log::Info("Locked the TrackMania window size while VR is active; moving and minimizing remain available.");
 }
 
+enum class VehicleProfile : uint32_t {
+    Stadium,
+    Island,
+    Desert,
+    Rally,
+    Bay,
+    Coast,
+    Snow,
+    Count
+};
+
+constexpr size_t kVehicleProfileCount = static_cast<size_t>(VehicleProfile::Count);
+constexpr std::array<const char*, kVehicleProfileCount> kVehicleProfileNames{
+    "Stadium", "Island", "Desert", "Rally", "Bay", "Coast", "Snow"};
+constexpr std::array<const wchar_t*, kVehicleProfileCount> kVehicleProfileSections{
+    L"Camera.Stadium", L"Camera.Island", L"Camera.Desert", L"Camera.Rally",
+    L"Camera.Bay", L"Camera.Coast", L"Camera.Snow"};
+
+struct CameraOffsetProfile {
+    std::atomic<float> right{0.0f};
+    std::atomic<float> up{-0.45f};
+    std::atomic<float> forward{-0.65f};
+};
+
 struct CameraSettings {
     std::atomic<bool> cockpitEnabled{true};
     // User-facing axes: positive X is right, positive Y is up, and positive Z
     // is forward. TrackMania's reflected projection requires X to be negated
     // when the offset is converted to its camera basis.
-    std::atomic<float> cockpitOffsetRight{0.0f};
-    std::atomic<float> cockpitOffsetUp{-0.45f};
-    std::atomic<float> cockpitOffsetForward{-0.65f};
+    std::array<CameraOffsetProfile, kVehicleProfileCount> vehicleProfiles;
+    std::atomic<VehicleProfile> activeVehicleProfile{VehicleProfile::Stadium};
     std::atomic<float> cockpitNearClip{0.05f};
     std::atomic<bool> horizonLock{true};
     std::atomic<float> horizonLockReleaseStart{35.0f};
@@ -188,6 +211,101 @@ VehicleSetVisibilityFn g_originalVehicleSetVisibility = nullptr;
 void** g_vehicleSetVisibilitySlot = nullptr;
 std::atomic<bool> g_vehicleVisibilityOverrideLogged = false;
 std::atomic<bool> g_horizonLockLogged = false;
+void* g_lastDetectedChallenge = nullptr;
+ULONGLONG g_nextVehicleDetectionAttempt = 0;
+bool g_vehicleDetectionFailureLogged = false;
+
+bool IsReadableRange(const void* address, size_t size) {
+    if (!address || !size) return false;
+    MEMORY_BASIC_INFORMATION memory{};
+    if (!VirtualQuery(address, &memory, sizeof(memory)) || memory.State != MEM_COMMIT) return false;
+    if ((memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) return false;
+    const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+    const uintptr_t end = reinterpret_cast<uintptr_t>(memory.BaseAddress) + memory.RegionSize;
+    return start <= end && size <= end - start;
+}
+
+bool ReadTrackManiaWideString(const void* owner, size_t offset, std::wstring& value) {
+    struct GameWideString {
+        int32_t length;
+        const wchar_t* characters;
+    } string{};
+    const auto* address = static_cast<const uint8_t*>(owner) + offset;
+    if (!IsReadableRange(address, sizeof(string))) return false;
+    std::memcpy(&string, address, sizeof(string));
+    if (string.length <= 0 || string.length > 64 ||
+        !IsReadableRange(string.characters, static_cast<size_t>(string.length) * sizeof(wchar_t))) return false;
+    value.assign(string.characters, static_cast<size_t>(string.length));
+    return true;
+}
+
+bool VehicleProfileFromCollectionName(const std::wstring& name, VehicleProfile& profile) {
+    constexpr std::array<const wchar_t*, kVehicleProfileCount> names{
+        L"Stadium", L"Island", L"Desert", L"Rally", L"Bay", L"Coast", L"Snow"};
+    for (size_t index = 0; index < names.size(); ++index) {
+        if (_wcsicmp(name.c_str(), names[index]) != 0) continue;
+        profile = static_cast<VehicleProfile>(index);
+        return true;
+    }
+    return false;
+}
+
+void DetectActiveVehicleProfile(void* game) {
+    if (!game) return;
+    // Verified against the supported United Forever executable and independently
+    // documented by ModTMNF: CGameApp::GetChallenge returns [this+0x198], the
+    // challenge's CGameCtnCollection* is +0x90, and its DisplayName StringInt is
+    // +0x48. These bounded reads replace the previous unsafe object-graph probe.
+    constexpr size_t challengeOffset = 0x198;
+    constexpr size_t collectionOffset = 0x90;
+    constexpr size_t displayNameOffset = 0x48;
+    void* challenge = nullptr;
+    const auto* challengeAddress = static_cast<const uint8_t*>(game) + challengeOffset;
+    if (!IsReadableRange(challengeAddress, sizeof(challenge))) return;
+    std::memcpy(&challenge, challengeAddress, sizeof(challenge));
+    if (!challenge) return;
+
+    const ULONGLONG now = GetTickCount64();
+    if (challenge == g_lastDetectedChallenge && now < g_nextVehicleDetectionAttempt) return;
+    g_nextVehicleDetectionAttempt = now + 1000;
+
+    void* collection = nullptr;
+    const auto* collectionAddress = static_cast<const uint8_t*>(challenge) + collectionOffset;
+    if (IsReadableRange(collectionAddress, sizeof(collection))) {
+        std::memcpy(&collection, collectionAddress, sizeof(collection));
+    }
+    std::wstring collectionName;
+    VehicleProfile detected = VehicleProfile::Stadium;
+    const bool found = collection && ReadTrackManiaWideString(collection, displayNameOffset, collectionName) &&
+        VehicleProfileFromCollectionName(collectionName, detected);
+    if (!found) {
+        if (!g_vehicleDetectionFailureLogged) {
+            g_vehicleDetectionFailureLogged = true;
+            std::ostringstream message;
+            message << "Could not identify the active challenge collection from its display name";
+            if (!collectionName.empty()) {
+                message << " (UTF-16 length " << collectionName.size() << ")";
+            }
+            message << "; retaining the current cockpit profile.";
+            tmoxr::log::Warn(message.str());
+        }
+        return;
+    }
+
+    const bool challengeChanged = challenge != g_lastDetectedChallenge;
+    g_lastDetectedChallenge = challenge;
+    g_vehicleDetectionFailureLogged = false;
+    const VehicleProfile previous = g_cameraSettings.activeVehicleProfile.exchange(detected, std::memory_order_relaxed);
+    if (previous == detected && !challengeChanged) return;
+    const size_t index = static_cast<size_t>(detected);
+    const auto& offset = g_cameraSettings.vehicleProfiles[index];
+    std::ostringstream message;
+    message << "Detected " << kVehicleProfileNames[index] << " challenge collection; cockpit offset right/up/forward=("
+            << offset.right.load(std::memory_order_relaxed) << ","
+            << offset.up.load(std::memory_order_relaxed) << ","
+            << offset.forward.load(std::memory_order_relaxed) << ") metres.";
+    tmoxr::log::Info(message.str());
+}
 
 float ReadIniFloat(const std::filesystem::path& path, const wchar_t* key, float defaultValue,
                    const wchar_t* section = L"Camera") {
@@ -203,9 +321,28 @@ float ReadIniFloat(const std::filesystem::path& path, const wchar_t* key, float 
 void ReadCameraSettings(bool reloaded) {
     const auto& path = g_cameraSettings.configurationPath;
     const bool enabled = GetPrivateProfileIntW(L"Camera", L"CockpitEnabled", 1, path.c_str()) != 0;
-    const float right = ReadIniFloat(path, L"CockpitOffsetRight", 0.0f);
-    const float up = ReadIniFloat(path, L"CockpitOffsetUp", -0.45f);
-    const float forward = ReadIniFloat(path, L"CockpitOffsetForward", -0.65f);
+    // Keep the original Camera keys as the fallback so an existing installation
+    // retains its Stadium calibration until the new named sections are added.
+    const float legacyRight = ReadIniFloat(path, L"CockpitOffsetRight", 0.0f);
+    const float legacyUp = ReadIniFloat(path, L"CockpitOffsetUp", -0.45f);
+    const float legacyForward = ReadIniFloat(path, L"CockpitOffsetForward", -0.65f);
+    for (size_t index = 0; index < kVehicleProfileCount; ++index) {
+        auto& profile = g_cameraSettings.vehicleProfiles[index];
+        // Accept the short names emitted by the first profile build, but prefer
+        // the established CockpitOffset... spelling used by existing configs.
+        const float shortRight = ReadIniFloat(path, L"OffsetRight", legacyRight,
+            kVehicleProfileSections[index]);
+        const float shortUp = ReadIniFloat(path, L"OffsetUp", legacyUp,
+            kVehicleProfileSections[index]);
+        const float shortForward = ReadIniFloat(path, L"OffsetForward", legacyForward,
+            kVehicleProfileSections[index]);
+        profile.right.store(ReadIniFloat(path, L"CockpitOffsetRight", shortRight,
+            kVehicleProfileSections[index]), std::memory_order_relaxed);
+        profile.up.store(ReadIniFloat(path, L"CockpitOffsetUp", shortUp,
+            kVehicleProfileSections[index]), std::memory_order_relaxed);
+        profile.forward.store(ReadIniFloat(path, L"CockpitOffsetForward", shortForward,
+            kVehicleProfileSections[index]), std::memory_order_relaxed);
+    }
     const float nearClip = std::clamp(ReadIniFloat(path, L"CockpitNearClip", 0.05f), 0.01f, 0.5f);
     const bool horizonLock = GetPrivateProfileIntW(L"Camera", L"HorizonLock", 1, path.c_str()) != 0;
     const float horizonReleaseStart =
@@ -219,9 +356,6 @@ void ReadCameraSettings(bool reloaded) {
     const bool verboseDiagnostics =
         GetPrivateProfileIntW(L"Diagnostics", L"Verbose", 0, path.c_str()) != 0;
     g_cameraSettings.cockpitEnabled.store(enabled, std::memory_order_relaxed);
-    g_cameraSettings.cockpitOffsetRight.store(right, std::memory_order_relaxed);
-    g_cameraSettings.cockpitOffsetUp.store(up, std::memory_order_relaxed);
-    g_cameraSettings.cockpitOffsetForward.store(forward, std::memory_order_relaxed);
     g_cameraSettings.cockpitNearClip.store(nearClip, std::memory_order_relaxed);
     g_cameraSettings.horizonLock.store(horizonLock, std::memory_order_relaxed);
     g_cameraSettings.horizonLockReleaseStart.store(horizonReleaseStart, std::memory_order_relaxed);
@@ -230,10 +364,15 @@ void ReadCameraSettings(bool reloaded) {
     g_cameraSettings.d3d9On12.store(d3d9On12, std::memory_order_relaxed);
     g_cameraSettings.verboseDiagnostics.store(verboseDiagnostics, std::memory_order_relaxed);
     tmoxr::VrBridge::Instance().SetVerboseDiagnostics(verboseDiagnostics);
+    const auto activeProfile = g_cameraSettings.activeVehicleProfile.load(std::memory_order_relaxed);
+    const auto& activeOffset = g_cameraSettings.vehicleProfiles[static_cast<size_t>(activeProfile)];
     tmoxr::log::Info(std::string(reloaded ? "Reloaded" : "Loaded") +
         " cockpit camera configuration: enabled=" + std::to_string(enabled) +
-        ", right/up/forward=(" + std::to_string(right) + "," + std::to_string(up) + "," +
-        std::to_string(forward) + ") metres, near clip=" + std::to_string(nearClip) +
+        ", active vehicle=" + kVehicleProfileNames[static_cast<size_t>(activeProfile)] +
+        ", right/up/forward=(" + std::to_string(activeOffset.right.load(std::memory_order_relaxed)) + "," +
+        std::to_string(activeOffset.up.load(std::memory_order_relaxed)) + "," +
+        std::to_string(activeOffset.forward.load(std::memory_order_relaxed)) +
+        ") metres, near clip=" + std::to_string(nearClip) +
         " metres, horizon lock=" + std::to_string(horizonLock) +
         ", adaptive release=" + std::to_string(horizonReleaseStart) + "-" +
         std::to_string(horizonReleaseEnd) + " degrees, mirror eye to desktop=" +
@@ -310,6 +449,9 @@ void __fastcall VehicleSetVisibilityHook(void* game, void*, void* vehicleMobil,
     // here as well or the first camera-3 hide request can arrive one frame
     // before the renderer has recorded the new camera mode.
     UpdateSelectedCameraFromKeyboard();
+    // The active challenge belongs to the game object, so any visibility update
+    // can safely refresh the environment without inspecting a vehicle instance.
+    if (visible == 0) DetectActiveVehicleProfile(game);
     if (CockpitCameraActive() && vehicleMobil && visible == 0) {
         visible = 1;
         if (!g_vehicleVisibilityOverrideLogged.exchange(true)) {
@@ -1176,9 +1318,12 @@ Matrix4 HeadViewMatrix(float eyeOffsetMeters) {
         g_stereo.haveHeadPose ? g_stereo.headPose.position[1] : 0.0f,
         g_stereo.haveHeadPose ? -g_stereo.headPose.position[2] : 0.0f};
     if (CockpitCameraActive()) {
-        cameraPosition[0] -= g_cameraSettings.cockpitOffsetRight.load(std::memory_order_relaxed);
-        cameraPosition[1] += g_cameraSettings.cockpitOffsetUp.load(std::memory_order_relaxed);
-        cameraPosition[2] += g_cameraSettings.cockpitOffsetForward.load(std::memory_order_relaxed);
+        const VehicleProfile activeProfile =
+            g_cameraSettings.activeVehicleProfile.load(std::memory_order_relaxed);
+        const auto& offset = g_cameraSettings.vehicleProfiles[static_cast<size_t>(activeProfile)];
+        cameraPosition[0] -= offset.right.load(std::memory_order_relaxed);
+        cameraPosition[1] += offset.up.load(std::memory_order_relaxed);
+        cameraPosition[2] += offset.forward.load(std::memory_order_relaxed);
     }
     // The eye offset is local to the headset and therefore rotates with it.
     for (UINT row = 0; row < 3; ++row) cameraPosition[row] += rotation[row][0] * eyeOffsetMeters;
