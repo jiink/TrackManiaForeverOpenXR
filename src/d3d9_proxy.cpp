@@ -52,7 +52,7 @@ bool IsTrackManiaGameProcess() {
     return _wcsicmp(fileName, L"TmForever.exe") == 0;
 }
 
-void LoadRealD3D9() {
+void LoadRealD3D9(bool reportLoad = true) {
     if (g_realD3D9) return;
     wchar_t systemDirectory[MAX_PATH]{};
     if (!GetSystemDirectoryW(systemDirectory, MAX_PATH)) {
@@ -70,7 +70,7 @@ void LoadRealD3D9() {
     g_create9On12 = reinterpret_cast<PFN_Direct3DCreate9On12>(
         GetProcAddress(g_realD3D9, "Direct3DCreate9On12"));
     g_perfSetOptions = reinterpret_cast<PerfSetOptionsFn>(GetProcAddress(g_realD3D9, "D3DPERF_SetOptions"));
-    tmoxr::log::Info("Loaded real Direct3D 9 from " + path.string());
+    if (reportLoad) tmoxr::log::Info("Loaded real Direct3D 9 from " + path.string());
 }
 
 using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
@@ -114,6 +114,10 @@ HWND g_lockedGameWindow = nullptr;
 WNDPROC g_originalGameWindowProcedure = nullptr;
 LONG g_lockedWindowWidth = 0;
 LONG g_lockedWindowHeight = 0;
+
+void RemoveDeviceHooks(IDirect3DDevice9* device);
+void DisableVrForIncompatibleGraphics(HWND owner, bool fullscreen,
+                                      D3DMULTISAMPLE_TYPE multisampleType, DWORD multisampleQuality);
 
 bool IsResizeHitTest(LRESULT hitTest) {
     return hitTest == HTLEFT || hitTest == HTRIGHT || hitTest == HTTOP || hitTest == HTBOTTOM ||
@@ -170,6 +174,18 @@ void LockGameWindowSize(HWND window) {
     tmoxr::log::Info("Locked the TrackMania window size while VR is active; moving and minimizing remain available.");
 }
 
+void UnlockGameWindowSize() {
+    const HWND window = g_lockedGameWindow;
+    const WNDPROC original = g_originalGameWindowProcedure;
+    if (window && original && IsWindow(window)) {
+        SetWindowLongPtrW(window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(original));
+    }
+    g_lockedGameWindow = nullptr;
+    g_originalGameWindowProcedure = nullptr;
+    g_lockedWindowWidth = 0;
+    g_lockedWindowHeight = 0;
+}
+
 enum class VehicleProfile : uint32_t {
     Stadium,
     Island,
@@ -222,6 +238,8 @@ VehicleSetVisibilityFn g_originalVehicleSetVisibility = nullptr;
 void** g_vehicleSetVisibilitySlot = nullptr;
 std::atomic<bool> g_vehicleVisibilityOverrideLogged = false;
 std::atomic<bool> g_horizonLockLogged = false;
+std::atomic<bool> g_vrDisabledForIncompatibleGraphics = false;
+std::atomic<bool> g_incompatibleGraphicsWarningShown = false;
 void* g_lastDetectedChallenge = nullptr;
 ULONGLONG g_nextVehicleDetectionAttempt = 0;
 bool g_vehicleDetectionFailureLogged = false;
@@ -1929,6 +1947,19 @@ HRESULT STDMETHODCALLTYPE EndSceneHook(IDirect3DDevice9* device) {
 }
 
 HRESULT STDMETHODCALLTYPE ResetHook(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* parameters) {
+    if (parameters && (parameters->Windowed == FALSE ||
+                       parameters->MultiSampleType != D3DMULTISAMPLE_NONE)) {
+        const ResetFn originalReset = g_originalReset;
+        DisableVrForIncompatibleGraphics(
+            parameters->hDeviceWindow ? parameters->hDeviceWindow : g_lockedGameWindow,
+            parameters->Windowed == FALSE, parameters->MultiSampleType, parameters->MultiSampleQuality);
+        tmoxr::VrBridge::Instance().OnBeforeReset();
+        ReleaseStereoResources();
+        tmoxr::VrBridge::Instance().Shutdown();
+        UnlockGameWindowSize();
+        RemoveDeviceHooks(device);
+        return originalReset(device, parameters);
+    }
     tmoxr::log::Info("IDirect3DDevice9::Reset intercepted; releasing OpenXR swapchains before reset.");
     tmoxr::VrBridge::Instance().OnBeforeReset();
     ReleaseStereoResources();
@@ -2244,6 +2275,85 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
     return true;
 }
 
+void RemoveDeviceHooks(IDirect3DDevice9* device) {
+    if (!device || !g_hooked.exchange(false)) return;
+    auto table = *reinterpret_cast<void***>(device);
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(&table[16], sizeof(void*) * 79, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        g_hooked.store(true, std::memory_order_relaxed);
+        tmoxr::log::Warn("Could not restore the native D3D9 vtable after disabling VR: " +
+                         std::to_string(GetLastError()) + ".");
+        return;
+    }
+    table[16] = reinterpret_cast<void*>(g_originalReset);
+    table[17] = reinterpret_cast<void*>(g_originalPresent);
+    table[37] = reinterpret_cast<void*>(g_originalSetRenderTarget);
+    table[39] = reinterpret_cast<void*>(g_originalSetDepthStencilSurface);
+    table[41] = reinterpret_cast<void*>(g_originalBeginScene);
+    table[42] = reinterpret_cast<void*>(g_originalEndScene);
+    table[43] = reinterpret_cast<void*>(g_originalClear);
+    table[44] = reinterpret_cast<void*>(g_originalSetTransform);
+    table[47] = reinterpret_cast<void*>(g_originalSetViewport);
+    table[81] = reinterpret_cast<void*>(g_originalDrawPrimitive);
+    table[82] = reinterpret_cast<void*>(g_originalDrawIndexedPrimitive);
+    table[83] = reinterpret_cast<void*>(g_originalDrawPrimitiveUP);
+    table[84] = reinterpret_cast<void*>(g_originalDrawIndexedPrimitiveUP);
+    table[92] = reinterpret_cast<void*>(g_originalSetVertexShader);
+    table[94] = reinterpret_cast<void*>(g_originalSetVertexShaderConstantF);
+    DWORD ignored = 0;
+    VirtualProtect(&table[16], sizeof(void*) * 79, oldProtect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), &table[16], sizeof(void*) * 79);
+    tmoxr::log::Info("Restored the native D3D9 device vtable after disabling VR.");
+}
+
+struct IncompatibleGraphicsWarning {
+    HWND gameWindow;
+    bool fullscreen;
+    bool antialiasing;
+};
+
+DWORD WINAPI ShowIncompatibleGraphicsWarning(void* context) {
+    auto* warning = static_cast<IncompatibleGraphicsWarning*>(context);
+    const HWND gameWindow = warning->gameWindow;
+    std::wstring message =
+        L"TrackMania OpenXR did not start because these graphics settings are incompatible with VR:\n\n";
+    if (warning->fullscreen) message += L"  - Fullscreen mode is enabled.\n";
+    if (warning->antialiasing) message += L"  - Anti-aliasing is enabled.\n";
+    delete warning;
+    message +=
+        L"\nOpen TmForeverLauncher.exe, select windowed mode, set anti-aliasing to None, "
+        L"and then restart TrackMania.\n\nThe game will continue on the desktop without VR.";
+    MessageBoxW(nullptr, message.c_str(), L"TrackMania OpenXR - incompatible graphics settings",
+                MB_OK | MB_ICONWARNING | MB_TASKMODAL | MB_SETFOREGROUND | MB_TOPMOST);
+    if (gameWindow && IsWindow(gameWindow)) SetForegroundWindow(gameWindow);
+    return 0;
+}
+
+void DisableVrForIncompatibleGraphics(HWND owner, bool fullscreen, D3DMULTISAMPLE_TYPE multisampleType,
+                                      DWORD multisampleQuality) {
+    g_vrDisabledForIncompatibleGraphics.store(true, std::memory_order_relaxed);
+    RemoveVehicleVisibilityHook();
+
+    std::ostringstream logMessage;
+    logMessage << "VR initialization blocked by incompatible TrackMania graphics settings: fullscreen="
+               << fullscreen << ", multisample type=" << static_cast<int>(multisampleType)
+               << ", quality=" << multisampleQuality
+               << ". The game will continue through native D3D9 without VR.";
+    tmoxr::log::Warn(logMessage.str());
+
+    if (g_incompatibleGraphicsWarningShown.exchange(true, std::memory_order_relaxed)) return;
+    auto* warning = new IncompatibleGraphicsWarning{
+        owner, fullscreen, multisampleType != D3DMULTISAMPLE_NONE};
+    HANDLE thread = CreateThread(nullptr, 0, &ShowIncompatibleGraphicsWarning, warning, 0, nullptr);
+    if (thread) {
+        CloseHandle(thread);
+    } else {
+        delete warning;
+        tmoxr::log::Warn("Could not create the incompatible-graphics warning thread: " +
+                         std::to_string(GetLastError()) + ".");
+    }
+}
+
 class D3D9Proxy final : public IDirect3D9 {
 public:
     explicit D3D9Proxy(IDirect3D9* real, IDirect3D9* nativeFallback = nullptr)
@@ -2273,9 +2383,33 @@ public:
     HRESULT STDMETHODCALLTYPE GetDeviceCaps(UINT a,D3DDEVTYPE t,D3DCAPS9* c) override { return real_->GetDeviceCaps(a,t,c); }
     HMONITOR STDMETHODCALLTYPE GetAdapterMonitor(UINT a) override { return real_->GetAdapterMonitor(a); }
     HRESULT STDMETHODCALLTYPE CreateDevice(UINT a,D3DDEVTYPE type,HWND window,DWORD flags,D3DPRESENT_PARAMETERS* parameters,IDirect3DDevice9** device) override {
-        if (!device) return D3DERR_INVALIDCALL;
+        if (!parameters || !device) return D3DERR_INVALIDCALL;
         *device = nullptr;
         const D3DPRESENT_PARAMETERS originalParameters = *parameters;
+        const bool fullscreen = parameters->Windowed == FALSE;
+        const bool antialiasing = parameters->MultiSampleType != D3DMULTISAMPLE_NONE;
+        if (fullscreen || antialiasing) {
+            DisableVrForIncompatibleGraphics(
+                parameters->hDeviceWindow ? parameters->hDeviceWindow : window,
+                fullscreen, parameters->MultiSampleType, parameters->MultiSampleQuality);
+            // Direct3DCreate9 may already have selected D3D9On12 before the game
+            // supplied its presentation settings. Restore native D3D9 as part
+            // of the non-VR fallback so this path behaves like vanilla.
+            if (nativeFallback_) {
+                real_->Release();
+                real_ = nativeFallback_;
+                nativeFallback_ = nullptr;
+            }
+            const HRESULT result = real_->CreateDevice(a, type, window, flags, parameters, device);
+            if (FAILED(result)) {
+                tmoxr::log::Error("Native desktop D3D9 device creation failed after VR was disabled: HRESULT=" +
+                    std::to_string(static_cast<long>(result)) + ".");
+            }
+            return result;
+        }
+        if (g_vrDisabledForIncompatibleGraphics.load(std::memory_order_relaxed)) {
+            return real_->CreateDevice(a, type, window, flags, parameters, device);
+        }
         HRESULT result = real_->CreateDevice(a,type,window,flags,parameters,device);
         if (FAILED(result) && nativeFallback_) {
             tmoxr::log::Warn("D3D9On12 device creation failed; retrying with native D3D9. HRESULT=" +
@@ -2311,7 +2445,7 @@ private:
 
 __declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT sdkVersion) {
     if (!IsTrackManiaGameProcess()) {
-        LoadRealD3D9();
+        LoadRealD3D9(false);
         return g_create9 ? g_create9(sdkVersion) : nullptr;
     }
     tmoxr::log::Initialize();
@@ -2339,7 +2473,7 @@ __declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT sdkVersion) {
 
 __declspec(dllexport) HRESULT WINAPI Direct3DCreate9Ex(UINT sdkVersion, IDirect3D9Ex** out) {
     if (!IsTrackManiaGameProcess()) {
-        LoadRealD3D9();
+        LoadRealD3D9(false);
         return g_create9Ex ? g_create9Ex(sdkVersion, out) : D3DERR_NOTAVAILABLE;
     }
     tmoxr::log::Initialize();
@@ -2350,12 +2484,13 @@ __declspec(dllexport) HRESULT WINAPI Direct3DCreate9Ex(UINT sdkVersion, IDirect3
 }
 
 extern "C" __declspec(dllexport) void WINAPI D3DPERF_SetOptions(DWORD options) {
-    LoadRealD3D9();
+    LoadRealD3D9(IsTrackManiaGameProcess());
     if (g_perfSetOptions) g_perfSetOptions(options);
 }
 
 extern "C" __declspec(dllexport) BOOL WINAPI TMOXR_GetGamepadState(tmoxr::GamepadState* state) {
     if (!IsTrackManiaGameProcess()) return FALSE;
+    if (g_vrDisabledForIncompatibleGraphics.load(std::memory_order_relaxed)) return FALSE;
     if (!state || state->size != sizeof(tmoxr::GamepadState)) return FALSE;
     return tmoxr::VrBridge::Instance().GetGamepadState(*state) ? TRUE : FALSE;
 }
