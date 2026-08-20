@@ -7,7 +7,7 @@ https://github.com/user-attachments/assets/5b76c802-7499-458f-a74e-979e9e26bcc3
 > ## AI made it.
 > ## This repo is 100% vibed/slopped up. I didn't write any of this, not even the rest of this readme! All I did was sit with my VR headset on and launch the game whenever AI finished its turn.
 > 
-> BTW, **you have to disable fullscreen and anti aliasing in the Trackmania options for this to work.** Current builds detect either incompatible setting, show a warning, and continue on the desktop without initializing VR.
+> BTW, **you have to disable fullscreen and anti aliasing in the Trackmania options, and the complete game window must fit within the monitor's usable area.** Current builds detect these incompatible conditions, show a warning, and continue on the desktop without initializing VR.
 > 
 > <img width="351" height="189" alt="image" src="https://github.com/user-attachments/assets/e39cf512-4586-4187-8dbd-8bc588ce553e" />
 >
@@ -140,7 +140,7 @@ Every launch replaces `TMOXR.log` beside `TmForever.exe`, so the file contains o
 
 If OpenXR initialization fails, the mod displays a one-time error dialog over the game with the failing stage, symbolic error name, and a suggested action. Dismiss it to continue playing on the monitor without VR; the complete details remain in `TMOXR.log`.
 
-Before OpenXR initialization, the mod also validates TrackMania's actual D3D9 presentation settings. Fullscreen mode or D3D9 multisample anti-aliasing produces a one-time modal explaining how to correct the launcher settings. In that case the game continues through native D3D9 without installing VR rendering or cockpit hooks.
+Before OpenXR initialization, the mod also validates TrackMania's actual D3D9 presentation settings. Fullscreen mode, D3D9 multisample anti-aliasing, or a requested window whose complete outer dimensions exceed the monitor's usable work area produces a one-time modal explaining how to correct the launcher settings. In that case the game continues on the desktop without installing VR rendering or cockpit hooks.
 
 Common messages:
 

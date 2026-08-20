@@ -115,9 +115,18 @@ WNDPROC g_originalGameWindowProcedure = nullptr;
 LONG g_lockedWindowWidth = 0;
 LONG g_lockedWindowHeight = 0;
 
+struct WindowFitResult {
+    bool tooLarge = false;
+    UINT requiredWidth = 0;
+    UINT requiredHeight = 0;
+    UINT availableWidth = 0;
+    UINT availableHeight = 0;
+};
+
 void RemoveDeviceHooks(IDirect3DDevice9* device);
 void DisableVrForIncompatibleGraphics(HWND owner, bool fullscreen,
-                                      D3DMULTISAMPLE_TYPE multisampleType, DWORD multisampleQuality);
+                                      D3DMULTISAMPLE_TYPE multisampleType, DWORD multisampleQuality,
+                                      const WindowFitResult& windowFit);
 
 bool IsResizeHitTest(LRESULT hitTest) {
     return hitTest == HTLEFT || hitTest == HTRIGHT || hitTest == HTTOP || hitTest == HTBOTTOM ||
@@ -184,6 +193,42 @@ void UnlockGameWindowSize() {
     g_originalGameWindowProcedure = nullptr;
     g_lockedWindowWidth = 0;
     g_lockedWindowHeight = 0;
+}
+
+WindowFitResult EvaluateWindowFit(HWND window, const D3DPRESENT_PARAMETERS& parameters) {
+    WindowFitResult result{};
+    if (parameters.Windowed == FALSE) return result;
+
+    LONG clientWidth = static_cast<LONG>(parameters.BackBufferWidth);
+    LONG clientHeight = static_cast<LONG>(parameters.BackBufferHeight);
+    if ((!clientWidth || !clientHeight) && window && IsWindow(window)) {
+        RECT client{};
+        if (GetClientRect(window, &client)) {
+            if (!clientWidth) clientWidth = client.right - client.left;
+            if (!clientHeight) clientHeight = client.bottom - client.top;
+        }
+    }
+    if (clientWidth <= 0 || clientHeight <= 0) return result;
+
+    RECT required{0, 0, clientWidth, clientHeight};
+    if (window && IsWindow(window)) {
+        const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE));
+        const DWORD extendedStyle = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_EXSTYLE));
+        AdjustWindowRectEx(&required, style, GetMenu(window) != nullptr, extendedStyle);
+    }
+    result.requiredWidth = static_cast<UINT>(std::max<LONG>(0, required.right - required.left));
+    result.requiredHeight = static_cast<UINT>(std::max<LONG>(0, required.bottom - required.top));
+
+    HMONITOR monitor = window && IsWindow(window)
+        ? MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST)
+        : MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO monitorInfo{sizeof(monitorInfo)};
+    if (!monitor || !GetMonitorInfoW(monitor, &monitorInfo)) return result;
+    result.availableWidth = static_cast<UINT>(monitorInfo.rcWork.right - monitorInfo.rcWork.left);
+    result.availableHeight = static_cast<UINT>(monitorInfo.rcWork.bottom - monitorInfo.rcWork.top);
+    result.tooLarge = result.requiredWidth > result.availableWidth ||
+                      result.requiredHeight > result.availableHeight;
+    return result;
 }
 
 enum class VehicleProfile : uint32_t {
@@ -1947,12 +1992,16 @@ HRESULT STDMETHODCALLTYPE EndSceneHook(IDirect3DDevice9* device) {
 }
 
 HRESULT STDMETHODCALLTYPE ResetHook(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* parameters) {
+    const HWND resetWindow = parameters && parameters->hDeviceWindow
+        ? parameters->hDeviceWindow : g_lockedGameWindow;
+    const WindowFitResult windowFit = parameters
+        ? EvaluateWindowFit(resetWindow, *parameters) : WindowFitResult{};
     if (parameters && (parameters->Windowed == FALSE ||
-                       parameters->MultiSampleType != D3DMULTISAMPLE_NONE)) {
+                       parameters->MultiSampleType != D3DMULTISAMPLE_NONE || windowFit.tooLarge)) {
         const ResetFn originalReset = g_originalReset;
         DisableVrForIncompatibleGraphics(
-            parameters->hDeviceWindow ? parameters->hDeviceWindow : g_lockedGameWindow,
-            parameters->Windowed == FALSE, parameters->MultiSampleType, parameters->MultiSampleQuality);
+            resetWindow, parameters->Windowed == FALSE,
+            parameters->MultiSampleType, parameters->MultiSampleQuality, windowFit);
         tmoxr::VrBridge::Instance().OnBeforeReset();
         ReleaseStereoResources();
         tmoxr::VrBridge::Instance().Shutdown();
@@ -2310,6 +2359,7 @@ struct IncompatibleGraphicsWarning {
     HWND gameWindow;
     bool fullscreen;
     bool antialiasing;
+    WindowFitResult windowFit;
 };
 
 DWORD WINAPI ShowIncompatibleGraphicsWarning(void* context) {
@@ -2319,10 +2369,19 @@ DWORD WINAPI ShowIncompatibleGraphicsWarning(void* context) {
         L"TrackMania OpenXR did not start because these graphics settings are incompatible with VR:\n\n";
     if (warning->fullscreen) message += L"  - Fullscreen mode is enabled.\n";
     if (warning->antialiasing) message += L"  - Anti-aliasing is enabled.\n";
+    if (warning->windowFit.tooLarge) {
+        message += L"  - The requested game window (" +
+            std::to_wstring(warning->windowFit.requiredWidth) + L" x " +
+            std::to_wstring(warning->windowFit.requiredHeight) +
+            L" including borders) is larger than this monitor's usable area (" +
+            std::to_wstring(warning->windowFit.availableWidth) + L" x " +
+            std::to_wstring(warning->windowFit.availableHeight) + L").\n";
+    }
     delete warning;
     message +=
         L"\nOpen TmForeverLauncher.exe, select windowed mode, set anti-aliasing to None, "
-        L"and then restart TrackMania.\n\nThe game will continue on the desktop without VR.";
+        L"choose a resolution whose complete window fits on the monitor, and then restart TrackMania."
+        L"\n\nThe game will continue on the desktop without VR.";
     MessageBoxW(nullptr, message.c_str(), L"TrackMania OpenXR - incompatible graphics settings",
                 MB_OK | MB_ICONWARNING | MB_TASKMODAL | MB_SETFOREGROUND | MB_TOPMOST);
     if (gameWindow && IsWindow(gameWindow)) SetForegroundWindow(gameWindow);
@@ -2330,20 +2389,22 @@ DWORD WINAPI ShowIncompatibleGraphicsWarning(void* context) {
 }
 
 void DisableVrForIncompatibleGraphics(HWND owner, bool fullscreen, D3DMULTISAMPLE_TYPE multisampleType,
-                                      DWORD multisampleQuality) {
+                                      DWORD multisampleQuality, const WindowFitResult& windowFit) {
     g_vrDisabledForIncompatibleGraphics.store(true, std::memory_order_relaxed);
     RemoveVehicleVisibilityHook();
 
     std::ostringstream logMessage;
     logMessage << "VR initialization blocked by incompatible TrackMania graphics settings: fullscreen="
                << fullscreen << ", multisample type=" << static_cast<int>(multisampleType)
-               << ", quality=" << multisampleQuality
-               << ". The game will continue through native D3D9 without VR.";
+               << ", quality=" << multisampleQuality << ", window required="
+               << windowFit.requiredWidth << "x" << windowFit.requiredHeight << ", monitor work area="
+               << windowFit.availableWidth << "x" << windowFit.availableHeight
+               << ". The game will continue on the desktop without VR.";
     tmoxr::log::Warn(logMessage.str());
 
     if (g_incompatibleGraphicsWarningShown.exchange(true, std::memory_order_relaxed)) return;
     auto* warning = new IncompatibleGraphicsWarning{
-        owner, fullscreen, multisampleType != D3DMULTISAMPLE_NONE};
+        owner, fullscreen, multisampleType != D3DMULTISAMPLE_NONE, windowFit};
     HANDLE thread = CreateThread(nullptr, 0, &ShowIncompatibleGraphicsWarning, warning, 0, nullptr);
     if (thread) {
         CloseHandle(thread);
@@ -2388,10 +2449,12 @@ public:
         const D3DPRESENT_PARAMETERS originalParameters = *parameters;
         const bool fullscreen = parameters->Windowed == FALSE;
         const bool antialiasing = parameters->MultiSampleType != D3DMULTISAMPLE_NONE;
-        if (fullscreen || antialiasing) {
+        const HWND deviceWindow = parameters->hDeviceWindow ? parameters->hDeviceWindow : window;
+        const WindowFitResult windowFit = EvaluateWindowFit(deviceWindow, *parameters);
+        if (fullscreen || antialiasing || windowFit.tooLarge) {
             DisableVrForIncompatibleGraphics(
-                parameters->hDeviceWindow ? parameters->hDeviceWindow : window,
-                fullscreen, parameters->MultiSampleType, parameters->MultiSampleQuality);
+                deviceWindow, fullscreen, parameters->MultiSampleType,
+                parameters->MultiSampleQuality, windowFit);
             // Direct3DCreate9 may already have selected D3D9On12 before the game
             // supplied its presentation settings. Restore native D3D9 as part
             // of the non-VR fallback so this path behaves like vanilla.
