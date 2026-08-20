@@ -30,6 +30,17 @@ GetGamepadStateFn g_getGamepadState = nullptr;
 LogInputMessageFn g_logInputMessage = nullptr;
 std::atomic_bool g_advertisedLogged = false;
 
+bool IsTrackManiaGameProcess() {
+    wchar_t executablePath[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(nullptr, executablePath, static_cast<DWORD>(std::size(executablePath)));
+    if (!length || length >= std::size(executablePath)) return false;
+    const wchar_t* fileName = executablePath;
+    for (const wchar_t* cursor = executablePath; *cursor; ++cursor) {
+        if (*cursor == L'\\' || *cursor == L'/') fileName = cursor + 1;
+    }
+    return _wcsicmp(fileName, L"TmForever.exe") == 0;
+}
+
 void ResolveBridge() {
     if (g_getGamepadState && g_logInputMessage) return;
     HMODULE bridge = GetModuleHandleW(L"d3d9.dll");
@@ -311,6 +322,10 @@ extern "C" __declspec(dllexport) HRESULT WINAPI DirectInput8Create(HINSTANCE ins
     LPVOID real = nullptr;
     const HRESULT result = g_realCreate(instance, version, interfaceId, &real, outer);
     if (FAILED(result) || !real) return result;
+    if (!IsTrackManiaGameProcess()) {
+        *output = real;
+        return result;
+    }
     if (interfaceId == IID_IDirectInput8A) *output = static_cast<IDirectInput8A*>(new DirectInputProxyA(static_cast<IDirectInput8A*>(real)));
     else if (interfaceId == IID_IDirectInput8W) *output = static_cast<IDirectInput8W*>(new DirectInputProxyW(static_cast<IDirectInput8W*>(real)));
     else *output = real;

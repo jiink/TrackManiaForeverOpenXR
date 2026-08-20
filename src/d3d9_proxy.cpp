@@ -41,6 +41,17 @@ Create9ExFn g_create9Ex = nullptr;
 PFN_Direct3DCreate9On12 g_create9On12 = nullptr;
 PerfSetOptionsFn g_perfSetOptions = nullptr;
 
+bool IsTrackManiaGameProcess() {
+    wchar_t executablePath[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(nullptr, executablePath, static_cast<DWORD>(std::size(executablePath)));
+    if (!length || length >= std::size(executablePath)) return false;
+    const wchar_t* fileName = executablePath;
+    for (const wchar_t* cursor = executablePath; *cursor; ++cursor) {
+        if (*cursor == L'\\' || *cursor == L'/') fileName = cursor + 1;
+    }
+    return _wcsicmp(fileName, L"TmForever.exe") == 0;
+}
+
 void LoadRealD3D9() {
     if (g_realD3D9) return;
     wchar_t systemDirectory[MAX_PATH]{};
@@ -2299,6 +2310,10 @@ private:
 } // namespace
 
 __declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT sdkVersion) {
+    if (!IsTrackManiaGameProcess()) {
+        LoadRealD3D9();
+        return g_create9 ? g_create9(sdkVersion) : nullptr;
+    }
     tmoxr::log::Initialize();
     LoadCameraSettings();
     InstallVehicleVisibilityHook();
@@ -2323,6 +2338,10 @@ __declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT sdkVersion) {
 }
 
 __declspec(dllexport) HRESULT WINAPI Direct3DCreate9Ex(UINT sdkVersion, IDirect3D9Ex** out) {
+    if (!IsTrackManiaGameProcess()) {
+        LoadRealD3D9();
+        return g_create9Ex ? g_create9Ex(sdkVersion, out) : D3DERR_NOTAVAILABLE;
+    }
     tmoxr::log::Initialize();
     LoadRealD3D9();
     if (!g_create9Ex) return D3DERR_NOTAVAILABLE;
@@ -2336,16 +2355,18 @@ extern "C" __declspec(dllexport) void WINAPI D3DPERF_SetOptions(DWORD options) {
 }
 
 extern "C" __declspec(dllexport) BOOL WINAPI TMOXR_GetGamepadState(tmoxr::GamepadState* state) {
+    if (!IsTrackManiaGameProcess()) return FALSE;
     if (!state || state->size != sizeof(tmoxr::GamepadState)) return FALSE;
     return tmoxr::VrBridge::Instance().GetGamepadState(*state) ? TRUE : FALSE;
 }
 
 extern "C" __declspec(dllexport) void WINAPI TMOXR_LogInputMessage(const char* message) {
+    if (!IsTrackManiaGameProcess()) return;
     if (message) tmoxr::log::Info(std::string("Input proxy: ") + message);
 }
 
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
-    if (reason == DLL_PROCESS_DETACH) {
+    if (reason == DLL_PROCESS_DETACH && IsTrackManiaGameProcess()) {
         RemoveVehicleVisibilityHook();
         tmoxr::VrBridge::Instance().Shutdown();
     }

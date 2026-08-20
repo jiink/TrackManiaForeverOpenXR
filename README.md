@@ -121,6 +121,8 @@ The mod tracks manual camera keys 1–7. While its camera state is initially unk
 
 The companion `dinput8.dll` adds a virtual controller named **Meta Quest Touch Virtual Gamepad** and continues forwarding every real DirectInput device. TrackMania can bind it like a conventional controller.
 
+Both proxy DLLs activate mod behavior only inside `TmForever.exe`. The vanilla `TmForeverLauncher.exe` receives direct pass-through to the system D3D9 and DirectInput runtimes, so it remains usable for changing pre-launch settings while the mod is installed.
+
 | Quest Touch input | Virtual Xbox-style input |
 | --- | --- |
 | Left / right thumbstick | Left / right stick |
