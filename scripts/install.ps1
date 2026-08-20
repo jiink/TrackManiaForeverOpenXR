@@ -2,7 +2,6 @@
 param(
     [string]$GamePath = 'C:\Program Files (x86)\Steam\steamapps\common\TrackMania United',
     [string]$ModDll,
-    [string]$InputDll,
     [switch]$RefreshOpenXrLoader
 )
 
@@ -13,10 +12,6 @@ $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 if ([string]::IsNullOrWhiteSpace($ModDll)) {
     $ModDll = Join-Path $scriptRoot '..\build\d3d9.dll'
 }
-if ([string]::IsNullOrWhiteSpace($InputDll)) {
-    $InputDll = Join-Path $scriptRoot '..\build\dinput8.dll'
-}
-
 $loaderVersion = '1.1.62'
 $loaderUri = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$loaderVersion/openxr_loader_windows-$loaderVersion.zip"
 $loaderArchiveSha256 = '800EC772E2F9448A26AB9F579F4914D984346DD9D0D7C007841ABE21D2C8FF2F'
@@ -43,12 +38,9 @@ function Get-PeMachine {
 
 $resolvedGamePath = [System.IO.Path]::GetFullPath($GamePath)
 $resolvedModDll = [System.IO.Path]::GetFullPath($ModDll)
-$resolvedInputDll = [System.IO.Path]::GetFullPath($InputDll)
 $gameExecutable = Join-Path $resolvedGamePath 'TmForever.exe'
 $destinationProxy = Join-Path $resolvedGamePath 'd3d9.dll'
 $proxyBackup = Join-Path $resolvedGamePath 'd3d9.before-tmoxr.dll'
-$destinationInputProxy = Join-Path $resolvedGamePath 'dinput8.dll'
-$inputProxyBackup = Join-Path $resolvedGamePath 'dinput8.before-tmoxr.dll'
 $destinationLoader = Join-Path $resolvedGamePath 'openxr_loader.dll'
 $sourceConfiguration = Join-Path $scriptRoot '..\TMOXR.ini'
 $destinationConfiguration = Join-Path $resolvedGamePath 'TMOXR.ini'
@@ -62,13 +54,6 @@ if (-not (Test-Path -LiteralPath $resolvedModDll -PathType Leaf)) {
 if ((Get-PeMachine -Path $resolvedModDll) -ne $x86Machine) {
     throw "'$resolvedModDll' is not a Win32 DLL. Build from an x86 MSVC environment."
 }
-if (-not (Test-Path -LiteralPath $resolvedInputDll -PathType Leaf)) {
-    throw "The virtual gamepad DLL was not found at '$resolvedInputDll'. Build target dinput8 first or pass -InputDll."
-}
-if ((Get-PeMachine -Path $resolvedInputDll) -ne $x86Machine) {
-    throw "'$resolvedInputDll' is not a Win32 DLL. Build from an x86 MSVC environment."
-}
-
 if ((Test-Path -LiteralPath $destinationProxy -PathType Leaf) -and
     -not (Test-Path -LiteralPath $proxyBackup)) {
     Copy-Item -LiteralPath $destinationProxy -Destination $proxyBackup
@@ -76,14 +61,6 @@ if ((Test-Path -LiteralPath $destinationProxy -PathType Leaf) -and
 }
 Copy-Item -LiteralPath $resolvedModDll -Destination $destinationProxy -Force
 Write-Host "Installed TrackMania OpenXR proxy: '$destinationProxy'."
-
-if ((Test-Path -LiteralPath $destinationInputProxy -PathType Leaf) -and
-    -not (Test-Path -LiteralPath $inputProxyBackup)) {
-    Copy-Item -LiteralPath $destinationInputProxy -Destination $inputProxyBackup
-    Write-Host "Preserved existing dinput8.dll as '$inputProxyBackup'."
-}
-Copy-Item -LiteralPath $resolvedInputDll -Destination $destinationInputProxy -Force
-Write-Host "Installed OpenXR virtual gamepad proxy: '$destinationInputProxy'."
 
 if ((Test-Path -LiteralPath $sourceConfiguration -PathType Leaf) -and
     -not (Test-Path -LiteralPath $destinationConfiguration -PathType Leaf)) {

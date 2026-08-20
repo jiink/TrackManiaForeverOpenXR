@@ -36,21 +36,6 @@ target_include_directories(d3d9 PRIVATE
 )
 target_link_libraries(d3d9 PRIVATE dxguid d3d11 dxgi)
 
-add_library(dinput8 SHARED
-  src/dinput8_proxy.cpp
-  src/dinput8_proxy.def
-)
-target_compile_features(dinput8 PRIVATE cxx_std_20)
-target_compile_definitions(dinput8 PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX DIRECTINPUT_VERSION=0x0800)
-target_include_directories(dinput8 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_link_libraries(dinput8 PRIVATE dxguid)
-set_target_properties(dinput8 PROPERTIES OUTPUT_NAME "dinput8" PREFIX "" SUFFIX ".dll")
-
-add_executable(dinput8_smoke EXCLUDE_FROM_ALL tests/dinput8_smoke.cpp)
-target_compile_features(dinput8_smoke PRIVATE cxx_std_20)
-target_compile_definitions(dinput8_smoke PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX DIRECTINPUT_VERSION=0x0800)
-target_link_libraries(dinput8_smoke PRIVATE dxguid)
-
 add_executable(d3d9on12_compat_smoke EXCLUDE_FROM_ALL tests/d3d9on12_compat_smoke.cpp)
 target_compile_features(d3d9on12_compat_smoke PRIVATE cxx_std_20)
 target_compile_definitions(d3d9on12_compat_smoke PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

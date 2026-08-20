@@ -2551,18 +2551,6 @@ extern "C" __declspec(dllexport) void WINAPI D3DPERF_SetOptions(DWORD options) {
     if (g_perfSetOptions) g_perfSetOptions(options);
 }
 
-extern "C" __declspec(dllexport) BOOL WINAPI TMOXR_GetGamepadState(tmoxr::GamepadState* state) {
-    if (!IsTrackManiaGameProcess()) return FALSE;
-    if (g_vrDisabledForIncompatibleGraphics.load(std::memory_order_relaxed)) return FALSE;
-    if (!state || state->size != sizeof(tmoxr::GamepadState)) return FALSE;
-    return tmoxr::VrBridge::Instance().GetGamepadState(*state) ? TRUE : FALSE;
-}
-
-extern "C" __declspec(dllexport) void WINAPI TMOXR_LogInputMessage(const char* message) {
-    if (!IsTrackManiaGameProcess()) return;
-    if (message) tmoxr::log::Info(std::string("Input proxy: ") + message);
-}
-
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_DETACH && IsTrackManiaGameProcess()) {
         RemoveVehicleVisibilityHook();

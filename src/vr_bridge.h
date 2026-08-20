@@ -1,7 +1,5 @@
 #pragma once
 
-#include "controller_state.h"
-
 #include <d3d9.h>
 #include <cstdint>
 
@@ -42,7 +40,6 @@ public:
     void SetUiSurface(IDirect3DSurface9* surface, HANDLE sharedHandle = nullptr);
     bool GetHeadPose(HeadPose& pose);
     bool GetRenderConfiguration(RenderConfiguration& configuration);
-    bool GetGamepadState(GamepadState& state);
     void SetVerboseDiagnostics(bool enabled);
     void Shutdown();
 
