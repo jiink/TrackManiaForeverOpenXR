@@ -651,6 +651,8 @@ struct StereoResources {
 #if TMOXR_EXPERIMENTAL_CULLING
     uint64_t clippingPlaneBuilds = 0;
     uint64_t disabledClippingFrustums = 0;
+    uint64_t portalVisibilityTests = 0;
+    uint64_t forcedPortalVisibility = 0;
 #endif
     bool customVertexShaderBound = false;
     IDirect3DVertexShader9* vertexShader = nullptr;
@@ -667,6 +669,7 @@ struct StereoResources {
 
 #if TMOXR_EXPERIMENTAL_CULLING
 using ComputeClippingPlanesFn = void(__thiscall*)(void*, void*, void*);
+using PortalIsVisibleFn = int(__thiscall*)(void*, void*, void*, void*);
 
 // Steam TMUF 2.11.26: CHmsViewport::SClippingFrustum::ComputePlaneEqs. The
 // ModTMNF symbol identifies the equivalent TMNF routine; the United body and
@@ -676,9 +679,22 @@ constexpr std::array<uint8_t, 5> kComputeClippingPlanesPrologue = {
     0x8B, 0x44, 0x24, 0x04, 0x56};
 constexpr size_t kComputeClippingPlanesPatchSize = kComputeClippingPlanesPrologue.size();
 constexpr size_t kClippingPlaneCountOffset = 0x1c;
+
+// Steam TMUF 2.11.26: CHmsPortal::IsVisible. UpdateVisibleZones calls this
+// with the camera's raw GmFrustum before the render trees are traversed. This
+// is a separate rejection path from SClippingFrustum and can prevent entire
+// connected zones from ever reaching D3D9.
+constexpr uintptr_t kPortalIsVisibleRva = 0x0014AFB0;
+constexpr std::array<uint8_t, 7> kPortalIsVisiblePrologue = {
+    0x8B, 0x44, 0x24, 0x08, 0x83, 0xEC, 0x74};
+constexpr size_t kPortalIsVisiblePatchSize = kPortalIsVisiblePrologue.size();
+
 ComputeClippingPlanesFn g_originalComputeClippingPlanes = nullptr;
 uint8_t* g_computeClippingPlanesTarget = nullptr;
 uint8_t* g_computeClippingPlanesTrampoline = nullptr;
+PortalIsVisibleFn g_originalPortalIsVisible = nullptr;
+uint8_t* g_portalIsVisibleTarget = nullptr;
+uint8_t* g_portalIsVisibleTrampoline = nullptr;
 
 void __fastcall ComputeClippingPlanesHook(void* clippingFrustum, void*,
                                           void* frustum, void* location) {
@@ -703,6 +719,86 @@ bool WriteRelativeJump(uint8_t* source, const void* destination) {
     const int32_t relative = static_cast<int32_t>(displacement);
     std::memcpy(source + 1, &relative, sizeof(relative));
     return true;
+}
+
+int __fastcall PortalIsVisibleHook(void* portal, void*, void* frustum,
+                                   void* cameraLocation, void* visibilityResult) {
+    const int originalResult =
+        g_originalPortalIsVisible(portal, frustum, cameraLocation, visibilityResult);
+    ++g_stereo.portalVisibilityTests;
+    if (!g_stereo.haveHeadPose || originalResult) return originalResult;
+
+    // Preserve the original routine's cache and bookkeeping work, then override
+    // only its rejection result. UpdateVisibleZones otherwise omits the zone and
+    // none of its track geometry can reach the later render-tree hooks.
+    if (visibilityResult) *static_cast<uint32_t*>(visibilityResult) = 1;
+    ++g_stereo.forcedPortalVisibility;
+    return 1;
+}
+
+bool InstallPortalVisibilityHook() {
+    if (g_originalPortalIsVisible) return true;
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    if (!module) return false;
+    auto* const target = reinterpret_cast<uint8_t*>(module + kPortalIsVisibleRva);
+    if (std::memcmp(target, kPortalIsVisiblePrologue.data(),
+                    kPortalIsVisiblePatchSize) != 0) {
+        tmoxr::log::Warn("The portal-visibility hook was not installed because this TmForever.exe does not match Steam 2.11.26.");
+        return false;
+    }
+
+    auto* const trampoline = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, kPortalIsVisiblePatchSize + 5, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!trampoline) {
+        tmoxr::log::Warn("VirtualAlloc failed while installing the portal-visibility hook: " +
+            std::to_string(GetLastError()));
+        return false;
+    }
+    std::memcpy(trampoline, target, kPortalIsVisiblePatchSize);
+    if (!WriteRelativeJump(trampoline + kPortalIsVisiblePatchSize,
+                           target + kPortalIsVisiblePatchSize)) {
+        VirtualFree(trampoline, 0, MEM_RELEASE);
+        return false;
+    }
+
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(target, kPortalIsVisiblePatchSize, PAGE_EXECUTE_READWRITE, &oldProtection)) {
+        tmoxr::log::Warn("VirtualProtect failed while installing the portal-visibility hook: " +
+            std::to_string(GetLastError()));
+        VirtualFree(trampoline, 0, MEM_RELEASE);
+        return false;
+    }
+    g_originalPortalIsVisible = reinterpret_cast<PortalIsVisibleFn>(trampoline);
+    const bool wroteJump = WriteRelativeJump(target, reinterpret_cast<void*>(&PortalIsVisibleHook));
+    DWORD ignored = 0;
+    VirtualProtect(target, kPortalIsVisiblePatchSize, oldProtection, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), target, kPortalIsVisiblePatchSize);
+    if (!wroteJump) {
+        g_originalPortalIsVisible = nullptr;
+        VirtualFree(trampoline, 0, MEM_RELEASE);
+        return false;
+    }
+
+    g_portalIsVisibleTarget = target;
+    g_portalIsVisibleTrampoline = trampoline;
+    tmoxr::log::Info("Installed CHmsPortal::IsVisible hook; portal-zone rejection will be overridden while VR tracking is active.");
+    return true;
+}
+
+void RemovePortalVisibilityHook() {
+    if (!g_portalIsVisibleTarget || !g_originalPortalIsVisible) return;
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(g_portalIsVisibleTarget, kPortalIsVisiblePatchSize,
+                        PAGE_EXECUTE_READWRITE, &oldProtection)) return;
+    std::memcpy(g_portalIsVisibleTarget, kPortalIsVisiblePrologue.data(),
+                kPortalIsVisiblePatchSize);
+    DWORD ignored = 0;
+    VirtualProtect(g_portalIsVisibleTarget, kPortalIsVisiblePatchSize, oldProtection, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), g_portalIsVisibleTarget, kPortalIsVisiblePatchSize);
+    if (g_portalIsVisibleTrampoline) VirtualFree(g_portalIsVisibleTrampoline, 0, MEM_RELEASE);
+    g_portalIsVisibleTarget = nullptr;
+    g_portalIsVisibleTrampoline = nullptr;
+    g_originalPortalIsVisible = nullptr;
 }
 
 bool InstallCullingFrustumHook() {
@@ -751,10 +847,11 @@ bool InstallCullingFrustumHook() {
     g_computeClippingPlanesTarget = target;
     g_computeClippingPlanesTrampoline = trampoline;
     tmoxr::log::Info("Installed SClippingFrustum plane hook; desktop-camera frustum rejection will be disabled while VR tracking is active.");
-    return true;
+    return InstallPortalVisibilityHook();
 }
 
 void RemoveCullingFrustumHook() {
+    RemovePortalVisibilityHook();
     if (!g_computeClippingPlanesTarget || !g_originalComputeClippingPlanes) return;
     DWORD oldProtection = 0;
     bool restored = false;
@@ -1772,7 +1869,10 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
 #if TMOXR_EXPERIMENTAL_CULLING
         tmoxr::log::Info("Clipping-plane hook diagnostic: builds=" +
             std::to_string(g_stereo.clippingPlaneBuilds) + ", disabled=" +
-            std::to_string(g_stereo.disabledClippingFrustums) + ".");
+            std::to_string(g_stereo.disabledClippingFrustums) +
+            "; portal visibility tests/rejections-forced=" +
+            std::to_string(g_stereo.portalVisibilityTests) + "/" +
+            std::to_string(g_stereo.forcedPortalVisibility) + ".");
 #endif
         UINT likelyRegister = 0;
         uint32_t likelyCount = 0;
