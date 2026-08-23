@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <intrin.h>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -651,8 +652,11 @@ struct StereoResources {
 #if TMOXR_EXPERIMENTAL_CULLING
     uint64_t clippingPlaneBuilds = 0;
     uint64_t disabledClippingFrustums = 0;
-    uint64_t portalVisibilityTests = 0;
-    uint64_t forcedPortalVisibility = 0;
+    std::array<uint64_t, 10> clippingPlaneBuildsByCallSite{};
+    uint64_t clippingPlaneBuildsUnknownCallSite = 0;
+    uint64_t renderTreeCalls = 0;
+    uint64_t renderTreeFrustumFlagged = 0;
+    uint64_t renderTreeFrustumBypassed = 0;
 #endif
     bool customVertexShaderBound = false;
     IDirect3DVertexShader9* vertexShader = nullptr;
@@ -669,7 +673,7 @@ struct StereoResources {
 
 #if TMOXR_EXPERIMENTAL_CULLING
 using ComputeClippingPlanesFn = void(__thiscall*)(void*, void*, void*);
-using PortalIsVisibleFn = int(__thiscall*)(void*, void*, void*, void*);
+using RenderTreeFn = int(__thiscall*)(void*, void*);
 
 // Steam TMUF 2.11.26: CHmsViewport::SClippingFrustum::ComputePlaneEqs. The
 // ModTMNF symbol identifies the equivalent TMNF routine; the United body and
@@ -679,36 +683,74 @@ constexpr std::array<uint8_t, 5> kComputeClippingPlanesPrologue = {
     0x8B, 0x44, 0x24, 0x04, 0x56};
 constexpr size_t kComputeClippingPlanesPatchSize = kComputeClippingPlanesPrologue.size();
 constexpr size_t kClippingPlaneCountOffset = 0x1c;
-
-// Steam TMUF 2.11.26: CHmsPortal::IsVisible. UpdateVisibleZones calls this
-// with the camera's raw GmFrustum before the render trees are traversed. This
-// is a separate rejection path from SClippingFrustum and can prevent entire
-// connected zones from ever reaching D3D9.
-constexpr uintptr_t kPortalIsVisibleRva = 0x0014AFB0;
-constexpr std::array<uint8_t, 7> kPortalIsVisiblePrologue = {
-    0x8B, 0x44, 0x24, 0x08, 0x83, 0xEC, 0x74};
-constexpr size_t kPortalIsVisiblePatchSize = kPortalIsVisiblePrologue.size();
+constexpr std::array<uintptr_t, 10> kClippingPlaneCallSiteReturnRvas = {
+    0x0012F705, 0x0012F7A7, 0x0058E7DA, 0x0058E967, 0x00590D74,
+    0x00592727, 0x00595126, 0x00595C36, 0x005975E5, 0x005ABB9C};
+constexpr size_t kWorldClippingPlaneCallSiteIndex = 3;
+constexpr uintptr_t kRenderTreeRva = 0x0012FD10;
+constexpr std::array<uint8_t, 6> kRenderTreePrologue = {
+    0x81, 0xEC, 0x04, 0x01, 0x00, 0x00};
+constexpr size_t kRenderTreePatchSize = kRenderTreePrologue.size();
+constexpr size_t kRenderTreeFlagsOffset = 0x9c;
+constexpr uint32_t kRenderTreeFrustumFlag = 0x2000;
 
 ComputeClippingPlanesFn g_originalComputeClippingPlanes = nullptr;
 uint8_t* g_computeClippingPlanesTarget = nullptr;
 uint8_t* g_computeClippingPlanesTrampoline = nullptr;
-PortalIsVisibleFn g_originalPortalIsVisible = nullptr;
-uint8_t* g_portalIsVisibleTarget = nullptr;
-uint8_t* g_portalIsVisibleTrampoline = nullptr;
+uintptr_t g_executableModuleBase = 0;
+RenderTreeFn g_originalRenderTree = nullptr;
+uint8_t* g_renderTreeTarget = nullptr;
+uint8_t* g_renderTreeTrampoline = nullptr;
 
 void __fastcall ComputeClippingPlanesHook(void* clippingFrustum, void*,
                                           void* frustum, void* location) {
+    const uintptr_t returnAddress = reinterpret_cast<uintptr_t>(_ReturnAddress());
     g_originalComputeClippingPlanes(clippingFrustum, frustum, location);
     ++g_stereo.clippingPlaneBuilds;
-    if (!g_stereo.haveHeadPose || !clippingFrustum) return;
+
+    const uintptr_t returnRva = returnAddress - g_executableModuleBase;
+    size_t callSiteIndex = kClippingPlaneCallSiteReturnRvas.size();
+    for (size_t i = 0; i < kClippingPlaneCallSiteReturnRvas.size(); ++i) {
+        if (returnRva == kClippingPlaneCallSiteReturnRvas[i]) {
+            callSiteIndex = i;
+            ++g_stereo.clippingPlaneBuildsByCallSite[i];
+            break;
+        }
+    }
+    if (callSiteIndex == kClippingPlaneCallSiteReturnRvas.size()) {
+        ++g_stereo.clippingPlaneBuildsUnknownCallSite;
+    }
+
+    if (!g_stereo.haveHeadPose || !clippingFrustum ||
+        callSiteIndex != kWorldClippingPlaneCallSiteIndex) return;
 
     // SClippingFrustum stores the number of active rejection planes here. A
     // zero-plane convex volume accepts every object, allowing the stereo replay
     // to decide visibility with its per-eye projection instead of the desktop
-    // camera. This intentionally disables CPU frustum rejection as a diagnostic.
+    // camera. Auxiliary clipping volumes (including shadows) remain untouched.
     *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(clippingFrustum) +
                                  kClippingPlaneCountOffset) = 0;
     ++g_stereo.disabledClippingFrustums;
+}
+
+int __fastcall RenderTreeHook(void* viewport, void*, void* tree) {
+    ++g_stereo.renderTreeCalls;
+    if (!tree || !g_stereo.haveHeadPose) return g_originalRenderTree(viewport, tree);
+
+    auto* const flags = reinterpret_cast<uint32_t*>(
+        static_cast<uint8_t*>(tree) + kRenderTreeFlagsOffset);
+    const uint32_t originalFlags = *flags;
+    if ((originalFlags & kRenderTreeFrustumFlag) == 0) {
+        return g_originalRenderTree(viewport, tree);
+    }
+
+    ++g_stereo.renderTreeFrustumFlagged;
+    *flags = originalFlags & ~kRenderTreeFrustumFlag;
+    ++g_stereo.renderTreeFrustumBypassed;
+    const int result = g_originalRenderTree(viewport, tree);
+    *flags = (*flags & ~kRenderTreeFrustumFlag) |
+             (originalFlags & kRenderTreeFrustumFlag);
+    return result;
 }
 
 bool WriteRelativeJump(uint8_t* source, const void* destination) {
@@ -721,84 +763,80 @@ bool WriteRelativeJump(uint8_t* source, const void* destination) {
     return true;
 }
 
-int __fastcall PortalIsVisibleHook(void* portal, void*, void* frustum,
-                                   void* cameraLocation, void* visibilityResult) {
-    const int originalResult =
-        g_originalPortalIsVisible(portal, frustum, cameraLocation, visibilityResult);
-    ++g_stereo.portalVisibilityTests;
-    if (!g_stereo.haveHeadPose || originalResult) return originalResult;
-
-    // Preserve the original routine's cache and bookkeeping work, then override
-    // only its rejection result. UpdateVisibleZones otherwise omits the zone and
-    // none of its track geometry can reach the later render-tree hooks.
-    if (visibilityResult) *static_cast<uint32_t*>(visibilityResult) = 1;
-    ++g_stereo.forcedPortalVisibility;
-    return 1;
-}
-
-bool InstallPortalVisibilityHook() {
-    if (g_originalPortalIsVisible) return true;
-    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-    if (!module) return false;
-    auto* const target = reinterpret_cast<uint8_t*>(module + kPortalIsVisibleRva);
-    if (std::memcmp(target, kPortalIsVisiblePrologue.data(),
-                    kPortalIsVisiblePatchSize) != 0) {
-        tmoxr::log::Warn("The portal-visibility hook was not installed because this TmForever.exe does not match Steam 2.11.26.");
+bool InstallRenderTreeHook(uintptr_t module) {
+    if (g_originalRenderTree) return true;
+    auto* const target = reinterpret_cast<uint8_t*>(module + kRenderTreeRva);
+    if (std::memcmp(target, kRenderTreePrologue.data(), kRenderTreePatchSize) != 0) {
+        tmoxr::log::Warn("The RenderTree hook was not installed because this TmForever.exe does not match Steam 2.11.26.");
         return false;
     }
 
     auto* const trampoline = static_cast<uint8_t*>(VirtualAlloc(
-        nullptr, kPortalIsVisiblePatchSize + 5, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+        nullptr, kRenderTreePatchSize + 5, MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE));
     if (!trampoline) {
-        tmoxr::log::Warn("VirtualAlloc failed while installing the portal-visibility hook: " +
+        tmoxr::log::Warn("VirtualAlloc failed while installing the RenderTree hook: " +
             std::to_string(GetLastError()));
         return false;
     }
-    std::memcpy(trampoline, target, kPortalIsVisiblePatchSize);
-    if (!WriteRelativeJump(trampoline + kPortalIsVisiblePatchSize,
-                           target + kPortalIsVisiblePatchSize)) {
+    std::memcpy(trampoline, target, kRenderTreePatchSize);
+    if (!WriteRelativeJump(trampoline + kRenderTreePatchSize,
+                           target + kRenderTreePatchSize)) {
         VirtualFree(trampoline, 0, MEM_RELEASE);
         return false;
     }
 
     DWORD oldProtection = 0;
-    if (!VirtualProtect(target, kPortalIsVisiblePatchSize, PAGE_EXECUTE_READWRITE, &oldProtection)) {
-        tmoxr::log::Warn("VirtualProtect failed while installing the portal-visibility hook: " +
+    if (!VirtualProtect(target, kRenderTreePatchSize, PAGE_EXECUTE_READWRITE,
+                        &oldProtection)) {
+        tmoxr::log::Warn("VirtualProtect failed while installing the RenderTree hook: " +
             std::to_string(GetLastError()));
         VirtualFree(trampoline, 0, MEM_RELEASE);
         return false;
     }
-    g_originalPortalIsVisible = reinterpret_cast<PortalIsVisibleFn>(trampoline);
-    const bool wroteJump = WriteRelativeJump(target, reinterpret_cast<void*>(&PortalIsVisibleHook));
+    g_originalRenderTree = reinterpret_cast<RenderTreeFn>(trampoline);
+    const bool wroteJump = WriteRelativeJump(
+        target, reinterpret_cast<void*>(&RenderTreeHook));
+    if (wroteJump && kRenderTreePatchSize > 5) {
+        std::memset(target + 5, 0x90, kRenderTreePatchSize - 5);
+    }
     DWORD ignored = 0;
-    VirtualProtect(target, kPortalIsVisiblePatchSize, oldProtection, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), target, kPortalIsVisiblePatchSize);
+    VirtualProtect(target, kRenderTreePatchSize, oldProtection, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), target, kRenderTreePatchSize);
     if (!wroteJump) {
-        g_originalPortalIsVisible = nullptr;
+        g_originalRenderTree = nullptr;
         VirtualFree(trampoline, 0, MEM_RELEASE);
         return false;
     }
 
-    g_portalIsVisibleTarget = target;
-    g_portalIsVisibleTrampoline = trampoline;
-    tmoxr::log::Info("Installed CHmsPortal::IsVisible hook; portal-zone rejection will be overridden while VR tracking is active.");
+    g_renderTreeTarget = target;
+    g_renderTreeTrampoline = trampoline;
+    tmoxr::log::Info("Installed CHmsViewport::RenderTree diagnostic hook; flagged per-tree frustum branches will be bypassed while VR tracking is active.");
     return true;
 }
 
-void RemovePortalVisibilityHook() {
-    if (!g_portalIsVisibleTarget || !g_originalPortalIsVisible) return;
+void RemoveRenderTreeHook() {
+    if (!g_renderTreeTarget || !g_originalRenderTree) return;
     DWORD oldProtection = 0;
-    if (!VirtualProtect(g_portalIsVisibleTarget, kPortalIsVisiblePatchSize,
-                        PAGE_EXECUTE_READWRITE, &oldProtection)) return;
-    std::memcpy(g_portalIsVisibleTarget, kPortalIsVisiblePrologue.data(),
-                kPortalIsVisiblePatchSize);
-    DWORD ignored = 0;
-    VirtualProtect(g_portalIsVisibleTarget, kPortalIsVisiblePatchSize, oldProtection, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), g_portalIsVisibleTarget, kPortalIsVisiblePatchSize);
-    if (g_portalIsVisibleTrampoline) VirtualFree(g_portalIsVisibleTrampoline, 0, MEM_RELEASE);
-    g_portalIsVisibleTarget = nullptr;
-    g_portalIsVisibleTrampoline = nullptr;
-    g_originalPortalIsVisible = nullptr;
+    bool restored = false;
+    if (VirtualProtect(g_renderTreeTarget, kRenderTreePatchSize,
+                       PAGE_EXECUTE_READWRITE, &oldProtection)) {
+        std::memcpy(g_renderTreeTarget, kRenderTreePrologue.data(),
+                    kRenderTreePatchSize);
+        DWORD ignored = 0;
+        VirtualProtect(g_renderTreeTarget, kRenderTreePatchSize, oldProtection,
+                       &ignored);
+        FlushInstructionCache(GetCurrentProcess(), g_renderTreeTarget,
+                              kRenderTreePatchSize);
+        restored = true;
+    }
+    if (!restored) return;
+    if (g_renderTreeTrampoline) {
+        VirtualFree(g_renderTreeTrampoline, 0, MEM_RELEASE);
+    }
+    g_renderTreeTarget = nullptr;
+    g_renderTreeTrampoline = nullptr;
+    g_originalRenderTree = nullptr;
 }
 
 bool InstallCullingFrustumHook() {
@@ -846,12 +884,14 @@ bool InstallCullingFrustumHook() {
 
     g_computeClippingPlanesTarget = target;
     g_computeClippingPlanesTrampoline = trampoline;
-    tmoxr::log::Info("Installed SClippingFrustum plane hook; desktop-camera frustum rejection will be disabled while VR tracking is active.");
-    return InstallPortalVisibilityHook();
+    g_executableModuleBase = module;
+    tmoxr::log::Info("Installed call-site-filtered SClippingFrustum hook; shadow clipping volumes will remain unchanged.");
+    InstallRenderTreeHook(module);
+    return true;
 }
 
 void RemoveCullingFrustumHook() {
-    RemovePortalVisibilityHook();
+    RemoveRenderTreeHook();
     if (!g_computeClippingPlanesTarget || !g_originalComputeClippingPlanes) return;
     DWORD oldProtection = 0;
     bool restored = false;
@@ -869,6 +909,7 @@ void RemoveCullingFrustumHook() {
     g_computeClippingPlanesTarget = nullptr;
     g_computeClippingPlanesTrampoline = nullptr;
     g_originalComputeClippingPlanes = nullptr;
+    g_executableModuleBase = 0;
 }
 #endif
 
@@ -1867,12 +1908,26 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
     ++g_stereo.presentedFrames;
     if (g_stereo.presentedFrames % 180 == 0) {
 #if TMOXR_EXPERIMENTAL_CULLING
+        std::ostringstream clippingCallSites;
+        for (size_t i = 0; i < g_stereo.clippingPlaneBuildsByCallSite.size(); ++i) {
+            if (i) clippingCallSites << '/';
+            clippingCallSites << std::hex << kClippingPlaneCallSiteReturnRvas[i]
+                              << std::dec << ':'
+                              << g_stereo.clippingPlaneBuildsByCallSite[i];
+        }
         tmoxr::log::Info("Clipping-plane hook diagnostic: builds=" +
             std::to_string(g_stereo.clippingPlaneBuilds) + ", disabled=" +
             std::to_string(g_stereo.disabledClippingFrustums) +
-            "; portal visibility tests/rejections-forced=" +
-            std::to_string(g_stereo.portalVisibilityTests) + "/" +
-            std::to_string(g_stereo.forcedPortalVisibility) + ".");
+            ", auxiliary preserved=" +
+            std::to_string(g_stereo.clippingPlaneBuilds -
+                           g_stereo.disabledClippingFrustums) +
+            "; call sites=" + clippingCallSites.str() +
+            ", unknown=" +
+            std::to_string(g_stereo.clippingPlaneBuildsUnknownCallSite) +
+            "; RenderTree calls/flagged/bypassed=" +
+            std::to_string(g_stereo.renderTreeCalls) + "/" +
+            std::to_string(g_stereo.renderTreeFrustumFlagged) + "/" +
+            std::to_string(g_stereo.renderTreeFrustumBypassed) + ".");
 #endif
         UINT likelyRegister = 0;
         uint32_t likelyCount = 0;
