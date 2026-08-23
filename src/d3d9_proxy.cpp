@@ -657,6 +657,7 @@ struct StereoResources {
     uint64_t renderTreeCalls = 0;
     uint64_t renderTreeFrustumFlagged = 0;
     uint64_t renderTreeFrustumBypassed = 0;
+    uint64_t renderTreeHmdRejected = 0;
 #endif
     bool customVertexShaderBound = false;
     IDirect3DVertexShader9* vertexShader = nullptr;
@@ -745,6 +746,109 @@ int __fastcall RenderTreeHook(void* viewport, void*, void* tree) {
     }
 
     ++g_stereo.renderTreeFrustumFlagged;
+
+    const auto* const bounds = reinterpret_cast<const float*>(
+        static_cast<const uint8_t*>(tree) + 0x34);
+    const float centerX = bounds[0];
+    const float centerY = bounds[1];
+    const float centerZ = bounds[2];
+    const float extentX = std::abs(bounds[3]);
+    const float extentY = std::abs(bounds[4]);
+    const float extentZ = std::abs(bounds[5]);
+    const float radius = std::sqrt(extentX * extentX + extentY * extentY +
+                                   extentZ * extentZ);
+
+    const auto* const viewportBytes = static_cast<const uint8_t*>(viewport);
+    const uint32_t locationDepth = *reinterpret_cast<const uint32_t*>(
+        viewportBytes + 0x538);
+    const auto* const locationEntries = *reinterpret_cast<uint8_t* const*>(
+        viewportBytes + 0x53c);
+    const float* camera = nullptr;
+    if (locationDepth && locationEntries) {
+        camera = reinterpret_cast<const float*>(
+            locationEntries + static_cast<size_t>(locationDepth - 1) * 0xa4 +
+            0x70);
+    }
+
+    bool hmdVisible = false;
+    if (camera && g_stereo.haveRenderConfiguration &&
+        std::isfinite(centerX) && std::isfinite(centerY) &&
+        std::isfinite(centerZ) && std::isfinite(radius)) {
+        // RenderTree itself uses the current location-stack entry at
+        // CHmsViewport+0x538. Its GmIso4 begins at entry+0x70. Apply the
+        // orthonormal inverse to move the world-space tree center into the
+        // exact camera space used by this particular tree traversal.
+        const float deltaX = centerX - camera[9];
+        const float deltaY = centerY - camera[10];
+        const float deltaZ = centerZ - camera[11];
+        const float viewX = camera[0] * deltaX + camera[3] * deltaY +
+                            camera[6] * deltaZ;
+        const float viewY = camera[1] * deltaX + camera[4] * deltaY +
+                            camera[7] * deltaZ;
+        const float viewZ = camera[2] * deltaX + camera[5] * deltaY +
+                            camera[8] * deltaZ;
+
+        const float x = g_stereo.headPose.orientation[0];
+        const float y = g_stereo.headPose.orientation[1];
+        const float z = g_stereo.headPose.orientation[2];
+        const float w = g_stereo.headPose.orientation[3];
+        const float rightHanded[3][3] = {
+            {1.0f - 2.0f * (y * y + z * z),
+             2.0f * (x * y - z * w), 2.0f * (x * z + y * w)},
+            {2.0f * (x * y + z * w),
+             1.0f - 2.0f * (x * x + z * z), 2.0f * (y * z - x * w)},
+            {2.0f * (x * z - y * w), 2.0f * (y * z + x * w),
+             1.0f - 2.0f * (x * x + y * y)}};
+        constexpr float reflection[3] = {1.0f, -1.0f, 1.0f};
+        float headRotation[3][3]{};
+        for (size_t row = 0; row < 3; ++row) {
+            for (size_t column = 0; column < 3; ++column) {
+                headRotation[row][column] = reflection[row] *
+                    rightHanded[row][column] * reflection[column];
+            }
+        }
+
+        const float trackedX = viewX * headRotation[0][0] +
+                               viewY * headRotation[1][0] +
+                               viewZ * headRotation[2][0];
+        const float trackedY = viewX * headRotation[0][1] +
+                               viewY * headRotation[1][1] +
+                               viewZ * headRotation[2][1];
+        const float trackedZ = viewX * headRotation[0][2] +
+                               viewY * headRotation[1][2] +
+                               viewZ * headRotation[2][2];
+
+        const auto& leftEye = g_stereo.renderConfiguration.eyes[0];
+        const auto& rightEye = g_stereo.renderConfiguration.eyes[1];
+        constexpr float kAngularSafetyMargin = 0.17f;
+        const float angleLeft = std::max(-1.45f,
+            std::min(leftEye.angleLeft, rightEye.angleLeft) -
+                kAngularSafetyMargin);
+        const float angleRight = std::min(1.45f,
+            std::max(leftEye.angleRight, rightEye.angleRight) +
+                kAngularSafetyMargin);
+        const float angleDown = std::max(-1.45f,
+            std::min(leftEye.angleDown, rightEye.angleDown) -
+                kAngularSafetyMargin);
+        const float angleUp = std::min(1.45f,
+            std::max(leftEye.angleUp, rightEye.angleUp) +
+                kAngularSafetyMargin);
+        const float leftSlope = std::tan(angleLeft);
+        const float rightSlope = std::tan(angleRight);
+        const float downSlope = std::tan(angleDown);
+        const float upSlope = std::tan(angleUp);
+        hmdVisible = trackedZ + radius > 0.05f &&
+            trackedX + radius >= trackedZ * leftSlope &&
+            trackedX - radius <= trackedZ * rightSlope &&
+            trackedY + radius >= trackedZ * downSlope &&
+            trackedY - radius <= trackedZ * upSlope;
+    }
+
+    if (!hmdVisible) {
+        ++g_stereo.renderTreeHmdRejected;
+        return g_originalRenderTree(viewport, tree);
+    }
+
     *flags = originalFlags & ~kRenderTreeFrustumFlag;
     ++g_stereo.renderTreeFrustumBypassed;
     const int result = g_originalRenderTree(viewport, tree);
@@ -1924,10 +2028,11 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
             "; call sites=" + clippingCallSites.str() +
             ", unknown=" +
             std::to_string(g_stereo.clippingPlaneBuildsUnknownCallSite) +
-            "; RenderTree calls/flagged/bypassed=" +
+            "; RenderTree calls/flagged/bypassed/HMD-rejected=" +
             std::to_string(g_stereo.renderTreeCalls) + "/" +
             std::to_string(g_stereo.renderTreeFrustumFlagged) + "/" +
-            std::to_string(g_stereo.renderTreeFrustumBypassed) + ".");
+            std::to_string(g_stereo.renderTreeFrustumBypassed) + "/" +
+            std::to_string(g_stereo.renderTreeHmdRejected) + ".");
 #endif
         UINT likelyRegister = 0;
         uint32_t likelyCount = 0;
