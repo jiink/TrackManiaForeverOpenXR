@@ -774,19 +774,16 @@ int __fastcall RenderTreeHook(void* viewport, void*, void* tree) {
     if (camera && g_stereo.haveRenderConfiguration &&
         std::isfinite(centerX) && std::isfinite(centerY) &&
         std::isfinite(centerZ) && std::isfinite(radius)) {
-        // RenderTree itself uses the current location-stack entry at
-        // CHmsViewport+0x538. Its GmIso4 begins at entry+0x70. Apply the
-        // orthonormal inverse to move the world-space tree center into the
-        // exact camera space used by this particular tree traversal.
-        const float deltaX = centerX - camera[9];
-        const float deltaY = centerY - camera[10];
-        const float deltaZ = centerZ - camera[11];
-        const float viewX = camera[0] * deltaX + camera[3] * deltaY +
-                            camera[6] * deltaZ;
-        const float viewY = camera[1] * deltaX + camera[4] * deltaY +
-                            camera[7] * deltaZ;
-        const float viewZ = camera[2] * deltaX + camera[5] * deltaY +
-                            camera[8] * deltaZ;
+        // RenderTree itself passes the current location-stack entry at
+        // CHmsViewport+0x538 to GmBox::Transform. Its GmIso4 begins at
+        // entry+0x70 and is already the world-to-viewport transform. Mirror
+        // the game's direct center transform exactly; do not invert it again.
+        const float viewX = camera[0] * centerX + camera[1] * centerY +
+                            camera[2] * centerZ + camera[9];
+        const float viewY = camera[3] * centerX + camera[4] * centerY +
+                            camera[5] * centerZ + camera[10];
+        const float viewZ = camera[6] * centerX + camera[7] * centerY +
+                            camera[8] * centerZ + camera[11];
 
         const float x = g_stereo.headPose.orientation[0];
         const float y = g_stereo.headPose.orientation[1];
