@@ -805,21 +805,18 @@ int __fastcall RenderTreeHook(void* viewport, void*, void* tree) {
             }
         }
 
-        // GmIso4 camera space looks down -Z and TrackMania's projection maps
-        // positive camera X to screen-left. OpenXR uses +Z forward and +X
-        // screen-right, so reflect both axes before applying the same tracked
-        // head rotation used by stereo rendering.
-        const float headsetSpaceX = -viewX;
-        const float headsetSpaceZ = -viewZ;
-        const float trackedX = headsetSpaceX * headRotation[0][0] +
+        // GmBox::Transform has already produced the viewport's camera-space
+        // center. Projection reflection is applied later by TrackMania and
+        // must not be folded into this visibility-space vector.
+        const float trackedX = viewX * headRotation[0][0] +
                                viewY * headRotation[1][0] +
-                               headsetSpaceZ * headRotation[2][0];
-        const float trackedY = headsetSpaceX * headRotation[0][1] +
+                               viewZ * headRotation[2][0];
+        const float trackedY = viewX * headRotation[0][1] +
                                viewY * headRotation[1][1] +
-                               headsetSpaceZ * headRotation[2][1];
-        const float trackedZ = headsetSpaceX * headRotation[0][2] +
+                               viewZ * headRotation[2][1];
+        const float trackedZ = viewX * headRotation[0][2] +
                                viewY * headRotation[1][2] +
-                               headsetSpaceZ * headRotation[2][2];
+                               viewZ * headRotation[2][2];
 
         const auto& leftEye = g_stereo.renderConfiguration.eyes[0];
         const auto& rightEye = g_stereo.renderConfiguration.eyes[1];
