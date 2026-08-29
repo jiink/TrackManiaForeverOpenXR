@@ -72,6 +72,7 @@ elseif ((Test-Path -LiteralPath $sourceConfiguration -PathType Leaf) -and
     $sourceText = [System.IO.File]::ReadAllText($sourceConfiguration)
     $destinationText = [System.IO.File]::ReadAllText($destinationConfiguration)
     $addedSections = [System.Collections.Generic.List[string]]::new()
+    $addedSettings = [System.Collections.Generic.List[string]]::new()
     foreach ($section in @('Camera.Stadium', 'Camera.Island', 'Camera.Desert', 'Camera.Rally', 'Camera.Bay', 'Camera.Coast', 'Camera.Snow')) {
         $escapedSection = [regex]::Escape($section)
         if ($destinationText -match "(?im)^\s*\[$escapedSection\]\s*$") { continue }
@@ -83,9 +84,36 @@ elseif ((Test-Path -LiteralPath $sourceConfiguration -PathType Leaf) -and
             $sectionMatch.Value.Trim() + [Environment]::NewLine
         $addedSections.Add($section)
     }
-    if ($addedSections.Count -gt 0) {
+
+    if ($destinationText -notmatch '(?im)^\s*FrustumCullingFix\s*=') {
+        $performanceHeader = [regex]::Match($destinationText, '(?im)^\s*\[Performance\]\s*$')
+        if ($performanceHeader.Success) {
+            $insertAt = $performanceHeader.Index + $performanceHeader.Length
+            $destinationText = $destinationText.Insert(
+                $insertAt, [Environment]::NewLine + 'FrustumCullingFix=0')
+            $addedSettings.Add('Performance.FrustumCullingFix')
+        }
+        else {
+            $performanceSection = [regex]::Match(
+                $sourceText,
+                '(?ims)^\s*\[Performance\]\s*\r?\n.*?(?=^\s*\[|\z)')
+            if ($performanceSection.Success) {
+                $destinationText = $destinationText.TrimEnd() + [Environment]::NewLine +
+                    [Environment]::NewLine + $performanceSection.Value.Trim() +
+                    [Environment]::NewLine
+                $addedSettings.Add('Performance.FrustumCullingFix')
+            }
+        }
+    }
+
+    if ($addedSections.Count -gt 0 -or $addedSettings.Count -gt 0) {
         [System.IO.File]::WriteAllText($destinationConfiguration, $destinationText)
-        Write-Host "Added missing vehicle camera sections to '$destinationConfiguration': $($addedSections -join ', ')."
+        if ($addedSections.Count -gt 0) {
+            Write-Host "Added missing vehicle camera sections to '$destinationConfiguration': $($addedSections -join ', ')."
+        }
+        if ($addedSettings.Count -gt 0) {
+            Write-Host "Added missing default settings to '$destinationConfiguration': $($addedSettings -join ', ')."
+        }
     }
 }
 

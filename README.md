@@ -58,7 +58,7 @@ cmake --build build --target d3d9
 
 CMake downloads the official Khronos OpenXR 1.1.62 headers while configuring. The mod does not link an OpenXR import library; it loads `openxr_loader.dll` dynamically at runtime.
 
-Normal builds compile out the unfinished camera-memory scanning and frustum-culling experiments. Developers can opt into that diagnostic code in a separate build with `-DTMOXR_EXPERIMENTAL_CULLING=ON`; DLLs intended for normal use or sharing should leave the option off.
+Normal builds include the optional headset-aligned frustum fix. It remains inactive unless `FrustumCullingFix=1` is set in `TMOXR.ini`.
 
 ## Install script
 
@@ -112,6 +112,8 @@ Each supplied profile has its own starting position. Tune the seven sections for
 The mod always honors the eye resolution recommended by the active OpenXR runtime. Adjust headset render resolution in Virtual Desktop, SteamVR, or the relevant runtime rather than applying a second scale in the mod.
 
 `MirrorEyeToDesktop=1` skips TrackMania's redundant original perspective draw, renders the two tracked headset eyes, and mirrors the completed center/left-eye scene through the game's normal post-processing path for the monitor. This reduces scene geometry work from three views to two. The setting reloads live when `TMOXR.ini` is saved; set it to `0` if a track or unusual post-processing effect does not mirror correctly.
+
+`FrustumCullingFix=1` makes TrackMania's CPU visibility volume follow the headset, preventing scenery from disappearing when looking far to either side or behind. It retains the game's normal six-plane culling, avoiding the severe performance cost of rendering the desktop camera's view and the headset view simultaneously. The fix is disabled by default because it hooks version-specific TrackMania rendering code; enable it under `[Performance]` when using the supported Steam United Forever 2.11.26 executable. The setting reloads live when `TMOXR.ini` is saved.
 
 The mod tracks manual camera keys 1–7. While its camera state is initially unknown, TrackMania's first native vehicle-hide request can identify a persisted camera 3 selection. This restores the cockpit offset and visible car before the first race frame without allowing unrelated visibility changes later in the race to disturb the camera.
 

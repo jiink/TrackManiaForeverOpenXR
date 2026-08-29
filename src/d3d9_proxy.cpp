@@ -27,10 +27,6 @@
 #include <utility>
 #include <vector>
 
-#ifndef TMOXR_EXPERIMENTAL_CULLING
-#define TMOXR_EXPERIMENTAL_CULLING 0
-#endif
-
 namespace {
 using Create9Fn = IDirect3D9* (WINAPI*)(UINT);
 using Create9ExFn = HRESULT (WINAPI*)(UINT, IDirect3D9Ex**);
@@ -269,6 +265,7 @@ struct CameraSettings {
     std::atomic<float> horizonLockReleaseEnd{70.0f};
     std::atomic<bool> mirrorEyeToDesktop{true};
     std::atomic<bool> d3d9On12{true};
+    std::atomic<bool> frustumCullingFix{false};
     std::atomic<bool> verboseDiagnostics{false};
     std::atomic<int> selectedCamera{0};
     std::array<std::atomic<bool>, 8> cameraKeyDown{};
@@ -420,6 +417,8 @@ void ReadCameraSettings(bool reloaded) {
         GetPrivateProfileIntW(L"Performance", L"MirrorEyeToDesktop", 1, path.c_str()) != 0;
     const bool d3d9On12 =
         GetPrivateProfileIntW(L"Performance", L"D3D9On12", 1, path.c_str()) != 0;
+    const bool frustumCullingFix =
+        GetPrivateProfileIntW(L"Performance", L"FrustumCullingFix", 0, path.c_str()) != 0;
     const bool verboseDiagnostics =
         GetPrivateProfileIntW(L"Diagnostics", L"Verbose", 0, path.c_str()) != 0;
     g_cameraSettings.cockpitEnabled.store(enabled, std::memory_order_relaxed);
@@ -429,6 +428,7 @@ void ReadCameraSettings(bool reloaded) {
     g_cameraSettings.horizonLockReleaseEnd.store(horizonReleaseEnd, std::memory_order_relaxed);
     g_cameraSettings.mirrorEyeToDesktop.store(mirrorEyeToDesktop, std::memory_order_relaxed);
     g_cameraSettings.d3d9On12.store(d3d9On12, std::memory_order_relaxed);
+    g_cameraSettings.frustumCullingFix.store(frustumCullingFix, std::memory_order_relaxed);
     g_cameraSettings.verboseDiagnostics.store(verboseDiagnostics, std::memory_order_relaxed);
     tmoxr::VrBridge::Instance().SetVerboseDiagnostics(verboseDiagnostics);
     const auto activeProfile = g_cameraSettings.activeVehicleProfile.load(std::memory_order_relaxed);
@@ -444,6 +444,7 @@ void ReadCameraSettings(bool reloaded) {
         ", adaptive release=" + std::to_string(horizonReleaseStart) + "-" +
         std::to_string(horizonReleaseEnd) + " degrees, mirror eye to desktop=" +
         std::to_string(mirrorEyeToDesktop) + ", D3D9On12=" + std::to_string(d3d9On12) +
+        ", frustum culling fix=" + std::to_string(frustumCullingFix) +
         ", verbose diagnostics=" +
         std::to_string(verboseDiagnostics) + ".");
 }
@@ -649,7 +650,6 @@ struct StereoResources {
     uint32_t skippedDesktopDraws = 0;
     uint32_t mirroredDesktopPasses = 0;
     uint64_t presentedFrames = 0;
-#if TMOXR_EXPERIMENTAL_CULLING
     uint64_t clippingPlaneBuilds = 0;
     uint64_t hmdAlignedClippingFrustums = 0;
     std::array<uint64_t, 10> clippingPlaneBuildsByCallSite{};
@@ -658,14 +658,12 @@ struct StereoResources {
     uint64_t renderTreeFrustumFlagged = 0;
     uint64_t renderTreeFrustumBypassed = 0;
     uint64_t renderTreeHmdRejected = 0;
-    uint64_t renderTreeDesktopPreserved = 0;
     float renderTreeHeadRotation[3][3]{};
     float renderTreeLeftSlope = 0.0f;
     float renderTreeRightSlope = 0.0f;
     float renderTreeDownSlope = 0.0f;
     float renderTreeUpSlope = 0.0f;
     bool renderTreeCullingValid = false;
-#endif
     bool customVertexShaderBound = false;
     IDirect3DVertexShader9* vertexShader = nullptr;
     std::vector<IDirect3DVertexShader9*> analyzedShaders;
@@ -679,7 +677,6 @@ struct StereoResources {
     bool ready = false;
 } g_stereo;
 
-#if TMOXR_EXPERIMENTAL_CULLING
 using ComputeClippingPlanesFn = void(__thiscall*)(void*, void*, void*);
 
 // Steam TMUF 2.11.26: CHmsViewport::SClippingFrustum::ComputePlaneEqs. The
@@ -711,7 +708,8 @@ uintptr_t g_renderTreeRejectedContinuation = 0;
 
 void UpdateRenderTreeCullingCache() {
     g_stereo.renderTreeCullingValid = false;
-    if (!g_stereo.haveHeadPose || !g_stereo.haveRenderConfiguration) return;
+    if (!g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed) ||
+        !g_stereo.haveHeadPose || !g_stereo.haveRenderConfiguration) return;
 
     const float x = g_stereo.headPose.orientation[0];
     const float y = g_stereo.headPose.orientation[1];
@@ -772,7 +770,8 @@ void __fastcall ComputeClippingPlanesHook(void* clippingFrustum, void*,
 
     void* clippingLocation = location;
     float hmdLocation[12]{};
-    if (callSiteIndex == kWorldClippingPlaneCallSiteIndex && location &&
+    if (g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed) &&
+        callSiteIndex == kWorldClippingPlaneCallSiteIndex && location &&
         g_stereo.renderTreeCullingValid) {
         const auto* const originalLocation = static_cast<const float*>(location);
         std::memcpy(hmdLocation, originalLocation, sizeof(hmdLocation));
@@ -800,7 +799,8 @@ void __fastcall ComputeClippingPlanesHook(void* clippingFrustum, void*,
 bool __cdecl IsRejectedRenderTreeVisibleToHmd(void* viewport, void* tree) {
     ++g_stereo.renderTreeCalls;
     ++g_stereo.renderTreeFrustumFlagged;
-    if (!viewport || !tree || !g_stereo.renderTreeCullingValid) {
+    if (!g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed) ||
+        !viewport || !tree || !g_stereo.renderTreeCullingValid) {
         ++g_stereo.renderTreeHmdRejected;
         return false;
     }
@@ -1060,7 +1060,6 @@ void RemoveCullingFrustumHook() {
     g_originalComputeClippingPlanes = nullptr;
     g_executableModuleBase = 0;
 }
-#endif
 
 void ReleasePrivateEyeTargets() {
     tmoxr::VrBridge::Instance().SetLeftEyeSurface(nullptr);
@@ -2056,7 +2055,7 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
     tmoxr::VrBridge::Instance().OnBeforePresent(device);
     ++g_stereo.presentedFrames;
     if (g_stereo.presentedFrames % 180 == 0) {
-#if TMOXR_EXPERIMENTAL_CULLING
+        if (g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed)) {
         std::ostringstream clippingCallSites;
         for (size_t i = 0; i < g_stereo.clippingPlaneBuildsByCallSite.size(); ++i) {
             if (i) clippingCallSites << '/';
@@ -2077,7 +2076,7 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
             std::to_string(g_stereo.renderTreeCalls) + "/" +
             std::to_string(g_stereo.renderTreeFrustumBypassed) + "/" +
             std::to_string(g_stereo.renderTreeHmdRejected) + ".");
-#endif
+        }
         UINT likelyRegister = 0;
         uint32_t likelyCount = 0;
         for (UINT registerIndex = 0; registerIndex < g_stereo.perspectiveMatrixCandidates.size(); ++registerIndex) {
@@ -2155,6 +2154,12 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
 
 HRESULT STDMETHODCALLTYPE BeginSceneHook(IDirect3DDevice9* device) {
     ReloadCameraSettingsIfChanged();
+    if (g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed)) {
+        InstallCullingFrustumHook();
+    }
+    else {
+        RemoveCullingFrustumHook();
+    }
     tmoxr::VrBridge::Instance().OnBeginScene();
     UpdateSelectedCameraFromKeyboard();
     g_stereo.haveHeadPose = tmoxr::VrBridge::Instance().GetHeadPose(g_stereo.headPose);
@@ -2162,9 +2167,7 @@ HRESULT STDMETHODCALLTYPE BeginSceneHook(IDirect3DDevice9* device) {
     if (tmoxr::VrBridge::Instance().GetRenderConfiguration(renderConfiguration)) {
         UpdateStereoRenderConfiguration(renderConfiguration);
     }
-#if TMOXR_EXPERIMENTAL_CULLING
     UpdateRenderTreeCullingCache();
-#endif
     const HRESULT result = g_originalBeginScene(device);
     g_stereo.sceneActive = SUCCEEDED(result);
     return result;
@@ -2700,9 +2703,9 @@ __declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT sdkVersion) {
     tmoxr::log::Initialize();
     LoadCameraSettings();
     InstallVehicleVisibilityHook();
-#if TMOXR_EXPERIMENTAL_CULLING
-    InstallCullingFrustumHook();
-#endif
+    if (g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed)) {
+        InstallCullingFrustumHook();
+    }
     LoadRealD3D9();
     if (!g_create9) return nullptr;
     IDirect3D9* real = nullptr;
@@ -2742,9 +2745,7 @@ extern "C" __declspec(dllexport) void WINAPI D3DPERF_SetOptions(DWORD options) {
 
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_DETACH && IsTrackManiaGameProcess()) {
-#if TMOXR_EXPERIMENTAL_CULLING
         RemoveCullingFrustumHook();
-#endif
         RemoveVehicleVisibilityHook();
         tmoxr::VrBridge::Instance().Shutdown();
     }
