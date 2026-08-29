@@ -28,6 +28,8 @@
 #include <vector>
 
 namespace {
+using Matrix4 = std::array<float, 16>;
+
 using Create9Fn = IDirect3D9* (WINAPI*)(UINT);
 using Create9ExFn = HRESULT (WINAPI*)(UINT, IDirect3D9Ex**);
 using PerfSetOptionsFn = void (WINAPI*)(DWORD);
@@ -706,6 +708,8 @@ uint8_t* g_renderTreeVisibilityBranchTarget = nullptr;
 uintptr_t g_renderTreeVisibleContinuation = 0;
 uintptr_t g_renderTreeRejectedContinuation = 0;
 
+Matrix4 HorizonCorrectionMatrix();
+
 void UpdateRenderTreeCullingCache() {
     g_stereo.renderTreeCullingValid = false;
     if (!g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed) ||
@@ -723,10 +727,25 @@ void UpdateRenderTreeCullingCache() {
         {2.0f * (x * z - y * w), 2.0f * (y * z + x * w),
          1.0f - 2.0f * (x * x + y * y)}};
     constexpr float reflection[3] = {1.0f, -1.0f, 1.0f};
+    float rawHeadRotation[3][3]{};
     for (size_t row = 0; row < 3; ++row) {
         for (size_t column = 0; column < 3; ++column) {
-            g_stereo.renderTreeHeadRotation[row][column] = reflection[row] *
+            rawHeadRotation[row][column] = reflection[row] *
                 rightHanded[row][column] * reflection[column];
+        }
+    }
+    // Rendering transforms vanilla camera space by Rhead^T * Chorizon. The
+    // culling code stores the inverse orientation used to map an HMD-local
+    // frustum back into vanilla camera space, so cache Chorizon^T * Rhead.
+    const Matrix4 horizonCorrection = HorizonCorrectionMatrix();
+    for (size_t row = 0; row < 3; ++row) {
+        for (size_t column = 0; column < 3; ++column) {
+            float value = 0.0f;
+            for (size_t inner = 0; inner < 3; ++inner) {
+                value += horizonCorrection[inner * 4 + row] *
+                         rawHeadRotation[inner][column];
+            }
+            g_stereo.renderTreeHeadRotation[row][column] = value;
         }
     }
 
@@ -1349,8 +1368,6 @@ void FlushDesktopEyeMirror(IDirect3DDevice9* device) {
     }
 }
 
-using Matrix4 = std::array<float, 16>;
-
 Matrix4 IdentityMatrix() {
     return {1.0f, 0.0f, 0.0f, 0.0f,
             0.0f, 1.0f, 0.0f, 0.0f,
@@ -1581,9 +1598,6 @@ Matrix4 HeadViewMatrix(float eyeOffsetMeters) {
         cameraPosition[1] += offset.up.load(std::memory_order_relaxed);
         cameraPosition[2] += offset.forward.load(std::memory_order_relaxed);
     }
-    // The eye offset is local to the headset and therefore rotates with it.
-    for (UINT row = 0; row < 3; ++row) cameraPosition[row] += rotation[row][0] * eyeOffsetMeters;
-
     Matrix4 view = IdentityMatrix();
     for (UINT row = 0; row < 3; ++row) {
         for (UINT column = 0; column < 3; ++column) view[row * 4 + column] = rotation[column][row];
@@ -1591,7 +1605,24 @@ Matrix4 HeadViewMatrix(float eyeOffsetMeters) {
                                rotation[1][row] * cameraPosition[1] +
                                rotation[2][row] * cameraPosition[2]);
     }
-    return MultiplyMatrix(view, HorizonCorrectionMatrix());
+    Matrix4 correctedView = MultiplyMatrix(view, HorizonCorrectionMatrix());
+    // Post-multiplying the horizon correction changes the view rotation but
+    // would otherwise retain the translation calculated for the uncorrected
+    // rotation. That moves the effective camera position around the vanilla
+    // camera-space origin on slopes. Recalculate translation from the final
+    // rotation so leveling pivots in place at the tracked head center (seat
+    // offset + headset translation).
+    for (UINT row = 0; row < 3; ++row) {
+        correctedView[row * 4 + 3] =
+            -(correctedView[row * 4] * cameraPosition[0] +
+              correctedView[row * 4 + 1] * cameraPosition[1] +
+              correctedView[row * 4 + 2] * cameraPosition[2]);
+    }
+    // Apply IPD only after horizon correction. Including it in the correction
+    // pivot holds each eye at a different world-space point and distorts the
+    // stereo baseline as the car pitches or rolls.
+    correctedView[3] -= eyeOffsetMeters;
+    return correctedView;
 }
 
 Matrix4 ApplyHeadPoseToCombinedMatrix(const Matrix4& original, float eyeOffsetMeters, bool rightEye) {
