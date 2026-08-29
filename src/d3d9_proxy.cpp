@@ -651,13 +651,20 @@ struct StereoResources {
     uint64_t presentedFrames = 0;
 #if TMOXR_EXPERIMENTAL_CULLING
     uint64_t clippingPlaneBuilds = 0;
-    uint64_t disabledClippingFrustums = 0;
+    uint64_t hmdAlignedClippingFrustums = 0;
     std::array<uint64_t, 10> clippingPlaneBuildsByCallSite{};
     uint64_t clippingPlaneBuildsUnknownCallSite = 0;
     uint64_t renderTreeCalls = 0;
     uint64_t renderTreeFrustumFlagged = 0;
     uint64_t renderTreeFrustumBypassed = 0;
     uint64_t renderTreeHmdRejected = 0;
+    uint64_t renderTreeDesktopPreserved = 0;
+    float renderTreeHeadRotation[3][3]{};
+    float renderTreeLeftSlope = 0.0f;
+    float renderTreeRightSlope = 0.0f;
+    float renderTreeDownSlope = 0.0f;
+    float renderTreeUpSlope = 0.0f;
+    bool renderTreeCullingValid = false;
 #endif
     bool customVertexShaderBound = false;
     IDirect3DVertexShader9* vertexShader = nullptr;
@@ -674,7 +681,6 @@ struct StereoResources {
 
 #if TMOXR_EXPERIMENTAL_CULLING
 using ComputeClippingPlanesFn = void(__thiscall*)(void*, void*, void*);
-using RenderTreeFn = int(__thiscall*)(void*, void*);
 
 // Steam TMUF 2.11.26: CHmsViewport::SClippingFrustum::ComputePlaneEqs. The
 // ModTMNF symbol identifies the equivalent TMNF routine; the United body and
@@ -683,32 +689,74 @@ constexpr uintptr_t kComputeClippingPlanesRva = 0x0012C940;
 constexpr std::array<uint8_t, 5> kComputeClippingPlanesPrologue = {
     0x8B, 0x44, 0x24, 0x04, 0x56};
 constexpr size_t kComputeClippingPlanesPatchSize = kComputeClippingPlanesPrologue.size();
-constexpr size_t kClippingPlaneCountOffset = 0x1c;
 constexpr std::array<uintptr_t, 10> kClippingPlaneCallSiteReturnRvas = {
     0x0012F705, 0x0012F7A7, 0x0058E7DA, 0x0058E967, 0x00590D74,
     0x00592727, 0x00595126, 0x00595C36, 0x005975E5, 0x005ABB9C};
 constexpr size_t kWorldClippingPlaneCallSiteIndex = 3;
-constexpr uintptr_t kRenderTreeRva = 0x0012FD10;
-constexpr std::array<uint8_t, 6> kRenderTreePrologue = {
-    0x81, 0xEC, 0x04, 0x01, 0x00, 0x00};
-constexpr size_t kRenderTreePatchSize = kRenderTreePrologue.size();
-constexpr size_t kRenderTreeFlagsOffset = 0x9c;
-constexpr uint32_t kRenderTreeFrustumFlag = 0x2000;
+constexpr uintptr_t kRenderTreeVisibilityBranchRva = 0x001301F6;
+constexpr std::array<uint8_t, 11> kRenderTreeVisibilityBranch = {
+    0x83, 0x7C, 0x24, 0x34, 0x00, 0x0F, 0x84, 0x6E, 0x0A, 0x00, 0x00};
+constexpr size_t kRenderTreeVisibilityBranchPatchSize =
+    kRenderTreeVisibilityBranch.size();
+constexpr uintptr_t kRenderTreeVisibleContinuationRva = 0x00130201;
+constexpr uintptr_t kRenderTreeRejectedContinuationRva = 0x00130C6F;
 
 ComputeClippingPlanesFn g_originalComputeClippingPlanes = nullptr;
 uint8_t* g_computeClippingPlanesTarget = nullptr;
 uint8_t* g_computeClippingPlanesTrampoline = nullptr;
 uintptr_t g_executableModuleBase = 0;
-RenderTreeFn g_originalRenderTree = nullptr;
-uint8_t* g_renderTreeTarget = nullptr;
-uint8_t* g_renderTreeTrampoline = nullptr;
+uint8_t* g_renderTreeVisibilityBranchTarget = nullptr;
+uintptr_t g_renderTreeVisibleContinuation = 0;
+uintptr_t g_renderTreeRejectedContinuation = 0;
+
+void UpdateRenderTreeCullingCache() {
+    g_stereo.renderTreeCullingValid = false;
+    if (!g_stereo.haveHeadPose || !g_stereo.haveRenderConfiguration) return;
+
+    const float x = g_stereo.headPose.orientation[0];
+    const float y = g_stereo.headPose.orientation[1];
+    const float z = g_stereo.headPose.orientation[2];
+    const float w = g_stereo.headPose.orientation[3];
+    const float rightHanded[3][3] = {
+        {1.0f - 2.0f * (y * y + z * z),
+         2.0f * (x * y - z * w), 2.0f * (x * z + y * w)},
+        {2.0f * (x * y + z * w),
+         1.0f - 2.0f * (x * x + z * z), 2.0f * (y * z - x * w)},
+        {2.0f * (x * z - y * w), 2.0f * (y * z + x * w),
+         1.0f - 2.0f * (x * x + y * y)}};
+    constexpr float reflection[3] = {1.0f, -1.0f, 1.0f};
+    for (size_t row = 0; row < 3; ++row) {
+        for (size_t column = 0; column < 3; ++column) {
+            g_stereo.renderTreeHeadRotation[row][column] = reflection[row] *
+                rightHanded[row][column] * reflection[column];
+        }
+    }
+
+    const auto& leftEye = g_stereo.renderConfiguration.eyes[0];
+    const auto& rightEye = g_stereo.renderConfiguration.eyes[1];
+    constexpr float kAngularSafetyMargin = 0.17f;
+    const float angleLeft = std::max(-1.45f,
+        std::min(leftEye.angleLeft, rightEye.angleLeft) -
+            kAngularSafetyMargin);
+    const float angleRight = std::min(1.45f,
+        std::max(leftEye.angleRight, rightEye.angleRight) +
+            kAngularSafetyMargin);
+    const float angleDown = std::max(-1.45f,
+        std::min(leftEye.angleDown, rightEye.angleDown) -
+            kAngularSafetyMargin);
+    const float angleUp = std::min(1.45f,
+        std::max(leftEye.angleUp, rightEye.angleUp) +
+            kAngularSafetyMargin);
+    g_stereo.renderTreeLeftSlope = std::tan(angleLeft);
+    g_stereo.renderTreeRightSlope = std::tan(angleRight);
+    g_stereo.renderTreeDownSlope = std::tan(angleDown);
+    g_stereo.renderTreeUpSlope = std::tan(angleUp);
+    g_stereo.renderTreeCullingValid = true;
+}
 
 void __fastcall ComputeClippingPlanesHook(void* clippingFrustum, void*,
                                           void* frustum, void* location) {
     const uintptr_t returnAddress = reinterpret_cast<uintptr_t>(_ReturnAddress());
-    g_originalComputeClippingPlanes(clippingFrustum, frustum, location);
-    ++g_stereo.clippingPlaneBuilds;
-
     const uintptr_t returnRva = returnAddress - g_executableModuleBase;
     size_t callSiteIndex = kClippingPlaneCallSiteReturnRvas.size();
     for (size_t i = 0; i < kClippingPlaneCallSiteReturnRvas.size(); ++i) {
@@ -722,30 +770,40 @@ void __fastcall ComputeClippingPlanesHook(void* clippingFrustum, void*,
         ++g_stereo.clippingPlaneBuildsUnknownCallSite;
     }
 
-    if (!g_stereo.haveHeadPose || !clippingFrustum ||
-        callSiteIndex != kWorldClippingPlaneCallSiteIndex) return;
-
-    // SClippingFrustum stores the number of active rejection planes here. A
-    // zero-plane convex volume accepts every object, allowing the stereo replay
-    // to decide visibility with its per-eye projection instead of the desktop
-    // camera. Auxiliary clipping volumes (including shadows) remain untouched.
-    *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(clippingFrustum) +
-                                 kClippingPlaneCountOffset) = 0;
-    ++g_stereo.disabledClippingFrustums;
-}
-
-int __fastcall RenderTreeHook(void* viewport, void*, void* tree) {
-    ++g_stereo.renderTreeCalls;
-    if (!tree || !g_stereo.haveHeadPose) return g_originalRenderTree(viewport, tree);
-
-    auto* const flags = reinterpret_cast<uint32_t*>(
-        static_cast<uint8_t*>(tree) + kRenderTreeFlagsOffset);
-    const uint32_t originalFlags = *flags;
-    if ((originalFlags & kRenderTreeFrustumFlag) == 0) {
-        return g_originalRenderTree(viewport, tree);
+    void* clippingLocation = location;
+    float hmdLocation[12]{};
+    if (callSiteIndex == kWorldClippingPlaneCallSiteIndex && location &&
+        g_stereo.renderTreeCullingValid) {
+        const auto* const originalLocation = static_cast<const float*>(location);
+        std::memcpy(hmdLocation, originalLocation, sizeof(hmdLocation));
+        const auto& headRotation = g_stereo.renderTreeHeadRotation;
+        // The supplied GmIso4 maps camera-local coordinates into world space.
+        // Compose the headset's local rotation on its right while retaining the
+        // vanilla camera origin. The resulting six-plane volume follows the
+        // HMD instead of representing a desktop/HMD union.
+        for (size_t row = 0; row < 3; ++row) {
+            for (size_t column = 0; column < 3; ++column) {
+                hmdLocation[row * 3 + column] =
+                    originalLocation[row * 3] * headRotation[0][column] +
+                    originalLocation[row * 3 + 1] * headRotation[1][column] +
+                    originalLocation[row * 3 + 2] * headRotation[2][column];
+            }
+        }
+        clippingLocation = hmdLocation;
+        ++g_stereo.hmdAlignedClippingFrustums;
     }
 
+    g_originalComputeClippingPlanes(clippingFrustum, frustum, clippingLocation);
+    ++g_stereo.clippingPlaneBuilds;
+}
+
+bool __cdecl IsRejectedRenderTreeVisibleToHmd(void* viewport, void* tree) {
+    ++g_stereo.renderTreeCalls;
     ++g_stereo.renderTreeFrustumFlagged;
+    if (!viewport || !tree || !g_stereo.renderTreeCullingValid) {
+        ++g_stereo.renderTreeHmdRejected;
+        return false;
+    }
 
     const auto* const bounds = reinterpret_cast<const float*>(
         static_cast<const uint8_t*>(tree) + 0x34);
@@ -771,7 +829,7 @@ int __fastcall RenderTreeHook(void* viewport, void*, void* tree) {
     }
 
     bool hmdVisible = false;
-    if (camera && g_stereo.haveRenderConfiguration &&
+    if (camera && g_stereo.renderTreeCullingValid &&
         std::isfinite(centerX) && std::isfinite(centerY) &&
         std::isfinite(centerZ) && std::isfinite(radius)) {
         // RenderTree itself passes the current location-stack entry at
@@ -784,26 +842,7 @@ int __fastcall RenderTreeHook(void* viewport, void*, void* tree) {
                             camera[5] * centerZ + camera[10];
         const float viewZ = camera[6] * centerX + camera[7] * centerY +
                             camera[8] * centerZ + camera[11];
-
-        const float x = g_stereo.headPose.orientation[0];
-        const float y = g_stereo.headPose.orientation[1];
-        const float z = g_stereo.headPose.orientation[2];
-        const float w = g_stereo.headPose.orientation[3];
-        const float rightHanded[3][3] = {
-            {1.0f - 2.0f * (y * y + z * z),
-             2.0f * (x * y - z * w), 2.0f * (x * z + y * w)},
-            {2.0f * (x * y + z * w),
-             1.0f - 2.0f * (x * x + z * z), 2.0f * (y * z - x * w)},
-            {2.0f * (x * z - y * w), 2.0f * (y * z + x * w),
-             1.0f - 2.0f * (x * x + y * y)}};
-        constexpr float reflection[3] = {1.0f, -1.0f, 1.0f};
-        float headRotation[3][3]{};
-        for (size_t row = 0; row < 3; ++row) {
-            for (size_t column = 0; column < 3; ++column) {
-                headRotation[row][column] = reflection[row] *
-                    rightHanded[row][column] * reflection[column];
-            }
-        }
+        const auto& headRotation = g_stereo.renderTreeHeadRotation;
 
         // GmBox::Transform has already produced the viewport's camera-space
         // center. Projection reflection is applied later by TrackMania and
@@ -817,26 +856,10 @@ int __fastcall RenderTreeHook(void* viewport, void*, void* tree) {
         const float trackedZ = viewX * headRotation[0][2] +
                                viewY * headRotation[1][2] +
                                viewZ * headRotation[2][2];
-
-        const auto& leftEye = g_stereo.renderConfiguration.eyes[0];
-        const auto& rightEye = g_stereo.renderConfiguration.eyes[1];
-        constexpr float kAngularSafetyMargin = 0.17f;
-        const float angleLeft = std::max(-1.45f,
-            std::min(leftEye.angleLeft, rightEye.angleLeft) -
-                kAngularSafetyMargin);
-        const float angleRight = std::min(1.45f,
-            std::max(leftEye.angleRight, rightEye.angleRight) +
-                kAngularSafetyMargin);
-        const float angleDown = std::max(-1.45f,
-            std::min(leftEye.angleDown, rightEye.angleDown) -
-                kAngularSafetyMargin);
-        const float angleUp = std::min(1.45f,
-            std::max(leftEye.angleUp, rightEye.angleUp) +
-                kAngularSafetyMargin);
-        const float leftSlope = std::tan(angleLeft);
-        const float rightSlope = std::tan(angleRight);
-        const float downSlope = std::tan(angleDown);
-        const float upSlope = std::tan(angleUp);
+        const float leftSlope = g_stereo.renderTreeLeftSlope;
+        const float rightSlope = g_stereo.renderTreeRightSlope;
+        const float downSlope = g_stereo.renderTreeDownSlope;
+        const float upSlope = g_stereo.renderTreeUpSlope;
         hmdVisible = trackedZ + radius > 0.05f &&
             trackedX + radius >= trackedZ * leftSlope &&
             trackedX - radius <= trackedZ * rightSlope &&
@@ -846,15 +869,44 @@ int __fastcall RenderTreeHook(void* viewport, void*, void* tree) {
 
     if (!hmdVisible) {
         ++g_stereo.renderTreeHmdRejected;
-        return g_originalRenderTree(viewport, tree);
+        return false;
     }
 
-    *flags = originalFlags & ~kRenderTreeFrustumFlag;
     ++g_stereo.renderTreeFrustumBypassed;
-    const int result = g_originalRenderTree(viewport, tree);
-    *flags = (*flags & ~kRenderTreeFrustumFlag) |
-             (originalFlags & kRenderTreeFrustumFlag);
-    return result;
+    return true;
+}
+
+// Entered in CHmsViewport::RenderTree immediately after TrackMania has
+// computed its own per-tree visibility result. Accepted trees stay entirely
+// on the vanilla path. Only genuine vanilla rejects call the HMD test; a
+// successful rescue changes the local visibility value and rejoins the normal
+// rendering path without mutating persistent tree flags.
+__declspec(naked) void RenderTreeVisibilityBranchHook() {
+    __asm {
+        cmp dword ptr [esp + 34h], 0
+        jne vanillaVisible
+
+        pushfd
+        pushad
+        push edi
+        push ebp
+        call IsRejectedRenderTreeVisibleToHmd
+        add esp, 8
+        test al, al
+        jz hmdRejected
+        popad
+        popfd
+        mov dword ptr [esp + 34h], 1
+        jmp dword ptr [g_renderTreeVisibleContinuation]
+
+    hmdRejected:
+        popad
+        popfd
+        jmp dword ptr [g_renderTreeRejectedContinuation]
+
+    vanillaVisible:
+        jmp dword ptr [g_renderTreeVisibleContinuation]
+    }
 }
 
 bool WriteRelativeJump(uint8_t* source, const void* destination) {
@@ -868,79 +920,72 @@ bool WriteRelativeJump(uint8_t* source, const void* destination) {
 }
 
 bool InstallRenderTreeHook(uintptr_t module) {
-    if (g_originalRenderTree) return true;
-    auto* const target = reinterpret_cast<uint8_t*>(module + kRenderTreeRva);
-    if (std::memcmp(target, kRenderTreePrologue.data(), kRenderTreePatchSize) != 0) {
-        tmoxr::log::Warn("The RenderTree hook was not installed because this TmForever.exe does not match Steam 2.11.26.");
-        return false;
-    }
-
-    auto* const trampoline = static_cast<uint8_t*>(VirtualAlloc(
-        nullptr, kRenderTreePatchSize + 5, MEM_COMMIT | MEM_RESERVE,
-        PAGE_EXECUTE_READWRITE));
-    if (!trampoline) {
-        tmoxr::log::Warn("VirtualAlloc failed while installing the RenderTree hook: " +
-            std::to_string(GetLastError()));
-        return false;
-    }
-    std::memcpy(trampoline, target, kRenderTreePatchSize);
-    if (!WriteRelativeJump(trampoline + kRenderTreePatchSize,
-                           target + kRenderTreePatchSize)) {
-        VirtualFree(trampoline, 0, MEM_RELEASE);
+    if (g_renderTreeVisibilityBranchTarget) return true;
+    auto* const target = reinterpret_cast<uint8_t*>(
+        module + kRenderTreeVisibilityBranchRva);
+    if (std::memcmp(target, kRenderTreeVisibilityBranch.data(),
+                    kRenderTreeVisibilityBranchPatchSize) != 0) {
+        tmoxr::log::Warn("The RenderTree visibility-branch hook was not installed because this TmForever.exe does not match Steam 2.11.26.");
         return false;
     }
 
     DWORD oldProtection = 0;
-    if (!VirtualProtect(target, kRenderTreePatchSize, PAGE_EXECUTE_READWRITE,
+    if (!VirtualProtect(target, kRenderTreeVisibilityBranchPatchSize,
+                        PAGE_EXECUTE_READWRITE,
                         &oldProtection)) {
-        tmoxr::log::Warn("VirtualProtect failed while installing the RenderTree hook: " +
+        tmoxr::log::Warn("VirtualProtect failed while installing the RenderTree visibility-branch hook: " +
             std::to_string(GetLastError()));
-        VirtualFree(trampoline, 0, MEM_RELEASE);
         return false;
     }
-    g_originalRenderTree = reinterpret_cast<RenderTreeFn>(trampoline);
+    g_renderTreeVisibleContinuation =
+        module + kRenderTreeVisibleContinuationRva;
+    g_renderTreeRejectedContinuation =
+        module + kRenderTreeRejectedContinuationRva;
     const bool wroteJump = WriteRelativeJump(
-        target, reinterpret_cast<void*>(&RenderTreeHook));
-    if (wroteJump && kRenderTreePatchSize > 5) {
-        std::memset(target + 5, 0x90, kRenderTreePatchSize - 5);
+        target, reinterpret_cast<void*>(&RenderTreeVisibilityBranchHook));
+    if (wroteJump && kRenderTreeVisibilityBranchPatchSize > 5) {
+        std::memset(target + 5, 0x90,
+                    kRenderTreeVisibilityBranchPatchSize - 5);
     }
     DWORD ignored = 0;
-    VirtualProtect(target, kRenderTreePatchSize, oldProtection, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), target, kRenderTreePatchSize);
+    VirtualProtect(target, kRenderTreeVisibilityBranchPatchSize,
+                   oldProtection, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), target,
+                          kRenderTreeVisibilityBranchPatchSize);
     if (!wroteJump) {
-        g_originalRenderTree = nullptr;
-        VirtualFree(trampoline, 0, MEM_RELEASE);
+        g_renderTreeVisibleContinuation = 0;
+        g_renderTreeRejectedContinuation = 0;
         return false;
     }
 
-    g_renderTreeTarget = target;
-    g_renderTreeTrampoline = trampoline;
-    tmoxr::log::Info("Installed CHmsViewport::RenderTree diagnostic hook; flagged per-tree frustum branches will be bypassed while VR tracking is active.");
+    g_renderTreeVisibilityBranchTarget = target;
+    tmoxr::log::Info("Installed CHmsViewport::RenderTree rejection-branch hook; only trees rejected by TrackMania will receive an HMD visibility test.");
     return true;
 }
 
 void RemoveRenderTreeHook() {
-    if (!g_renderTreeTarget || !g_originalRenderTree) return;
+    if (!g_renderTreeVisibilityBranchTarget) return;
     DWORD oldProtection = 0;
     bool restored = false;
-    if (VirtualProtect(g_renderTreeTarget, kRenderTreePatchSize,
+    if (VirtualProtect(g_renderTreeVisibilityBranchTarget,
+                       kRenderTreeVisibilityBranchPatchSize,
                        PAGE_EXECUTE_READWRITE, &oldProtection)) {
-        std::memcpy(g_renderTreeTarget, kRenderTreePrologue.data(),
-                    kRenderTreePatchSize);
+        std::memcpy(g_renderTreeVisibilityBranchTarget,
+                    kRenderTreeVisibilityBranch.data(),
+                    kRenderTreeVisibilityBranchPatchSize);
         DWORD ignored = 0;
-        VirtualProtect(g_renderTreeTarget, kRenderTreePatchSize, oldProtection,
-                       &ignored);
-        FlushInstructionCache(GetCurrentProcess(), g_renderTreeTarget,
-                              kRenderTreePatchSize);
+        VirtualProtect(g_renderTreeVisibilityBranchTarget,
+                       kRenderTreeVisibilityBranchPatchSize,
+                       oldProtection, &ignored);
+        FlushInstructionCache(GetCurrentProcess(),
+                              g_renderTreeVisibilityBranchTarget,
+                              kRenderTreeVisibilityBranchPatchSize);
         restored = true;
     }
     if (!restored) return;
-    if (g_renderTreeTrampoline) {
-        VirtualFree(g_renderTreeTrampoline, 0, MEM_RELEASE);
-    }
-    g_renderTreeTarget = nullptr;
-    g_renderTreeTrampoline = nullptr;
-    g_originalRenderTree = nullptr;
+    g_renderTreeVisibilityBranchTarget = nullptr;
+    g_renderTreeVisibleContinuation = 0;
+    g_renderTreeRejectedContinuation = 0;
 }
 
 bool InstallCullingFrustumHook() {
@@ -989,7 +1034,7 @@ bool InstallCullingFrustumHook() {
     g_computeClippingPlanesTarget = target;
     g_computeClippingPlanesTrampoline = trampoline;
     g_executableModuleBase = module;
-    tmoxr::log::Info("Installed call-site-filtered SClippingFrustum hook; shadow clipping volumes will remain unchanged.");
+    tmoxr::log::Info("Installed call-site-filtered HMD-aligned SClippingFrustum hook; auxiliary clipping volumes remain unchanged.");
     InstallRenderTreeHook(module);
     return true;
 }
@@ -2020,17 +2065,16 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
                               << g_stereo.clippingPlaneBuildsByCallSite[i];
         }
         tmoxr::log::Info("Clipping-plane hook diagnostic: builds=" +
-            std::to_string(g_stereo.clippingPlaneBuilds) + ", disabled=" +
-            std::to_string(g_stereo.disabledClippingFrustums) +
-            ", auxiliary preserved=" +
+            std::to_string(g_stereo.clippingPlaneBuilds) + ", HMD-aligned=" +
+            std::to_string(g_stereo.hmdAlignedClippingFrustums) +
+            ", unmodified=" +
             std::to_string(g_stereo.clippingPlaneBuilds -
-                           g_stereo.disabledClippingFrustums) +
+                           g_stereo.hmdAlignedClippingFrustums) +
             "; call sites=" + clippingCallSites.str() +
             ", unknown=" +
             std::to_string(g_stereo.clippingPlaneBuildsUnknownCallSite) +
-            "; RenderTree calls/flagged/bypassed/HMD-rejected=" +
+            "; RenderTree vanilla-rejects-tested/HMD-rescued/HMD-rejected=" +
             std::to_string(g_stereo.renderTreeCalls) + "/" +
-            std::to_string(g_stereo.renderTreeFrustumFlagged) + "/" +
             std::to_string(g_stereo.renderTreeFrustumBypassed) + "/" +
             std::to_string(g_stereo.renderTreeHmdRejected) + ".");
 #endif
@@ -2118,6 +2162,9 @@ HRESULT STDMETHODCALLTYPE BeginSceneHook(IDirect3DDevice9* device) {
     if (tmoxr::VrBridge::Instance().GetRenderConfiguration(renderConfiguration)) {
         UpdateStereoRenderConfiguration(renderConfiguration);
     }
+#if TMOXR_EXPERIMENTAL_CULLING
+    UpdateRenderTreeCullingCache();
+#endif
     const HRESULT result = g_originalBeginScene(device);
     g_stereo.sceneActive = SUCCEEDED(result);
     return result;
