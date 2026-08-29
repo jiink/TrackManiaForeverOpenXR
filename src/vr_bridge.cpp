@@ -190,6 +190,30 @@ bool Check(XrResult result, const char* stage) {
     log::Error(std::string(stage) + " failed: " + Result(result));
     return false;
 }
+
+struct StartupFailureDialog {
+    HWND gameWindow;
+    std::wstring message;
+};
+
+DWORD WINAPI ShowStartupFailureDialog(void* context) {
+    auto* dialog = static_cast<StartupFailureDialog*>(context);
+    const HWND gameWindow = dialog->gameWindow;
+    const std::wstring message = std::move(dialog->message);
+    delete dialog;
+
+    MessageBoxW(nullptr, message.c_str(), L"TrackMania OpenXR - VR startup failed",
+        MB_OK | MB_ICONERROR | MB_TASKMODAL | MB_SETFOREGROUND | MB_TOPMOST);
+    if (gameWindow && IsWindow(gameWindow)) {
+        // A synchronous, game-owned startup dialog previously left TrackMania
+        // accepting hover messages but not button clicks after dismissal.
+        // Match the known-good graphics-warning path and defensively restore
+        // the game's enabled/foreground state.
+        EnableWindow(gameWindow, TRUE);
+        SetForegroundWindow(gameWindow);
+    }
+    return 0;
+}
 } // namespace
 
 struct VrBridge::Impl {
@@ -473,8 +497,23 @@ struct VrBridge::Impl {
             if (SUCCEEDED(device->GetCreationParameters(&creation))) owner = creation.hFocusWindow;
         }
         if (!owner || !IsWindow(owner)) owner = GetForegroundWindow();
-        MessageBoxW(owner, message.c_str(), L"TrackMania OpenXR - VR startup failed",
-            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST);
+        auto* dialog = new StartupFailureDialog{owner, message};
+        HANDLE thread = CreateThread(
+            nullptr, 0, &ShowStartupFailureDialog, dialog, 0, nullptr);
+        if (thread) {
+            CloseHandle(thread);
+            return;
+        }
+
+        delete dialog;
+        log::Warn("Could not create the VR-startup warning thread; showing the dialog without a game-window owner. Windows error=" +
+            std::to_string(GetLastError()) + ".");
+        MessageBoxW(nullptr, message.c_str(), L"TrackMania OpenXR - VR startup failed",
+            MB_OK | MB_ICONERROR | MB_TASKMODAL | MB_SETFOREGROUND | MB_TOPMOST);
+        if (owner && IsWindow(owner)) {
+            EnableWindow(owner, TRUE);
+            SetForegroundWindow(owner);
+        }
     }
 
     bool DisableAfterStartupFailure(const std::string& stage, const std::string& error,
