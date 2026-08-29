@@ -2,8 +2,6 @@ cmake_minimum_required(VERSION 3.24)
 
 project(TrackManiaOpenXRBridge LANGUAGES CXX)
 
-option(TMOXR_EXPERIMENTAL_CULLING "Enable unfinished TrackMania camera/frustum experiments" OFF)
-
 if(NOT WIN32 OR NOT MSVC)
   message(FATAL_ERROR "This project builds a Win32 Direct3D 9 proxy and requires MSVC on Windows.")
 endif()
@@ -25,11 +23,6 @@ add_library(d3d9 SHARED
 
 target_compile_features(d3d9 PRIVATE cxx_std_20)
 target_compile_definitions(d3d9 PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX XR_USE_GRAPHICS_API_D3D11 XR_NO_PROTOTYPES)
-if(TMOXR_EXPERIMENTAL_CULLING)
-  target_compile_definitions(d3d9 PRIVATE TMOXR_EXPERIMENTAL_CULLING=1)
-else()
-  target_compile_definitions(d3d9 PRIVATE TMOXR_EXPERIMENTAL_CULLING=0)
-endif()
 target_include_directories(d3d9 PRIVATE
   "${openxr_headers_SOURCE_DIR}/src"
   "${openxr_headers_BINARY_DIR}/include"

@@ -21,14 +21,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <intrin.h>
 #include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
-
-#ifndef TMOXR_EXPERIMENTAL_CULLING
-#define TMOXR_EXPERIMENTAL_CULLING 0
-#endif
 
 namespace {
 using Create9Fn = IDirect3D9* (WINAPI*)(UINT);
@@ -268,6 +265,7 @@ struct CameraSettings {
     std::atomic<float> horizonLockReleaseEnd{70.0f};
     std::atomic<bool> mirrorEyeToDesktop{true};
     std::atomic<bool> d3d9On12{true};
+    std::atomic<bool> frustumCullingFix{false};
     std::atomic<bool> verboseDiagnostics{false};
     std::atomic<int> selectedCamera{0};
     std::array<std::atomic<bool>, 8> cameraKeyDown{};
@@ -419,6 +417,8 @@ void ReadCameraSettings(bool reloaded) {
         GetPrivateProfileIntW(L"Performance", L"MirrorEyeToDesktop", 1, path.c_str()) != 0;
     const bool d3d9On12 =
         GetPrivateProfileIntW(L"Performance", L"D3D9On12", 1, path.c_str()) != 0;
+    const bool frustumCullingFix =
+        GetPrivateProfileIntW(L"Performance", L"FrustumCullingFix", 0, path.c_str()) != 0;
     const bool verboseDiagnostics =
         GetPrivateProfileIntW(L"Diagnostics", L"Verbose", 0, path.c_str()) != 0;
     g_cameraSettings.cockpitEnabled.store(enabled, std::memory_order_relaxed);
@@ -428,6 +428,7 @@ void ReadCameraSettings(bool reloaded) {
     g_cameraSettings.horizonLockReleaseEnd.store(horizonReleaseEnd, std::memory_order_relaxed);
     g_cameraSettings.mirrorEyeToDesktop.store(mirrorEyeToDesktop, std::memory_order_relaxed);
     g_cameraSettings.d3d9On12.store(d3d9On12, std::memory_order_relaxed);
+    g_cameraSettings.frustumCullingFix.store(frustumCullingFix, std::memory_order_relaxed);
     g_cameraSettings.verboseDiagnostics.store(verboseDiagnostics, std::memory_order_relaxed);
     tmoxr::VrBridge::Instance().SetVerboseDiagnostics(verboseDiagnostics);
     const auto activeProfile = g_cameraSettings.activeVehicleProfile.load(std::memory_order_relaxed);
@@ -443,6 +444,7 @@ void ReadCameraSettings(bool reloaded) {
         ", adaptive release=" + std::to_string(horizonReleaseStart) + "-" +
         std::to_string(horizonReleaseEnd) + " degrees, mirror eye to desktop=" +
         std::to_string(mirrorEyeToDesktop) + ", D3D9On12=" + std::to_string(d3d9On12) +
+        ", frustum culling fix=" + std::to_string(frustumCullingFix) +
         ", verbose diagnostics=" +
         std::to_string(verboseDiagnostics) + ".");
 }
@@ -648,16 +650,20 @@ struct StereoResources {
     uint32_t skippedDesktopDraws = 0;
     uint32_t mirroredDesktopPasses = 0;
     uint64_t presentedFrames = 0;
-#if TMOXR_EXPERIMENTAL_CULLING
-    uint64_t lastCameraScanFrame = 0;
-    std::vector<const uint8_t*> cameraObjects;
-    const uint8_t* activeCullingCamera = nullptr;
-    std::array<float, 6> baseCullingFrustum{};
-    std::array<float, 4> lastAppliedCullingBounds{};
-    bool haveBaseCullingFrustum = false;
-    bool haveLastAppliedCullingBounds = false;
-    uint64_t lastCullingLogFrame = 0;
-#endif
+    uint64_t clippingPlaneBuilds = 0;
+    uint64_t hmdAlignedClippingFrustums = 0;
+    std::array<uint64_t, 10> clippingPlaneBuildsByCallSite{};
+    uint64_t clippingPlaneBuildsUnknownCallSite = 0;
+    uint64_t renderTreeCalls = 0;
+    uint64_t renderTreeFrustumFlagged = 0;
+    uint64_t renderTreeFrustumBypassed = 0;
+    uint64_t renderTreeHmdRejected = 0;
+    float renderTreeHeadRotation[3][3]{};
+    float renderTreeLeftSlope = 0.0f;
+    float renderTreeRightSlope = 0.0f;
+    float renderTreeDownSlope = 0.0f;
+    float renderTreeUpSlope = 0.0f;
+    bool renderTreeCullingValid = false;
     bool customVertexShaderBound = false;
     IDirect3DVertexShader9* vertexShader = nullptr;
     std::vector<IDirect3DVertexShader9*> analyzedShaders;
@@ -671,221 +677,389 @@ struct StereoResources {
     bool ready = false;
 } g_stereo;
 
-#if TMOXR_EXPERIMENTAL_CULLING
-constexpr uintptr_t kCHmsCameraVtableRva = 0x00756554;
-constexpr size_t kCHmsCameraDiagnosticSize = 0x204;
+using ComputeClippingPlanesFn = void(__thiscall*)(void*, void*, void*);
 
-bool IsReadableMemory(const void* address, size_t size) {
-    if (!address || !size) return false;
-    MEMORY_BASIC_INFORMATION memory{};
-    if (!VirtualQuery(address, &memory, sizeof(memory)) || memory.State != MEM_COMMIT) return false;
-    if ((memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) return false;
-    const uintptr_t start = reinterpret_cast<uintptr_t>(address);
-    const uintptr_t regionStart = reinterpret_cast<uintptr_t>(memory.BaseAddress);
-    const uintptr_t regionEnd = regionStart + memory.RegionSize;
-    return start >= regionStart && size <= regionEnd - start;
-}
+// Steam TMUF 2.11.26: CHmsViewport::SClippingFrustum::ComputePlaneEqs. The
+// ModTMNF symbol identifies the equivalent TMNF routine; the United body and
+// both arguments were then verified at the RenderCameraNormal call sites.
+constexpr uintptr_t kComputeClippingPlanesRva = 0x0012C940;
+constexpr std::array<uint8_t, 5> kComputeClippingPlanesPrologue = {
+    0x8B, 0x44, 0x24, 0x04, 0x56};
+constexpr size_t kComputeClippingPlanesPatchSize = kComputeClippingPlanesPrologue.size();
+constexpr std::array<uintptr_t, 10> kClippingPlaneCallSiteReturnRvas = {
+    0x0012F705, 0x0012F7A7, 0x0058E7DA, 0x0058E967, 0x00590D74,
+    0x00592727, 0x00595126, 0x00595C36, 0x005975E5, 0x005ABB9C};
+constexpr size_t kWorldClippingPlaneCallSiteIndex = 3;
+constexpr uintptr_t kRenderTreeVisibilityBranchRva = 0x001301F6;
+constexpr std::array<uint8_t, 11> kRenderTreeVisibilityBranch = {
+    0x83, 0x7C, 0x24, 0x34, 0x00, 0x0F, 0x84, 0x6E, 0x0A, 0x00, 0x00};
+constexpr size_t kRenderTreeVisibilityBranchPatchSize =
+    kRenderTreeVisibilityBranch.size();
+constexpr uintptr_t kRenderTreeVisibleContinuationRva = 0x00130201;
+constexpr uintptr_t kRenderTreeRejectedContinuationRva = 0x00130C6F;
 
-void FindCHmsCameraObjects() {
-    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-    if (!module) return;
-    const uintptr_t expectedVtable = module + kCHmsCameraVtableRva;
-    std::vector<const uint8_t*> objects;
-    SYSTEM_INFO system{};
-    GetSystemInfo(&system);
-    uintptr_t cursor = reinterpret_cast<uintptr_t>(system.lpMinimumApplicationAddress);
-    const uintptr_t maximum = reinterpret_cast<uintptr_t>(system.lpMaximumApplicationAddress);
-    while (cursor < maximum) {
-        MEMORY_BASIC_INFORMATION memory{};
-        if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) || !memory.RegionSize) break;
-        const uintptr_t next = reinterpret_cast<uintptr_t>(memory.BaseAddress) + memory.RegionSize;
-        const DWORD protection = memory.Protect & 0xff;
-        const bool writable = protection == PAGE_READWRITE || protection == PAGE_WRITECOPY ||
-            protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
-        if (memory.State == MEM_COMMIT && memory.Type == MEM_PRIVATE && writable &&
-            (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0) {
-            const uintptr_t begin = (reinterpret_cast<uintptr_t>(memory.BaseAddress) + 3u) & ~uintptr_t(3u);
-            const uintptr_t end = next >= sizeof(uintptr_t) ? next - sizeof(uintptr_t) : begin;
-            for (uintptr_t candidate = begin; candidate <= end; candidate += sizeof(uint32_t)) {
-                if (*reinterpret_cast<const uintptr_t*>(candidate) != expectedVtable) continue;
-                const auto* object = reinterpret_cast<const uint8_t*>(candidate);
-                if (IsReadableMemory(object, kCHmsCameraDiagnosticSize)) objects.push_back(object);
-            }
-        }
-        if (next <= cursor) break;
-        cursor = next;
-    }
-    if (objects != g_stereo.cameraObjects) {
-        g_stereo.cameraObjects = std::move(objects);
-        tmoxr::log::Info("Camera diagnostic located " + std::to_string(g_stereo.cameraObjects.size()) +
-            " exact CHmsCamera object(s).");
-    }
-}
+ComputeClippingPlanesFn g_originalComputeClippingPlanes = nullptr;
+uint8_t* g_computeClippingPlanesTarget = nullptr;
+uint8_t* g_computeClippingPlanesTrampoline = nullptr;
+uintptr_t g_executableModuleBase = 0;
+uint8_t* g_renderTreeVisibilityBranchTarget = nullptr;
+uintptr_t g_renderTreeVisibleContinuation = 0;
+uintptr_t g_renderTreeRejectedContinuation = 0;
 
-template <typename T>
-T ReadCameraValue(const uint8_t* camera, size_t offset) {
-    T value{};
-    std::memcpy(&value, camera + offset, sizeof(value));
-    return value;
-}
-
-void ResetActiveCullingCamera() {
-    g_stereo.activeCullingCamera = nullptr;
-    g_stereo.haveBaseCullingFrustum = false;
-    g_stereo.haveLastAppliedCullingBounds = false;
-}
-
-bool ApproximatelyEqual(float left, float right, float relativeTolerance = 0.025f) {
-    return std::abs(left - right) <= relativeTolerance * std::max({1.0f, std::abs(left), std::abs(right)});
-}
-
-bool IsPlausiblePerspectiveCamera(const uint8_t* camera) {
-    if (ReadCameraValue<uint32_t>(camera, 0x118) != 0) return false;
-    const float left = ReadCameraValue<float>(camera, 0x11c);
-    const float bottom = ReadCameraValue<float>(camera, 0x120);
-    const float nearZ = ReadCameraValue<float>(camera, 0x124);
-    const float right = ReadCameraValue<float>(camera, 0x128);
-    const float top = ReadCameraValue<float>(camera, 0x12c);
-    const float farZ = ReadCameraValue<float>(camera, 0x130);
-    return std::isfinite(left) && std::isfinite(bottom) && std::isfinite(nearZ) &&
-        std::isfinite(right) && std::isfinite(top) && std::isfinite(farZ) &&
-        left < -0.01f && right > 0.01f && bottom < -0.01f && top > 0.01f &&
-        nearZ >= 0.01f && farZ > nearZ && farZ < 10000000.0f;
-}
-
-bool CameraMatchesGameProjection(const uint8_t* camera) {
-    if (!IsPlausiblePerspectiveCamera(camera) || !g_stereo.perspective) return false;
-    const float left = ReadCameraValue<float>(camera, 0x11c);
-    const float bottom = ReadCameraValue<float>(camera, 0x120);
-    const float right = ReadCameraValue<float>(camera, 0x128);
-    const float top = ReadCameraValue<float>(camera, 0x12c);
-    const float horizontalScale = 2.0f / (right - left);
-    const float verticalScale = 2.0f / (top - bottom);
-    return ApproximatelyEqual(std::abs(g_stereo.projection._11), horizontalScale) &&
-        ApproximatelyEqual(std::abs(g_stereo.projection._22), verticalScale);
-}
-
-void CaptureBaseCullingFrustum(const uint8_t* camera) {
-    for (size_t index = 0; index < g_stereo.baseCullingFrustum.size(); ++index) {
-        g_stereo.baseCullingFrustum[index] = ReadCameraValue<float>(camera, 0x11c + index * sizeof(float));
-    }
-    g_stereo.haveBaseCullingFrustum = true;
-}
-
-void WriteCameraFloat(const uint8_t* camera, size_t offset, float value) {
-    std::memcpy(const_cast<uint8_t*>(camera) + offset, &value, sizeof(value));
-}
-
-void ExpandActiveCameraCullingFrustum() {
-    if (!g_stereo.haveHeadPose || !g_stereo.perspective) return;
-    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-    if (g_stereo.activeCullingCamera &&
-        (!IsReadableMemory(g_stereo.activeCullingCamera, kCHmsCameraDiagnosticSize) ||
-         ReadCameraValue<uintptr_t>(g_stereo.activeCullingCamera, 0) != module + kCHmsCameraVtableRva)) {
-        ResetActiveCullingCamera();
-    }
-    if (!g_stereo.activeCullingCamera) {
-        for (const auto* camera : g_stereo.cameraObjects) {
-            if (!CameraMatchesGameProjection(camera)) continue;
-            g_stereo.activeCullingCamera = camera;
-            CaptureBaseCullingFrustum(camera);
-            tmoxr::log::Info("Matched the active TrackMania CHmsCamera to the current D3D projection; enabling dynamic head-view culling expansion.");
-            break;
-        }
-    }
-    const auto* camera = g_stereo.activeCullingCamera;
-    if (!camera || !IsPlausiblePerspectiveCamera(camera)) return;
-
-    const std::array<float, 4> currentBounds = {
-        ReadCameraValue<float>(camera, 0x11c), ReadCameraValue<float>(camera, 0x120),
-        ReadCameraValue<float>(camera, 0x128), ReadCameraValue<float>(camera, 0x12c)};
-    if (g_stereo.haveLastAppliedCullingBounds) {
-        bool gameReplacedBounds = false;
-        for (size_t index = 0; index < currentBounds.size(); ++index) {
-            if (!ApproximatelyEqual(currentBounds[index], g_stereo.lastAppliedCullingBounds[index], 0.001f)) {
-                gameReplacedBounds = true;
-                break;
-            }
-        }
-        if (gameReplacedBounds) CaptureBaseCullingFrustum(camera);
-    } else if (!g_stereo.haveBaseCullingFrustum) {
-        CaptureBaseCullingFrustum(camera);
-    }
+void UpdateRenderTreeCullingCache() {
+    g_stereo.renderTreeCullingValid = false;
+    if (!g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed) ||
+        !g_stereo.haveHeadPose || !g_stereo.haveRenderConfiguration) return;
 
     const float x = g_stereo.headPose.orientation[0];
     const float y = g_stereo.headPose.orientation[1];
     const float z = g_stereo.headPose.orientation[2];
     const float w = g_stereo.headPose.orientation[3];
-    const float forwardX = 2.0f * (x * z + y * w);
-    const float forwardY = -2.0f * (y * z - x * w);
-    const float forwardZ = 1.0f - 2.0f * (x * x + y * y);
-    const float yaw = std::abs(std::atan2(forwardX, forwardZ));
-    const float pitch = std::abs(std::atan2(-forwardY, std::sqrt(forwardX * forwardX + forwardZ * forwardZ)));
-    float eyeHalfHorizontal = std::atan(std::max(-g_stereo.baseCullingFrustum[0], g_stereo.baseCullingFrustum[3]));
-    float eyeHalfVertical = std::atan(std::max(-g_stereo.baseCullingFrustum[1], g_stereo.baseCullingFrustum[4]));
-    if (g_stereo.haveRenderConfiguration) {
-        for (const auto& eye : g_stereo.renderConfiguration.eyes) {
-            eyeHalfHorizontal = std::max(eyeHalfHorizontal, std::max(std::abs(eye.angleLeft), std::abs(eye.angleRight)));
-            eyeHalfVertical = std::max(eyeHalfVertical, std::max(std::abs(eye.angleDown), std::abs(eye.angleUp)));
+    const float rightHanded[3][3] = {
+        {1.0f - 2.0f * (y * y + z * z),
+         2.0f * (x * y - z * w), 2.0f * (x * z + y * w)},
+        {2.0f * (x * y + z * w),
+         1.0f - 2.0f * (x * x + z * z), 2.0f * (y * z - x * w)},
+        {2.0f * (x * z - y * w), 2.0f * (y * z + x * w),
+         1.0f - 2.0f * (x * x + y * y)}};
+    constexpr float reflection[3] = {1.0f, -1.0f, 1.0f};
+    for (size_t row = 0; row < 3; ++row) {
+        for (size_t column = 0; column < 3; ++column) {
+            g_stereo.renderTreeHeadRotation[row][column] = reflection[row] *
+                rightHanded[row][column] * reflection[column];
         }
     }
-    constexpr float maximumHalfAngle = 1.483529864f; // 85 degrees; a perspective frustum cannot include the rear hemisphere.
-    const float horizontalExtent = std::tan(std::min(maximumHalfAngle, yaw + eyeHalfHorizontal));
-    const float verticalExtent = std::tan(std::min(maximumHalfAngle, pitch + eyeHalfVertical));
-    const std::array<float, 4> expandedBounds = {
-        std::min(g_stereo.baseCullingFrustum[0], -horizontalExtent),
-        std::min(g_stereo.baseCullingFrustum[1], -verticalExtent),
-        std::max(g_stereo.baseCullingFrustum[3], horizontalExtent),
-        std::max(g_stereo.baseCullingFrustum[4], verticalExtent)};
-    WriteCameraFloat(camera, 0x11c, expandedBounds[0]);
-    WriteCameraFloat(camera, 0x120, expandedBounds[1]);
-    WriteCameraFloat(camera, 0x128, expandedBounds[2]);
-    WriteCameraFloat(camera, 0x12c, expandedBounds[3]);
-    g_stereo.lastAppliedCullingBounds = expandedBounds;
-    g_stereo.haveLastAppliedCullingBounds = true;
-    if (!g_stereo.lastCullingLogFrame || g_stereo.presentedFrames - g_stereo.lastCullingLogFrame >= 180) {
-        g_stereo.lastCullingLogFrame = g_stereo.presentedFrames;
-        tmoxr::log::Info("Dynamic culling frustum: head yaw/pitch=" + std::to_string(yaw * 57.2957795f) + "/" +
-            std::to_string(pitch * 57.2957795f) + " degrees, bounds=(" +
-            std::to_string(expandedBounds[0]) + "," + std::to_string(expandedBounds[1]) + "," +
-            std::to_string(expandedBounds[2]) + "," + std::to_string(expandedBounds[3]) + ").");
+
+    const auto& leftEye = g_stereo.renderConfiguration.eyes[0];
+    const auto& rightEye = g_stereo.renderConfiguration.eyes[1];
+    constexpr float kAngularSafetyMargin = 0.17f;
+    const float angleLeft = std::max(-1.45f,
+        std::min(leftEye.angleLeft, rightEye.angleLeft) -
+            kAngularSafetyMargin);
+    const float angleRight = std::min(1.45f,
+        std::max(leftEye.angleRight, rightEye.angleRight) +
+            kAngularSafetyMargin);
+    const float angleDown = std::max(-1.45f,
+        std::min(leftEye.angleDown, rightEye.angleDown) -
+            kAngularSafetyMargin);
+    const float angleUp = std::min(1.45f,
+        std::max(leftEye.angleUp, rightEye.angleUp) +
+            kAngularSafetyMargin);
+    g_stereo.renderTreeLeftSlope = std::tan(angleLeft);
+    g_stereo.renderTreeRightSlope = std::tan(angleRight);
+    g_stereo.renderTreeDownSlope = std::tan(angleDown);
+    g_stereo.renderTreeUpSlope = std::tan(angleUp);
+    g_stereo.renderTreeCullingValid = true;
+}
+
+void __fastcall ComputeClippingPlanesHook(void* clippingFrustum, void*,
+                                          void* frustum, void* location) {
+    const uintptr_t returnAddress = reinterpret_cast<uintptr_t>(_ReturnAddress());
+    const uintptr_t returnRva = returnAddress - g_executableModuleBase;
+    size_t callSiteIndex = kClippingPlaneCallSiteReturnRvas.size();
+    for (size_t i = 0; i < kClippingPlaneCallSiteReturnRvas.size(); ++i) {
+        if (returnRva == kClippingPlaneCallSiteReturnRvas[i]) {
+            callSiteIndex = i;
+            ++g_stereo.clippingPlaneBuildsByCallSite[i];
+            break;
+        }
+    }
+    if (callSiteIndex == kClippingPlaneCallSiteReturnRvas.size()) {
+        ++g_stereo.clippingPlaneBuildsUnknownCallSite;
+    }
+
+    void* clippingLocation = location;
+    float hmdLocation[12]{};
+    if (g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed) &&
+        callSiteIndex == kWorldClippingPlaneCallSiteIndex && location &&
+        g_stereo.renderTreeCullingValid) {
+        const auto* const originalLocation = static_cast<const float*>(location);
+        std::memcpy(hmdLocation, originalLocation, sizeof(hmdLocation));
+        const auto& headRotation = g_stereo.renderTreeHeadRotation;
+        // The supplied GmIso4 maps camera-local coordinates into world space.
+        // Compose the headset's local rotation on its right while retaining the
+        // vanilla camera origin. The resulting six-plane volume follows the
+        // HMD instead of representing a desktop/HMD union.
+        for (size_t row = 0; row < 3; ++row) {
+            for (size_t column = 0; column < 3; ++column) {
+                hmdLocation[row * 3 + column] =
+                    originalLocation[row * 3] * headRotation[0][column] +
+                    originalLocation[row * 3 + 1] * headRotation[1][column] +
+                    originalLocation[row * 3 + 2] * headRotation[2][column];
+            }
+        }
+        clippingLocation = hmdLocation;
+        ++g_stereo.hmdAlignedClippingFrustums;
+    }
+
+    g_originalComputeClippingPlanes(clippingFrustum, frustum, clippingLocation);
+    ++g_stereo.clippingPlaneBuilds;
+}
+
+bool __cdecl IsRejectedRenderTreeVisibleToHmd(void* viewport, void* tree) {
+    ++g_stereo.renderTreeCalls;
+    ++g_stereo.renderTreeFrustumFlagged;
+    if (!g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed) ||
+        !viewport || !tree || !g_stereo.renderTreeCullingValid) {
+        ++g_stereo.renderTreeHmdRejected;
+        return false;
+    }
+
+    const auto* const bounds = reinterpret_cast<const float*>(
+        static_cast<const uint8_t*>(tree) + 0x34);
+    const float centerX = bounds[0];
+    const float centerY = bounds[1];
+    const float centerZ = bounds[2];
+    const float extentX = std::abs(bounds[3]);
+    const float extentY = std::abs(bounds[4]);
+    const float extentZ = std::abs(bounds[5]);
+    const float radius = std::sqrt(extentX * extentX + extentY * extentY +
+                                   extentZ * extentZ);
+
+    const auto* const viewportBytes = static_cast<const uint8_t*>(viewport);
+    const uint32_t locationDepth = *reinterpret_cast<const uint32_t*>(
+        viewportBytes + 0x538);
+    const auto* const locationEntries = *reinterpret_cast<uint8_t* const*>(
+        viewportBytes + 0x53c);
+    const float* camera = nullptr;
+    if (locationDepth && locationEntries) {
+        camera = reinterpret_cast<const float*>(
+            locationEntries + static_cast<size_t>(locationDepth - 1) * 0xa4 +
+            0x70);
+    }
+
+    bool hmdVisible = false;
+    if (camera && g_stereo.renderTreeCullingValid &&
+        std::isfinite(centerX) && std::isfinite(centerY) &&
+        std::isfinite(centerZ) && std::isfinite(radius)) {
+        // RenderTree itself passes the current location-stack entry at
+        // CHmsViewport+0x538 to GmBox::Transform. Its GmIso4 begins at
+        // entry+0x70 and is already the world-to-viewport transform. Mirror
+        // the game's direct center transform exactly; do not invert it again.
+        const float viewX = camera[0] * centerX + camera[1] * centerY +
+                            camera[2] * centerZ + camera[9];
+        const float viewY = camera[3] * centerX + camera[4] * centerY +
+                            camera[5] * centerZ + camera[10];
+        const float viewZ = camera[6] * centerX + camera[7] * centerY +
+                            camera[8] * centerZ + camera[11];
+        const auto& headRotation = g_stereo.renderTreeHeadRotation;
+
+        // GmBox::Transform has already produced the viewport's camera-space
+        // center. Projection reflection is applied later by TrackMania and
+        // must not be folded into this visibility-space vector.
+        const float trackedX = viewX * headRotation[0][0] +
+                               viewY * headRotation[1][0] +
+                               viewZ * headRotation[2][0];
+        const float trackedY = viewX * headRotation[0][1] +
+                               viewY * headRotation[1][1] +
+                               viewZ * headRotation[2][1];
+        const float trackedZ = viewX * headRotation[0][2] +
+                               viewY * headRotation[1][2] +
+                               viewZ * headRotation[2][2];
+        const float leftSlope = g_stereo.renderTreeLeftSlope;
+        const float rightSlope = g_stereo.renderTreeRightSlope;
+        const float downSlope = g_stereo.renderTreeDownSlope;
+        const float upSlope = g_stereo.renderTreeUpSlope;
+        hmdVisible = trackedZ + radius > 0.05f &&
+            trackedX + radius >= trackedZ * leftSlope &&
+            trackedX - radius <= trackedZ * rightSlope &&
+            trackedY + radius >= trackedZ * downSlope &&
+            trackedY - radius <= trackedZ * upSlope;
+    }
+
+    if (!hmdVisible) {
+        ++g_stereo.renderTreeHmdRejected;
+        return false;
+    }
+
+    ++g_stereo.renderTreeFrustumBypassed;
+    return true;
+}
+
+// Entered in CHmsViewport::RenderTree immediately after TrackMania has
+// computed its own per-tree visibility result. Accepted trees stay entirely
+// on the vanilla path. Only genuine vanilla rejects call the HMD test; a
+// successful rescue changes the local visibility value and rejoins the normal
+// rendering path without mutating persistent tree flags.
+__declspec(naked) void RenderTreeVisibilityBranchHook() {
+    __asm {
+        cmp dword ptr [esp + 34h], 0
+        jne vanillaVisible
+
+        pushfd
+        pushad
+        push edi
+        push ebp
+        call IsRejectedRenderTreeVisibleToHmd
+        add esp, 8
+        test al, al
+        jz hmdRejected
+        popad
+        popfd
+        mov dword ptr [esp + 34h], 1
+        jmp dword ptr [g_renderTreeVisibleContinuation]
+
+    hmdRejected:
+        popad
+        popfd
+        jmp dword ptr [g_renderTreeRejectedContinuation]
+
+    vanillaVisible:
+        jmp dword ptr [g_renderTreeVisibleContinuation]
     }
 }
 
-void LogCHmsCameraObjects() {
-    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-    std::vector<const uint8_t*> validObjects;
-    validObjects.reserve(g_stereo.cameraObjects.size());
-    for (size_t index = 0; index < g_stereo.cameraObjects.size(); ++index) {
-        const auto* camera = g_stereo.cameraObjects[index];
-        if (!IsReadableMemory(camera, kCHmsCameraDiagnosticSize) ||
-            ReadCameraValue<uintptr_t>(camera, 0) != module + kCHmsCameraVtableRva) {
-            tmoxr::log::Warn("Camera diagnostic object " + std::to_string(index) + " is no longer valid; a rescan will be attempted.");
-            if (camera == g_stereo.activeCullingCamera) ResetActiveCullingCamera();
-            continue;
-        }
-        validObjects.push_back(camera);
-        std::ostringstream address;
-        address << std::hex << std::uppercase << reinterpret_cast<uintptr_t>(camera);
-        tmoxr::log::Info("CHmsCamera diagnostic " + std::to_string(index) + " at 0x" + address.str() +
-            ": frustum type=" + std::to_string(ReadCameraValue<uint32_t>(camera, 0x118)) +
-            ", raw bounds=(" + std::to_string(ReadCameraValue<float>(camera, 0x11c)) + "," +
-            std::to_string(ReadCameraValue<float>(camera, 0x120)) + "," +
-            std::to_string(ReadCameraValue<float>(camera, 0x124)) + "," +
-            std::to_string(ReadCameraValue<float>(camera, 0x128)) + "," +
-            std::to_string(ReadCameraValue<float>(camera, 0x12c)) + "," +
-            std::to_string(ReadCameraValue<float>(camera, 0x130)) + ")" +
-            ", fields 134/164/168/16c/170/200=(" +
-            std::to_string(ReadCameraValue<float>(camera, 0x134)) + "," +
-            std::to_string(ReadCameraValue<float>(camera, 0x164)) + "," +
-            std::to_string(ReadCameraValue<float>(camera, 0x168)) + "," +
-            std::to_string(ReadCameraValue<float>(camera, 0x16c)) + "," +
-            std::to_string(ReadCameraValue<float>(camera, 0x170)) + "," +
-            std::to_string(ReadCameraValue<float>(camera, 0x200)) + ").");
-    }
-    g_stereo.cameraObjects = std::move(validObjects);
+bool WriteRelativeJump(uint8_t* source, const void* destination) {
+    const intptr_t displacement = reinterpret_cast<intptr_t>(destination) -
+        reinterpret_cast<intptr_t>(source + 5);
+    if (displacement < INT32_MIN || displacement > INT32_MAX) return false;
+    source[0] = 0xE9;
+    const int32_t relative = static_cast<int32_t>(displacement);
+    std::memcpy(source + 1, &relative, sizeof(relative));
+    return true;
 }
-#endif
+
+bool InstallRenderTreeHook(uintptr_t module) {
+    if (g_renderTreeVisibilityBranchTarget) return true;
+    auto* const target = reinterpret_cast<uint8_t*>(
+        module + kRenderTreeVisibilityBranchRva);
+    if (std::memcmp(target, kRenderTreeVisibilityBranch.data(),
+                    kRenderTreeVisibilityBranchPatchSize) != 0) {
+        tmoxr::log::Warn("The RenderTree visibility-branch hook was not installed because this TmForever.exe does not match Steam 2.11.26.");
+        return false;
+    }
+
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(target, kRenderTreeVisibilityBranchPatchSize,
+                        PAGE_EXECUTE_READWRITE,
+                        &oldProtection)) {
+        tmoxr::log::Warn("VirtualProtect failed while installing the RenderTree visibility-branch hook: " +
+            std::to_string(GetLastError()));
+        return false;
+    }
+    g_renderTreeVisibleContinuation =
+        module + kRenderTreeVisibleContinuationRva;
+    g_renderTreeRejectedContinuation =
+        module + kRenderTreeRejectedContinuationRva;
+    const bool wroteJump = WriteRelativeJump(
+        target, reinterpret_cast<void*>(&RenderTreeVisibilityBranchHook));
+    if (wroteJump && kRenderTreeVisibilityBranchPatchSize > 5) {
+        std::memset(target + 5, 0x90,
+                    kRenderTreeVisibilityBranchPatchSize - 5);
+    }
+    DWORD ignored = 0;
+    VirtualProtect(target, kRenderTreeVisibilityBranchPatchSize,
+                   oldProtection, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), target,
+                          kRenderTreeVisibilityBranchPatchSize);
+    if (!wroteJump) {
+        g_renderTreeVisibleContinuation = 0;
+        g_renderTreeRejectedContinuation = 0;
+        return false;
+    }
+
+    g_renderTreeVisibilityBranchTarget = target;
+    tmoxr::log::Info("Installed CHmsViewport::RenderTree rejection-branch hook; only trees rejected by TrackMania will receive an HMD visibility test.");
+    return true;
+}
+
+void RemoveRenderTreeHook() {
+    if (!g_renderTreeVisibilityBranchTarget) return;
+    DWORD oldProtection = 0;
+    bool restored = false;
+    if (VirtualProtect(g_renderTreeVisibilityBranchTarget,
+                       kRenderTreeVisibilityBranchPatchSize,
+                       PAGE_EXECUTE_READWRITE, &oldProtection)) {
+        std::memcpy(g_renderTreeVisibilityBranchTarget,
+                    kRenderTreeVisibilityBranch.data(),
+                    kRenderTreeVisibilityBranchPatchSize);
+        DWORD ignored = 0;
+        VirtualProtect(g_renderTreeVisibilityBranchTarget,
+                       kRenderTreeVisibilityBranchPatchSize,
+                       oldProtection, &ignored);
+        FlushInstructionCache(GetCurrentProcess(),
+                              g_renderTreeVisibilityBranchTarget,
+                              kRenderTreeVisibilityBranchPatchSize);
+        restored = true;
+    }
+    if (!restored) return;
+    g_renderTreeVisibilityBranchTarget = nullptr;
+    g_renderTreeVisibleContinuation = 0;
+    g_renderTreeRejectedContinuation = 0;
+}
+
+bool InstallCullingFrustumHook() {
+    if (g_originalComputeClippingPlanes) return true;
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    if (!module) return false;
+    auto* const target = reinterpret_cast<uint8_t*>(module + kComputeClippingPlanesRva);
+    if (std::memcmp(target, kComputeClippingPlanesPrologue.data(),
+                    kComputeClippingPlanesPatchSize) != 0) {
+        tmoxr::log::Warn("The clipping-plane hook was not installed because this TmForever.exe does not match Steam 2.11.26.");
+        return false;
+    }
+
+    auto* const trampoline = static_cast<uint8_t*>(VirtualAlloc(
+        nullptr, kComputeClippingPlanesPatchSize + 5, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!trampoline) {
+        tmoxr::log::Warn("VirtualAlloc failed while installing the clipping-plane hook: " +
+            std::to_string(GetLastError()));
+        return false;
+    }
+    std::memcpy(trampoline, target, kComputeClippingPlanesPatchSize);
+    if (!WriteRelativeJump(trampoline + kComputeClippingPlanesPatchSize,
+                           target + kComputeClippingPlanesPatchSize)) {
+        VirtualFree(trampoline, 0, MEM_RELEASE);
+        return false;
+    }
+
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(target, kComputeClippingPlanesPatchSize, PAGE_EXECUTE_READWRITE, &oldProtection)) {
+        tmoxr::log::Warn("VirtualProtect failed while installing the clipping-plane hook: " +
+            std::to_string(GetLastError()));
+        VirtualFree(trampoline, 0, MEM_RELEASE);
+        return false;
+    }
+    g_originalComputeClippingPlanes = reinterpret_cast<ComputeClippingPlanesFn>(trampoline);
+    const bool wroteJump = WriteRelativeJump(target, reinterpret_cast<void*>(&ComputeClippingPlanesHook));
+    DWORD ignored = 0;
+    VirtualProtect(target, kComputeClippingPlanesPatchSize, oldProtection, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), target, kComputeClippingPlanesPatchSize);
+    if (!wroteJump) {
+        g_originalComputeClippingPlanes = nullptr;
+        VirtualFree(trampoline, 0, MEM_RELEASE);
+        return false;
+    }
+
+    g_computeClippingPlanesTarget = target;
+    g_computeClippingPlanesTrampoline = trampoline;
+    g_executableModuleBase = module;
+    tmoxr::log::Info("Installed call-site-filtered HMD-aligned SClippingFrustum hook; auxiliary clipping volumes remain unchanged.");
+    InstallRenderTreeHook(module);
+    return true;
+}
+
+void RemoveCullingFrustumHook() {
+    RemoveRenderTreeHook();
+    if (!g_computeClippingPlanesTarget || !g_originalComputeClippingPlanes) return;
+    DWORD oldProtection = 0;
+    bool restored = false;
+    if (VirtualProtect(g_computeClippingPlanesTarget, kComputeClippingPlanesPatchSize,
+                       PAGE_EXECUTE_READWRITE, &oldProtection)) {
+        std::memcpy(g_computeClippingPlanesTarget, kComputeClippingPlanesPrologue.data(),
+                    kComputeClippingPlanesPatchSize);
+        DWORD ignored = 0;
+        VirtualProtect(g_computeClippingPlanesTarget, kComputeClippingPlanesPatchSize, oldProtection, &ignored);
+        FlushInstructionCache(GetCurrentProcess(), g_computeClippingPlanesTarget, kComputeClippingPlanesPatchSize);
+        restored = true;
+    }
+    if (!restored) return;
+    if (g_computeClippingPlanesTrampoline) VirtualFree(g_computeClippingPlanesTrampoline, 0, MEM_RELEASE);
+    g_computeClippingPlanesTarget = nullptr;
+    g_computeClippingPlanesTrampoline = nullptr;
+    g_originalComputeClippingPlanes = nullptr;
+    g_executableModuleBase = 0;
+}
 
 void ReleasePrivateEyeTargets() {
     tmoxr::VrBridge::Instance().SetLeftEyeSurface(nullptr);
@@ -1880,18 +2054,29 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
         g_stereo.uiDrawsThisFrame ? g_stereo.uiSharedHandle : nullptr);
     tmoxr::VrBridge::Instance().OnBeforePresent(device);
     ++g_stereo.presentedFrames;
-#if TMOXR_EXPERIMENTAL_CULLING
-    if (g_stereo.cameraObjects.empty() &&
-        (!g_stereo.lastCameraScanFrame || g_stereo.presentedFrames - g_stereo.lastCameraScanFrame >= 180)) {
-        g_stereo.lastCameraScanFrame = g_stereo.presentedFrames;
-        FindCHmsCameraObjects();
-        LogCHmsCameraObjects();
-    }
-#endif
     if (g_stereo.presentedFrames % 180 == 0) {
-#if TMOXR_EXPERIMENTAL_CULLING
-        LogCHmsCameraObjects();
-#endif
+        if (g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed)) {
+        std::ostringstream clippingCallSites;
+        for (size_t i = 0; i < g_stereo.clippingPlaneBuildsByCallSite.size(); ++i) {
+            if (i) clippingCallSites << '/';
+            clippingCallSites << std::hex << kClippingPlaneCallSiteReturnRvas[i]
+                              << std::dec << ':'
+                              << g_stereo.clippingPlaneBuildsByCallSite[i];
+        }
+        tmoxr::log::Info("Clipping-plane hook diagnostic: builds=" +
+            std::to_string(g_stereo.clippingPlaneBuilds) + ", HMD-aligned=" +
+            std::to_string(g_stereo.hmdAlignedClippingFrustums) +
+            ", unmodified=" +
+            std::to_string(g_stereo.clippingPlaneBuilds -
+                           g_stereo.hmdAlignedClippingFrustums) +
+            "; call sites=" + clippingCallSites.str() +
+            ", unknown=" +
+            std::to_string(g_stereo.clippingPlaneBuildsUnknownCallSite) +
+            "; RenderTree vanilla-rejects-tested/HMD-rescued/HMD-rejected=" +
+            std::to_string(g_stereo.renderTreeCalls) + "/" +
+            std::to_string(g_stereo.renderTreeFrustumBypassed) + "/" +
+            std::to_string(g_stereo.renderTreeHmdRejected) + ".");
+        }
         UINT likelyRegister = 0;
         uint32_t likelyCount = 0;
         for (UINT registerIndex = 0; registerIndex < g_stereo.perspectiveMatrixCandidates.size(); ++registerIndex) {
@@ -1969,6 +2154,12 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
 
 HRESULT STDMETHODCALLTYPE BeginSceneHook(IDirect3DDevice9* device) {
     ReloadCameraSettingsIfChanged();
+    if (g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed)) {
+        InstallCullingFrustumHook();
+    }
+    else {
+        RemoveCullingFrustumHook();
+    }
     tmoxr::VrBridge::Instance().OnBeginScene();
     UpdateSelectedCameraFromKeyboard();
     g_stereo.haveHeadPose = tmoxr::VrBridge::Instance().GetHeadPose(g_stereo.headPose);
@@ -1976,9 +2167,7 @@ HRESULT STDMETHODCALLTYPE BeginSceneHook(IDirect3DDevice9* device) {
     if (tmoxr::VrBridge::Instance().GetRenderConfiguration(renderConfiguration)) {
         UpdateStereoRenderConfiguration(renderConfiguration);
     }
-#if TMOXR_EXPERIMENTAL_CULLING
-    ExpandActiveCameraCullingFrustum();
-#endif
+    UpdateRenderTreeCullingCache();
     const HRESULT result = g_originalBeginScene(device);
     g_stereo.sceneActive = SUCCEEDED(result);
     return result;
@@ -2514,6 +2703,9 @@ __declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT sdkVersion) {
     tmoxr::log::Initialize();
     LoadCameraSettings();
     InstallVehicleVisibilityHook();
+    if (g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed)) {
+        InstallCullingFrustumHook();
+    }
     LoadRealD3D9();
     if (!g_create9) return nullptr;
     IDirect3D9* real = nullptr;
@@ -2553,6 +2745,7 @@ extern "C" __declspec(dllexport) void WINAPI D3DPERF_SetOptions(DWORD options) {
 
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_DETACH && IsTrackManiaGameProcess()) {
+        RemoveCullingFrustumHook();
         RemoveVehicleVisibilityHook();
         tmoxr::VrBridge::Instance().Shutdown();
     }
