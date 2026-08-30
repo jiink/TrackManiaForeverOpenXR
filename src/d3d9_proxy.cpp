@@ -1,4 +1,5 @@
 #include "log.h"
+#include "runtime_paths.h"
 #define Direct3DCreate9 TMOXR_SDK_DECLARATION_Direct3DCreate9
 #define Direct3DCreate9Ex TMOXR_SDK_DECLARATION_Direct3DCreate9Ex
 #define D3DPERF_SetOptions TMOXR_SDK_DECLARATION_D3DPERF_SetOptions
@@ -27,6 +28,9 @@
 #include <utility>
 #include <vector>
 
+__declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT sdkVersion);
+extern "C" __declspec(dllexport) void WINAPI D3DPERF_SetOptions(DWORD options);
+
 namespace {
 using Matrix4 = std::array<float, 16>;
 
@@ -39,6 +43,8 @@ Create9Fn g_create9 = nullptr;
 Create9ExFn g_create9Ex = nullptr;
 PFN_Direct3DCreate9On12 g_create9On12 = nullptr;
 PerfSetOptionsFn g_perfSetOptions = nullptr;
+std::atomic<bool> g_tmLoaderIatHookInstalled = false;
+std::atomic<DWORD> g_tmLoaderInjectionStatus = 0;
 
 bool IsTrackManiaGameProcess() {
     wchar_t executablePath[MAX_PATH]{};
@@ -278,6 +284,181 @@ struct CameraSettings {
     bool loaded = false;
 } g_cameraSettings;
 
+struct ExecutableLayout {
+    const char* name;
+    uintptr_t vehicleSetVisibilitySlotRva;
+    uintptr_t vehicleSetVisibilityFunctionRva;
+    uintptr_t computeClippingPlanesRva;
+    std::array<uintptr_t, 10> clippingPlaneCallSiteReturnRvas;
+    size_t worldClippingPlaneCallSiteIndex;
+    uintptr_t renderTreeVisibilityBranchRva;
+    uintptr_t renderTreeVisibleContinuationRva;
+    uintptr_t renderTreeRejectedContinuationRva;
+};
+
+constexpr ExecutableLayout kSteamUnitedLayout{
+    "Steam TMUF 2.11.26",
+    0x0073E0F8,
+    0x000859C0,
+    0x0012C940,
+    {0x0012F705, 0x0012F7A7, 0x0058E7DA, 0x0058E967, 0x00590D74,
+     0x00592727, 0x00595126, 0x00595C36, 0x005975E5, 0x005ABB9C},
+    3,
+    0x001301F6,
+    0x00130201,
+    0x00130C6F};
+
+constexpr ExecutableLayout kTmLoaderLayout{
+    "TrackMania ModLoader 2.12.0/2.12.0-compat",
+    0x0073E100,
+    0x00085B90,
+    0x0012CAC0,
+    {0x0012F835, 0x0012F8D7, 0x0058EA3A, 0x0058EBC7, 0x00590FD4,
+     0x00592987, 0x00595386, 0x00595E96, 0x00597845, 0x005ABEAC},
+    3,
+    0x00130326,
+    0x00130331,
+    0x00130D9F};
+
+const ExecutableLayout* g_executableLayout = nullptr;
+bool g_executableLayoutChecked = false;
+
+const ExecutableLayout* GetExecutableLayout() {
+    if (g_executableLayoutChecked) return g_executableLayout;
+    g_executableLayoutChecked = true;
+    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    if (!module) return nullptr;
+    const auto* const dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    const auto* const nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(
+        module + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) return nullptr;
+    const uintptr_t imageSize = nt->OptionalHeader.SizeOfImage;
+
+    for (const auto* layout : {&kSteamUnitedLayout, &kTmLoaderLayout}) {
+        if (imageSize < sizeof(void*) ||
+            layout->vehicleSetVisibilitySlotRva > imageSize - sizeof(void*)) {
+            continue;
+        }
+        auto* const slot = reinterpret_cast<void**>(
+            module + layout->vehicleSetVisibilitySlotRva);
+        if (*slot == reinterpret_cast<void*>(
+                         module + layout->vehicleSetVisibilityFunctionRva)) {
+            g_executableLayout = layout;
+            tmoxr::log::Info(std::string("Detected executable layout: ") +
+                             layout->name + ".");
+            break;
+        }
+    }
+    return g_executableLayout;
+}
+
+bool IsD3D9ProxyFileName(HMODULE module) {
+    wchar_t path[32768]{};
+    const DWORD length = GetModuleFileNameW(
+        module, path, static_cast<DWORD>(std::size(path)));
+    if (!length || length >= std::size(path)) return false;
+    const wchar_t* fileName = path;
+    for (const wchar_t* cursor = path; *cursor; ++cursor) {
+        if (*cursor == L'\\' || *cursor == L'/') fileName = cursor + 1;
+    }
+    return _wcsicmp(fileName, L"d3d9.dll") == 0;
+}
+
+bool InstallInjectedD3D9ImportHooks(HMODULE selfModule) {
+    // A normal installation is loaded by the game's d3d9 import already. The
+    // TMLoader package uses the same binary under the name TMOXR.dll, injected
+    // before the suspended game resumes, so redirect only the two d3d9 imports
+    // TrackMania uses to this module.
+    DWORD status = 0;
+    if (!IsTrackManiaGameProcess()) return false;
+    status |= 1;
+    g_tmLoaderInjectionStatus.store(status, std::memory_order_relaxed);
+    if (IsD3D9ProxyFileName(selfModule)) return false;
+    status |= 2;
+    g_tmLoaderInjectionStatus.store(status, std::memory_order_relaxed);
+
+    auto* const module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    if (!module) return false;
+    auto* const dos = reinterpret_cast<IMAGE_DOS_HEADER*>(module);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto* const nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(module + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) return false;
+    status |= 4;
+    g_tmLoaderInjectionStatus.store(status, std::memory_order_relaxed);
+    const auto& importDirectory =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!importDirectory.VirtualAddress ||
+        importDirectory.Size < sizeof(IMAGE_IMPORT_DESCRIPTOR)) return false;
+    status |= 8;
+    g_tmLoaderInjectionStatus.store(status, std::memory_order_relaxed);
+
+    auto* descriptor = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
+        module + importDirectory.VirtualAddress);
+    bool patchedCreate9 = false;
+    bool patchedPerf = false;
+    for (; descriptor->Name; ++descriptor) {
+        const char* const libraryName = reinterpret_cast<const char*>(
+            module + descriptor->Name);
+        if (_stricmp(libraryName, "d3d9.dll") != 0) continue;
+        status |= 16;
+        g_tmLoaderInjectionStatus.store(status, std::memory_order_relaxed);
+
+        auto* names = reinterpret_cast<IMAGE_THUNK_DATA32*>(module +
+            (descriptor->OriginalFirstThunk ? descriptor->OriginalFirstThunk
+                                            : descriptor->FirstThunk));
+        auto* functions = reinterpret_cast<IMAGE_THUNK_DATA32*>(
+            module + descriptor->FirstThunk);
+        for (; names->u1.AddressOfData; ++names, ++functions) {
+            if (IMAGE_SNAP_BY_ORDINAL32(names->u1.Ordinal)) continue;
+            auto* const import = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
+                module + names->u1.AddressOfData);
+            uintptr_t replacement = 0;
+            if (std::strcmp(reinterpret_cast<const char*>(import->Name),
+                            "Direct3DCreate9") == 0) {
+                replacement = reinterpret_cast<uintptr_t>(&Direct3DCreate9);
+                status |= 32;
+                patchedCreate9 = true;
+            } else if (std::strcmp(reinterpret_cast<const char*>(import->Name),
+                                   "D3DPERF_SetOptions") == 0) {
+                replacement = reinterpret_cast<uintptr_t>(&D3DPERF_SetOptions);
+                status |= 64;
+                patchedPerf = true;
+            } else {
+                continue;
+            }
+
+            DWORD oldProtection = 0;
+            if (!VirtualProtect(&functions->u1.Function, sizeof(functions->u1.Function),
+                                PAGE_READWRITE, &oldProtection)) {
+                if (replacement == reinterpret_cast<uintptr_t>(&Direct3DCreate9)) {
+                    patchedCreate9 = false;
+                } else {
+                    patchedPerf = false;
+                }
+                continue;
+            }
+            functions->u1.Function = static_cast<DWORD>(replacement);
+            if (replacement == reinterpret_cast<uintptr_t>(&Direct3DCreate9)) {
+                status |= 128;
+            } else {
+                status |= 256;
+            }
+            DWORD ignored = 0;
+            VirtualProtect(&functions->u1.Function, sizeof(functions->u1.Function),
+                           oldProtection, &ignored);
+        }
+        break;
+    }
+    FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
+    g_tmLoaderIatHookInstalled.store(
+        patchedCreate9 && patchedPerf, std::memory_order_relaxed);
+    g_tmLoaderInjectionStatus.store(status, std::memory_order_relaxed);
+    return patchedCreate9 && patchedPerf;
+}
+
 using VehicleSetVisibilityFn = void(__thiscall*)(void*, void*, int, int, int);
 VehicleSetVisibilityFn g_originalVehicleSetVisibility = nullptr;
 void** g_vehicleSetVisibilitySlot = nullptr;
@@ -454,13 +635,12 @@ void ReadCameraSettings(bool reloaded) {
 void LoadCameraSettings() {
     if (g_cameraSettings.loaded) return;
     g_cameraSettings.loaded = true;
-    wchar_t executablePath[MAX_PATH]{};
-    if (!GetModuleFileNameW(nullptr, executablePath, static_cast<DWORD>(std::size(executablePath)))) {
+    const auto configurationPath = tmoxr::ModuleFilePath(L"TMOXR.ini");
+    if (configurationPath.empty()) {
         tmoxr::log::Warn("Could not locate TMOXR.ini; using the default cockpit camera offset.");
         return;
     }
-    g_cameraSettings.configurationPath =
-        std::filesystem::path(executablePath).parent_path() / L"TMOXR.ini";
+    g_cameraSettings.configurationPath = configurationPath;
     ReadCameraSettings(false);
     WIN32_FILE_ATTRIBUTE_DATA attributes{};
     if (GetFileAttributesExW(g_cameraSettings.configurationPath.c_str(), GetFileExInfoStandard, &attributes)) {
@@ -551,14 +731,19 @@ bool InstallVehicleVisibilityHook() {
     if (g_originalVehicleSetVisibility) return true;
     const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     if (!module) return false;
-    // Steam TMUF 2.11.26: CTrackMania vtable + CGameApp::VehicleSetVisibility
-    // slot. Validate both RVAs before touching the executable's read-only data.
-    constexpr uintptr_t slotRva = 0x0073E0F8;
-    constexpr uintptr_t functionRva = 0x000859C0;
-    auto** slot = reinterpret_cast<void**>(module + slotRva);
-    void* const expected = reinterpret_cast<void*>(module + functionRva);
+    const ExecutableLayout* const layout = GetExecutableLayout();
+    if (!layout) {
+        tmoxr::log::Warn("Cockpit vehicle visibility hook was not installed because this TmForever.exe layout is not supported.");
+        return false;
+    }
+    // Validate the selected CTrackMania vtable slot before touching the
+    // executable's read-only data.
+    auto** slot = reinterpret_cast<void**>(
+        module + layout->vehicleSetVisibilitySlotRva);
+    void* const expected = reinterpret_cast<void*>(
+        module + layout->vehicleSetVisibilityFunctionRva);
     if (*slot != expected) {
-        tmoxr::log::Warn("Cockpit vehicle visibility hook was not installed because this TmForever.exe does not match the supported Steam 2.11.26 layout.");
+        tmoxr::log::Warn("Cockpit vehicle visibility hook was not installed because the selected executable layout failed validation.");
         return false;
     }
     DWORD oldProtection = 0;
@@ -684,21 +869,13 @@ using ComputeClippingPlanesFn = void(__thiscall*)(void*, void*, void*);
 // Steam TMUF 2.11.26: CHmsViewport::SClippingFrustum::ComputePlaneEqs. The
 // ModTMNF symbol identifies the equivalent TMNF routine; the United body and
 // both arguments were then verified at the RenderCameraNormal call sites.
-constexpr uintptr_t kComputeClippingPlanesRva = 0x0012C940;
 constexpr std::array<uint8_t, 5> kComputeClippingPlanesPrologue = {
     0x8B, 0x44, 0x24, 0x04, 0x56};
 constexpr size_t kComputeClippingPlanesPatchSize = kComputeClippingPlanesPrologue.size();
-constexpr std::array<uintptr_t, 10> kClippingPlaneCallSiteReturnRvas = {
-    0x0012F705, 0x0012F7A7, 0x0058E7DA, 0x0058E967, 0x00590D74,
-    0x00592727, 0x00595126, 0x00595C36, 0x005975E5, 0x005ABB9C};
-constexpr size_t kWorldClippingPlaneCallSiteIndex = 3;
-constexpr uintptr_t kRenderTreeVisibilityBranchRva = 0x001301F6;
 constexpr std::array<uint8_t, 11> kRenderTreeVisibilityBranch = {
     0x83, 0x7C, 0x24, 0x34, 0x00, 0x0F, 0x84, 0x6E, 0x0A, 0x00, 0x00};
 constexpr size_t kRenderTreeVisibilityBranchPatchSize =
     kRenderTreeVisibilityBranch.size();
-constexpr uintptr_t kRenderTreeVisibleContinuationRva = 0x00130201;
-constexpr uintptr_t kRenderTreeRejectedContinuationRva = 0x00130C6F;
 
 ComputeClippingPlanesFn g_originalComputeClippingPlanes = nullptr;
 uint8_t* g_computeClippingPlanesTarget = nullptr;
@@ -775,22 +952,23 @@ void __fastcall ComputeClippingPlanesHook(void* clippingFrustum, void*,
                                           void* frustum, void* location) {
     const uintptr_t returnAddress = reinterpret_cast<uintptr_t>(_ReturnAddress());
     const uintptr_t returnRva = returnAddress - g_executableModuleBase;
-    size_t callSiteIndex = kClippingPlaneCallSiteReturnRvas.size();
-    for (size_t i = 0; i < kClippingPlaneCallSiteReturnRvas.size(); ++i) {
-        if (returnRva == kClippingPlaneCallSiteReturnRvas[i]) {
+    const auto& callSites = g_executableLayout->clippingPlaneCallSiteReturnRvas;
+    size_t callSiteIndex = callSites.size();
+    for (size_t i = 0; i < callSites.size(); ++i) {
+        if (returnRva == callSites[i]) {
             callSiteIndex = i;
             ++g_stereo.clippingPlaneBuildsByCallSite[i];
             break;
         }
     }
-    if (callSiteIndex == kClippingPlaneCallSiteReturnRvas.size()) {
+    if (callSiteIndex == callSites.size()) {
         ++g_stereo.clippingPlaneBuildsUnknownCallSite;
     }
 
     void* clippingLocation = location;
     float hmdLocation[12]{};
     if (g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed) &&
-        callSiteIndex == kWorldClippingPlaneCallSiteIndex && location &&
+        callSiteIndex == g_executableLayout->worldClippingPlaneCallSiteIndex && location &&
         g_stereo.renderTreeCullingValid) {
         const auto* const originalLocation = static_cast<const float*>(location);
         std::memcpy(hmdLocation, originalLocation, sizeof(hmdLocation));
@@ -940,11 +1118,12 @@ bool WriteRelativeJump(uint8_t* source, const void* destination) {
 
 bool InstallRenderTreeHook(uintptr_t module) {
     if (g_renderTreeVisibilityBranchTarget) return true;
+    if (!g_executableLayout) return false;
     auto* const target = reinterpret_cast<uint8_t*>(
-        module + kRenderTreeVisibilityBranchRva);
+        module + g_executableLayout->renderTreeVisibilityBranchRva);
     if (std::memcmp(target, kRenderTreeVisibilityBranch.data(),
                     kRenderTreeVisibilityBranchPatchSize) != 0) {
-        tmoxr::log::Warn("The RenderTree visibility-branch hook was not installed because this TmForever.exe does not match Steam 2.11.26.");
+        tmoxr::log::Warn("The RenderTree visibility-branch hook was not installed because the selected executable layout failed validation.");
         return false;
     }
 
@@ -957,9 +1136,9 @@ bool InstallRenderTreeHook(uintptr_t module) {
         return false;
     }
     g_renderTreeVisibleContinuation =
-        module + kRenderTreeVisibleContinuationRva;
+        module + g_executableLayout->renderTreeVisibleContinuationRva;
     g_renderTreeRejectedContinuation =
-        module + kRenderTreeRejectedContinuationRva;
+        module + g_executableLayout->renderTreeRejectedContinuationRva;
     const bool wroteJump = WriteRelativeJump(
         target, reinterpret_cast<void*>(&RenderTreeVisibilityBranchHook));
     if (wroteJump && kRenderTreeVisibilityBranchPatchSize > 5) {
@@ -1011,10 +1190,16 @@ bool InstallCullingFrustumHook() {
     if (g_originalComputeClippingPlanes) return true;
     const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     if (!module) return false;
-    auto* const target = reinterpret_cast<uint8_t*>(module + kComputeClippingPlanesRva);
+    const ExecutableLayout* const layout = GetExecutableLayout();
+    if (!layout) {
+        tmoxr::log::Warn("The clipping-plane hook was not installed because this TmForever.exe layout is not supported.");
+        return false;
+    }
+    auto* const target = reinterpret_cast<uint8_t*>(
+        module + layout->computeClippingPlanesRva);
     if (std::memcmp(target, kComputeClippingPlanesPrologue.data(),
                     kComputeClippingPlanesPatchSize) != 0) {
-        tmoxr::log::Warn("The clipping-plane hook was not installed because this TmForever.exe does not match Steam 2.11.26.");
+        tmoxr::log::Warn("The clipping-plane hook was not installed because the selected executable layout failed validation.");
         return false;
     }
 
@@ -2086,11 +2271,13 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
     tmoxr::VrBridge::Instance().OnBeforePresent(device);
     ++g_stereo.presentedFrames;
     if (g_stereo.presentedFrames % 180 == 0) {
-        if (g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed)) {
+        if (g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed) &&
+            g_executableLayout) {
         std::ostringstream clippingCallSites;
         for (size_t i = 0; i < g_stereo.clippingPlaneBuildsByCallSite.size(); ++i) {
             if (i) clippingCallSites << '/';
-            clippingCallSites << std::hex << kClippingPlaneCallSiteReturnRvas[i]
+            clippingCallSites << std::hex
+                              << g_executableLayout->clippingPlaneCallSiteReturnRvas[i]
                               << std::dec << ':'
                               << g_stereo.clippingPlaneBuildsByCallSite[i];
         }
@@ -2732,6 +2919,9 @@ __declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT sdkVersion) {
         return g_create9 ? g_create9(sdkVersion) : nullptr;
     }
     tmoxr::log::Initialize();
+    if (g_tmLoaderIatHookInstalled.load(std::memory_order_relaxed)) {
+        tmoxr::log::Info("Activated through TrackMania ModLoader injection; redirected the game's D3D9 imports to TMOXR.dll.");
+    }
     LoadCameraSettings();
     InstallVehicleVisibilityHook();
     if (g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed)) {
@@ -2774,8 +2964,15 @@ extern "C" __declspec(dllexport) void WINAPI D3DPERF_SetOptions(DWORD options) {
     if (g_perfSetOptions) g_perfSetOptions(options);
 }
 
-BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
-    if (reason == DLL_PROCESS_DETACH && IsTrackManiaGameProcess()) {
+extern "C" __declspec(dllexport) DWORD WINAPI TMOXR_GetInjectionStatus() {
+    return g_tmLoaderInjectionStatus.load(std::memory_order_relaxed);
+}
+
+BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(module);
+        InstallInjectedD3D9ImportHooks(module);
+    } else if (reason == DLL_PROCESS_DETACH && IsTrackManiaGameProcess()) {
         RemoveCullingFrustumHook();
         RemoveVehicleVisibilityHook();
         tmoxr::VrBridge::Instance().Shutdown();

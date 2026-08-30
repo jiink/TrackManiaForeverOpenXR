@@ -1,6 +1,7 @@
 #include "vr_bridge.h"
 
 #include "log.h"
+#include "runtime_paths.h"
 
 #include <Windows.h>
 #include <d3d11.h>
@@ -17,6 +18,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -164,13 +166,7 @@ std::string ModulePath(HMODULE module) {
 }
 
 std::wstring LogFilePath() {
-    std::vector<wchar_t> executable(32768);
-    const DWORD length = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
-    if (!length || length >= executable.size()) return L"TMOXR.log beside TmForever.exe";
-    std::wstring path(executable.data(), length);
-    const size_t separator = path.find_last_of(L"\\/");
-    path.resize(separator == std::wstring::npos ? 0 : separator + 1);
-    return path + L"TMOXR.log";
+    return ModuleFilePath(L"TMOXR.log").wstring();
 }
 
 template <typename T>
@@ -890,14 +886,16 @@ struct VrBridge::Impl {
         if (!device) return false;
         log::Info("Beginning OpenXR initialization; Direct3D 9 frames will be uploaded to a D3D11 bridge device.");
         enabledImplicitApiLayers = LogOpenXrDiscovery();
-        loader = LoadLibraryW(L"openxr_loader.dll");
+        const std::filesystem::path loaderPath = ModuleFilePath(L"openxr_loader.dll");
+        loader = LoadLibraryW(loaderPath.c_str());
         if (!loader) {
             const DWORD error = GetLastError();
             const std::string detail = "Windows error " + std::to_string(error);
             const std::string guidance = error == ERROR_BAD_EXE_FORMAT ?
-                "The OpenXR loader may be 64-bit. Install Win32/bin/openxr_loader.dll beside TmForever.exe." :
-                "Install Win32/bin/openxr_loader.dll beside TmForever.exe.";
-            log::Error("Could not load the Win32 openxr_loader.dll beside TrackMania. " + detail + ". " + guidance);
+                "The OpenXR loader may be 64-bit. Install Win32/bin/openxr_loader.dll beside the TMOXR module." :
+                "Install Win32/bin/openxr_loader.dll beside the TMOXR module.";
+            log::Error("Could not load the Win32 OpenXR loader at " +
+                Utf8(loaderPath.c_str()) + ". " + detail + ". " + guidance);
             return DisableAfterStartupFailure("loading the Win32 OpenXR loader", detail, guidance);
         }
         log::Info("Loaded OpenXR loader from " + ModulePath(loader) + ".");

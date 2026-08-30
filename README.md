@@ -82,6 +82,28 @@ Use a different game path or deliberately refresh the pinned loader with:
 .\scripts\install.ps1 -GamePath 'D:\Games\TrackMania United' -RefreshOpenXrLoader
 ```
 
+### TrackMania ModLoader
+
+The same build can be installed as a toggleable local
+[TrackMania ModLoader](https://tomashu.dev/software/tmloader/) product. Build
+`d3d9`, then run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-tmloader.ps1
+```
+
+Restart TMLoader after installation. `TrackMania OpenXR` will appear with the
+other mods and can be enabled independently for each profile. The installer
+copies the current game-folder `TMOXR.ini` on first installation (or the
+repository defaults when none exists) and preserves subsequent edits. The
+managed configuration and current log are stored under
+`%LocalAppData%\TMLoader\database\TmForever\products\TMOXR\0.1.0-dev`.
+
+The TMLoader package is self-contained: `TMOXR.dll` redirects the managed
+game's existing Direct3D 9 imports when injected, while the normal installation
+continues to use the same binary as a `d3d9.dll` proxy. Both TMLoader 2.12.0
+and its 2.12.0-compat executable layouts are supported.
+
 ## Manual install
 
 1. Back up any existing `d3d9.dll` in the TrackMania folder.
@@ -119,7 +141,7 @@ The mod tracks manual camera keys 1–7. While its camera state is initially unk
 
 ## Diagnostics
 
-Every launch replaces `TMOXR.log` beside `TmForever.exe`, so the file contains only the current session. Attach the complete file when reporting a crash or initialization problem. For rendering problems, the periodic stereo, shader-coverage, tracked-pose, and OpenXR-timing lines are usually sufficient.
+Every launch replaces `TMOXR.log` beside the loaded mod DLL, so the file contains only the current session. This is the game directory for a normal proxy installation and the selected TMLoader product-version directory for a TMLoader launch. Attach the complete file when reporting a crash or initialization problem. For rendering problems, the periodic stereo, shader-coverage, tracked-pose, and OpenXR-timing lines are usually sufficient.
 
 If OpenXR initialization fails, the mod displays a one-time error dialog over the game with the failing stage, symbolic error name, and a suggested action. Dismiss it to continue playing on the monitor without VR; the complete details remain in `TMOXR.log`.
 

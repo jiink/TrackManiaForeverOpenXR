@@ -1,4 +1,5 @@
 #include "log.h"
+#include "runtime_paths.h"
 
 #include <Windows.h>
 
@@ -15,9 +16,7 @@ std::mutex g_mutex;
 std::ofstream g_file;
 
 std::filesystem::path LogPath() {
-    wchar_t executable[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, executable, MAX_PATH);
-    return std::filesystem::path(executable).parent_path() / L"TMOXR.log";
+    return ModuleFilePath(L"TMOXR.log");
 }
 
 std::string Timestamp() {
