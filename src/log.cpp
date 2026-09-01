@@ -16,7 +16,7 @@ std::mutex g_mutex;
 std::ofstream g_file;
 
 std::filesystem::path LogPath() {
-    return UserDataFilePath(L"TMOXR.log");
+    return UserDataFilePath(L"TMFOXR.log");
 }
 
 std::string Timestamp() {
@@ -37,7 +37,7 @@ void Initialize() {
     // to mistake an old experimental message for the currently deployed build.
     g_file.open(LogPath(), std::ios::out | std::ios::trunc);
     if (g_file.is_open()) {
-        g_file << "========== TrackMania OpenXR bridge started ==========" << std::endl;
+        g_file << "========== TrackMania Forever OpenXR started ==========" << std::endl;
     }
 }
 

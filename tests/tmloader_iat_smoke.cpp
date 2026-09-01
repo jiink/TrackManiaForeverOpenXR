@@ -37,15 +37,15 @@ FARPROC ImportedFunction(const char* functionName) {
 }
 
 int main() {
-    HMODULE tmoxr = LoadLibraryW(L"TMOXR.dll");
+    HMODULE tmoxr = LoadLibraryW(L"TMFOXR.dll");
     if (!tmoxr) {
-        std::fprintf(stderr, "LoadLibraryW(TMOXR.dll) failed: %lu\n",
+        std::fprintf(stderr, "LoadLibraryW(TMFOXR.dll) failed: %lu\n",
                      GetLastError());
         return 1;
     }
     using InjectionStatusFn = DWORD(WINAPI*)();
     const auto injectionStatus = reinterpret_cast<InjectionStatusFn>(
-        GetProcAddress(tmoxr, "TMOXR_GetInjectionStatus"));
+        GetProcAddress(tmoxr, "TMFOXR_GetInjectionStatus"));
     D3DPERF_SetOptions(0);
     if (IDirect3D9* d3d = Direct3DCreate9(D3D_SDK_VERSION)) d3d->Release();
 

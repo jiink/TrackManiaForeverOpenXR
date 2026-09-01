@@ -1,8 +1,8 @@
 #include "log.h"
 #include "runtime_paths.h"
-#define Direct3DCreate9 TMOXR_SDK_DECLARATION_Direct3DCreate9
-#define Direct3DCreate9Ex TMOXR_SDK_DECLARATION_Direct3DCreate9Ex
-#define D3DPERF_SetOptions TMOXR_SDK_DECLARATION_D3DPERF_SetOptions
+#define Direct3DCreate9 TMFOXR_SDK_DECLARATION_Direct3DCreate9
+#define Direct3DCreate9Ex TMFOXR_SDK_DECLARATION_Direct3DCreate9Ex
+#define D3DPERF_SetOptions TMFOXR_SDK_DECLARATION_D3DPERF_SetOptions
 #include "vr_bridge.h"
 
 #include <Windows.h>
@@ -368,7 +368,7 @@ bool IsD3D9ProxyFileName(HMODULE module) {
 
 bool InstallInjectedD3D9ImportHooks(HMODULE selfModule) {
     // A normal installation is loaded by the game's d3d9 import already. The
-    // TMLoader package uses the same binary under the name TMOXR.dll, injected
+    // TMLoader package uses the same binary under the name TMFOXR.dll, injected
     // before the suspended game resumes, so redirect only the two d3d9 imports
     // TrackMania uses to this module.
     DWORD status = 0;
@@ -635,13 +635,13 @@ void ReadCameraSettings(bool reloaded) {
 void LoadCameraSettings() {
     if (g_cameraSettings.loaded) return;
     g_cameraSettings.loaded = true;
-    const auto configurationPath = tmoxr::UserDataFilePath(L"TMOXR.ini");
+    const auto configurationPath = tmoxr::UserDataFilePath(L"TMFOXR.ini");
     if (configurationPath.empty()) {
-        tmoxr::log::Warn("Could not locate TMOXR.ini; using the default cockpit camera offset.");
+        tmoxr::log::Warn("Could not locate TMFOXR.ini; using the default cockpit camera offset.");
         return;
     }
     if (GetFileAttributesW(configurationPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        const auto packagedConfiguration = tmoxr::ModuleFilePath(L"TMOXR.defaults.ini");
+        const auto packagedConfiguration = tmoxr::ModuleFilePath(L"TMFOXR.defaults.ini");
         if (CopyFileW(packagedConfiguration.c_str(), configurationPath.c_str(), TRUE)) {
             tmoxr::log::Info("Created the persistent configuration at " +
                 configurationPath.string() + ".");
@@ -2780,7 +2780,7 @@ DWORD WINAPI ShowIncompatibleGraphicsWarning(void* context) {
     auto* warning = static_cast<IncompatibleGraphicsWarning*>(context);
     const HWND gameWindow = warning->gameWindow;
     std::wstring message =
-        L"TrackMania OpenXR did not start because these graphics settings are incompatible with VR:\n\n";
+        L"TrackMania Forever OpenXR did not start because these graphics settings are incompatible with VR:\n\n";
     if (warning->fullscreen) message += L"  - Fullscreen mode is enabled.\n";
     if (warning->antialiasing) message += L"  - Anti-aliasing is enabled.\n";
     if (warning->windowFit.tooLarge) {
@@ -2796,7 +2796,7 @@ DWORD WINAPI ShowIncompatibleGraphicsWarning(void* context) {
         L"\nOpen TmForeverLauncher.exe, select windowed mode, set anti-aliasing to None, "
         L"choose a resolution whose complete window fits on the monitor, and then restart TrackMania."
         L"\n\nThe game will continue on the desktop without VR.";
-    MessageBoxW(nullptr, message.c_str(), L"TrackMania OpenXR - incompatible graphics settings",
+    MessageBoxW(nullptr, message.c_str(), L"TrackMania Forever OpenXR - incompatible graphics settings",
                 MB_OK | MB_ICONWARNING | MB_TASKMODAL | MB_SETFOREGROUND | MB_TOPMOST);
     if (gameWindow && IsWindow(gameWindow)) SetForegroundWindow(gameWindow);
     return 0;
@@ -2927,7 +2927,7 @@ __declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT sdkVersion) {
     }
     tmoxr::log::Initialize();
     if (g_tmLoaderIatHookInstalled.load(std::memory_order_relaxed)) {
-        tmoxr::log::Info("Activated through TrackMania ModLoader injection; redirected the game's D3D9 imports to TMOXR.dll.");
+        tmoxr::log::Info("Activated through TrackMania ModLoader injection; redirected the game's D3D9 imports to TMFOXR.dll.");
     }
     LoadCameraSettings();
     InstallVehicleVisibilityHook();
@@ -2971,7 +2971,7 @@ extern "C" __declspec(dllexport) void WINAPI D3DPERF_SetOptions(DWORD options) {
     if (g_perfSetOptions) g_perfSetOptions(options);
 }
 
-extern "C" __declspec(dllexport) DWORD WINAPI TMOXR_GetInjectionStatus() {
+extern "C" __declspec(dllexport) DWORD WINAPI TMFOXR_GetInjectionStatus() {
     return g_tmLoaderInjectionStatus.load(std::memory_order_relaxed);
 }
 

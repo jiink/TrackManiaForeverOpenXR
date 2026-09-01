@@ -60,7 +60,7 @@ This was verified by disassembling the installed game executable at VA `0x0054BF
    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1
    ```
 
-4. Launch the game and first confirm this line appears in `TMOXR.log`:
+4. Launch the game and first confirm this line appears in `TMFOXR.log`:
 
    ```text
    Installed CHmsPortal::IsVisible hook; portal-zone rejection will be overridden while VR tracking is active.
@@ -259,7 +259,7 @@ Source changes in the old task were applied by generating a Git patch and piping
 - The log can be read directly from:
 
   ```text
-  C:\Program Files (x86)\Steam\steamapps\common\TrackMania United\TMOXR.log
+  Documents\TrackMania\TMFOXR.log
   ```
 
 - `TmForeverLauncher.exe` must remain an unmodified passthrough launch path.

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(TrackManiaOpenXRBridge LANGUAGES CXX)
+project(TrackManiaForeverOpenXR LANGUAGES CXX)
 
 if(NOT WIN32 OR NOT MSVC)
   message(FATAL_ERROR "This project builds a Win32 Direct3D 9 proxy and requires MSVC on Windows.")
@@ -42,7 +42,14 @@ set_target_properties(tmloader_iat_smoke PROPERTIES OUTPUT_NAME "TmForever")
 
 set_target_properties(d3d9 PROPERTIES
   OUTPUT_NAME "d3d9"
-  ARCHIVE_OUTPUT_NAME "TMOXR"
+  ARCHIVE_OUTPUT_NAME "TMFOXR"
   PREFIX ""
   SUFFIX ".dll"
+)
+
+add_custom_command(TARGET d3d9 POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:d3d9>
+    $<TARGET_FILE_DIR:d3d9>/TMFOXR.dll
+  COMMENT "Creating the TrackMania ModLoader TMFOXR.dll"
 )

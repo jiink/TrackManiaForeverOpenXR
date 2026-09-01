@@ -12,7 +12,7 @@ $ErrorActionPreference = 'Stop'
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptRoot '..'))
 if ([string]::IsNullOrWhiteSpace($ModDll)) {
-    $ModDll = Join-Path $repositoryRoot 'build\d3d9.dll'
+    $ModDll = Join-Path $repositoryRoot 'build\TMFOXR.dll'
 }
 if ([string]::IsNullOrWhiteSpace($OpenXrLoader)) {
     $OpenXrLoader = Join-Path $repositoryRoot 'dlls\32-bit\openxr_loader.dll'
@@ -56,18 +56,18 @@ foreach ($binary in @($resolvedModDll, $resolvedOpenXrLoader)) {
     }
 }
 
-$productPath = Join-Path $databasePath 'products\TMOXR'
+$productPath = Join-Path $databasePath 'products\TMFOXR'
 $versionPath = Join-Path $productPath $Version
 New-Item -ItemType Directory -Path $versionPath -Force | Out-Null
 
 $productDescription = @'
-name: TrackMania OpenXR
-author: TrackMania OpenXR contributors
+name: TrackMania Forever OpenXR
+author: TrackMania Forever OpenXR contributors
 type: modification
-description: Native stereoscopic OpenXR rendering and headset tracking for TrackMania United Forever. Settings are stored in Documents\TrackMania\TMOXR.ini.
+description: Native stereoscopic OpenXR rendering and headset tracking for TrackMania United Forever. Settings are stored in Documents\TrackMania\TMFOXR.ini.
 '@
 $versionDescription = @"
-executable: TMOXR.dll
+executable: TMFOXR.dll
 priority: 1000000000
 dependencies:
   - id: CoreMod
@@ -79,29 +79,25 @@ changelog: Local development build with TrackMania ModLoader support
 [System.IO.File]::WriteAllText(
     (Join-Path $versionPath 'description.yaml'), $versionDescription.Trim() + "`r`n")
 
-Copy-Item -LiteralPath $resolvedModDll -Destination (Join-Path $versionPath 'TMOXR.dll') -Force
+Copy-Item -LiteralPath $resolvedModDll -Destination (Join-Path $versionPath 'TMFOXR.dll') -Force
 Copy-Item -LiteralPath $resolvedOpenXrLoader -Destination (Join-Path $versionPath 'openxr_loader.dll') -Force
 
 $documentsPath = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
 if ([string]::IsNullOrWhiteSpace($documentsPath)) {
-    throw 'Windows did not provide a Documents folder for the persistent TMOXR configuration.'
+    throw 'Windows did not provide a Documents folder for the persistent TMFOXR configuration.'
 }
 $userDataPath = Join-Path $documentsPath 'TrackMania'
 New-Item -ItemType Directory -Path $userDataPath -Force | Out-Null
-$destinationConfiguration = Join-Path $userDataPath 'TMOXR.ini'
+$destinationConfiguration = Join-Path $userDataPath 'TMFOXR.ini'
 if (-not (Test-Path -LiteralPath $destinationConfiguration -PathType Leaf)) {
-    $sourceConfiguration = Join-Path $repositoryRoot 'TMOXR.ini'
+    $sourceConfiguration = Join-Path $repositoryRoot 'TMFOXR.defaults.ini'
     Copy-Item -LiteralPath $sourceConfiguration -Destination $destinationConfiguration
-    Write-Host "Installed editable TMOXR configuration: '$destinationConfiguration'."
+    Write-Host "Installed editable TMFOXR configuration: '$destinationConfiguration'."
 }
 else {
-    Write-Host "Preserved existing TMOXR configuration '$destinationConfiguration'."
+    Write-Host "Preserved existing TMFOXR configuration '$destinationConfiguration'."
 }
-$legacyPackagedConfiguration = Join-Path $versionPath 'TMOXR.ini'
-if (Test-Path -LiteralPath $legacyPackagedConfiguration -PathType Leaf) {
-    Remove-Item -LiteralPath $legacyPackagedConfiguration -Force
-}
-Copy-Item -LiteralPath (Join-Path $repositoryRoot 'TMOXR.ini') -Destination (Join-Path $versionPath 'TMOXR.defaults.ini') -Force
+Copy-Item -LiteralPath (Join-Path $repositoryRoot 'TMFOXR.defaults.ini') -Destination (Join-Path $versionPath 'TMFOXR.defaults.ini') -Force
 
-Write-Host "Installed local TMLoader product 'TrackMania OpenXR' $Version at '$versionPath'."
-Write-Host 'Restart TrackMania ModLoader, select the TrackMania OpenXR diamond for the desired profile, and launch that profile.'
+Write-Host "Installed local TMLoader product 'TrackMania Forever OpenXR' $Version at '$versionPath'."
+Write-Host 'Restart TrackMania ModLoader, select the TrackMania Forever OpenXR diamond for the desired profile, and launch that profile.'
