@@ -74,7 +74,8 @@ The installer:
 1. Validates the game and built mod paths.
 2. Preserves an existing proxy as `d3d9.before-tmoxr.dll` when that backup does not already exist.
 3. Copies `build\d3d9.dll` beside `TmForever.exe`.
-4. Checks whether the local OpenXR loader is Win32. If it is missing or has the wrong architecture, it downloads the pinned official Khronos 1.1.62 Windows loader archive, verifies its SHA-256 checksum, and installs `Win32\bin\openxr_loader.dll`.
+4. Installs the editable settings at `Documents\TrackMania\TMOXR.ini`, preserving the file when it already exists.
+5. Checks whether the local OpenXR loader is Win32. If it is missing or has the wrong architecture, it downloads the pinned official Khronos 1.1.62 Windows loader archive, verifies its SHA-256 checksum, and installs `Win32\bin\openxr_loader.dll`.
 
 Use a different game path or deliberately refresh the pinned loader with:
 
@@ -94,10 +95,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-tmloader.ps1
 
 Restart TMLoader after installation. `TrackMania OpenXR` will appear with the
 other mods and can be enabled independently for each profile. The installer
-copies the current game-folder `TMOXR.ini` on first installation (or the
-repository defaults when none exists) and preserves subsequent edits. The
-managed configuration and current log are stored under
-`%LocalAppData%\TMLoader\database\TmForever\products\TMOXR\0.1.0-dev`.
+installs the repository's default `TMOXR.ini` when the shared settings file is
+absent and preserves subsequent edits. Both installation methods use the same
+stable, discoverable settings and log paths:
+`Documents\TrackMania\TMOXR.ini` and `Documents\TrackMania\TMOXR.log`.
+The TMLoader product description also identifies the settings location.
 
 The TMLoader package is self-contained: `TMOXR.dll` redirects the managed
 game's existing Direct3D 9 imports when injected, while the normal installation
@@ -110,8 +112,9 @@ and its 2.12.0-compat executable layouts are supported.
 2. Copy `build\d3d9.dll` beside `TmForever.exe` (normally `C:\Program Files (x86)\Steam\steamapps\common\TrackMania United`).
 3. Download the official Khronos [`openxr_loader_windows-1.1.62.zip`](https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-1.1.62/openxr_loader_windows-1.1.62.zip).
 4. Extract the archive and copy **`Win32\bin\openxr_loader.dll`** beside `TmForever.exe`. Do not use `x64\bin\openxr_loader.dll`.
-5. For Virtual Desktop, select **VirtualDesktopXR (VDXR)** as the OpenXR runtime, connect the headset, and launch TrackMania normally.
-6. Put on the headset and enter a race.
+5. Create `Documents\TrackMania` if necessary and copy the repository's `TMOXR.ini` into it.
+6. For Virtual Desktop, select **VirtualDesktopXR (VDXR)** as the OpenXR runtime, connect the headset, and launch TrackMania normally.
+7. Put on the headset and enter a race.
 
 The loader package being version 1.1.62 does not require the application or active runtime to use OpenXR API 1.1. The mod deliberately requests OpenXR 1.0 for compatibility with runtimes that expose 1.0; newer loaders can negotiate that version normally.
 
@@ -119,7 +122,7 @@ The loader package being version 1.1.62 does not require the application or acti
 
 Press camera key **3** (the numeric keypad key used by TrackMania, or a top-row 3 binding) to enable the VR driver-seat offset. Pressing camera keys 1, 2, or 4–7 disables it. The seat transform affects only the two headset views. The native-car visibility override is game-wide, so the monitor may also show parts of the car while camera 3 is selected.
 
-The install script places `TMOXR.ini` beside `TmForever.exe`. It preserves existing settings and adds any missing per-environment camera sections. The mod detects the active Stadium, Island, Desert, Rally, Bay, Coast, or Snow vehicle and selects the matching `[Camera.<Environment>]` section automatically. Each section contains offsets measured in metres in the camera's local axes:
+All installation methods read `Documents\TrackMania\TMOXR.ini`. The install scripts preserve existing settings, and the normal installer adds any missing per-environment camera sections. The mod detects the active Stadium, Island, Desert, Rally, Bay, Coast, or Snow vehicle and selects the matching `[Camera.<Environment>]` section automatically. Each section contains offsets measured in metres in the camera's local axes:
 
 - `CockpitOffsetRight`: positive moves the viewpoint to the right.
 - `CockpitOffsetUp`: positive moves it upward.
@@ -141,7 +144,7 @@ The mod tracks manual camera keys 1–7. While its camera state is initially unk
 
 ## Diagnostics
 
-Every launch replaces `TMOXR.log` beside the loaded mod DLL, so the file contains only the current session. This is the game directory for a normal proxy installation and the selected TMLoader product-version directory for a TMLoader launch. Attach the complete file when reporting a crash or initialization problem. For rendering problems, the periodic stereo, shader-coverage, tracked-pose, and OpenXR-timing lines are usually sufficient.
+Every launch replaces `Documents\TrackMania\TMOXR.log`, so the file contains only the current session regardless of the installation method. Attach the complete file when reporting a crash or initialization problem. For rendering problems, the periodic stereo, shader-coverage, tracked-pose, and OpenXR-timing lines are usually sufficient.
 
 If OpenXR initialization fails, the mod displays a one-time error dialog over the game with the failing stage, symbolic error name, and a suggested action. Dismiss it to continue playing on the monitor without VR; the complete details remain in `TMOXR.log`.
 

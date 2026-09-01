@@ -1,7 +1,6 @@
 [CmdletBinding()]
 param(
     [string]$TMLoaderPath = (Join-Path $env:LOCALAPPDATA 'TMLoader'),
-    [string]$GamePath = 'C:\Program Files (x86)\Steam\steamapps\common\TrackMania United',
     [string]$ModDll,
     [string]$OpenXrLoader,
     [string]$Version = '0.1.0-dev'
@@ -65,7 +64,7 @@ $productDescription = @'
 name: TrackMania OpenXR
 author: TrackMania OpenXR contributors
 type: modification
-description: Native stereoscopic OpenXR rendering and headset tracking for TrackMania United Forever.
+description: Native stereoscopic OpenXR rendering and headset tracking for TrackMania United Forever. Settings are stored in Documents\TrackMania\TMOXR.ini.
 '@
 $versionDescription = @"
 executable: TMOXR.dll
@@ -83,20 +82,26 @@ changelog: Local development build with TrackMania ModLoader support
 Copy-Item -LiteralPath $resolvedModDll -Destination (Join-Path $versionPath 'TMOXR.dll') -Force
 Copy-Item -LiteralPath $resolvedOpenXrLoader -Destination (Join-Path $versionPath 'openxr_loader.dll') -Force
 
-$destinationConfiguration = Join-Path $versionPath 'TMOXR.ini'
+$documentsPath = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
+if ([string]::IsNullOrWhiteSpace($documentsPath)) {
+    throw 'Windows did not provide a Documents folder for the persistent TMOXR configuration.'
+}
+$userDataPath = Join-Path $documentsPath 'TrackMania'
+New-Item -ItemType Directory -Path $userDataPath -Force | Out-Null
+$destinationConfiguration = Join-Path $userDataPath 'TMOXR.ini'
 if (-not (Test-Path -LiteralPath $destinationConfiguration -PathType Leaf)) {
-    $gameConfiguration = Join-Path ([System.IO.Path]::GetFullPath($GamePath)) 'TMOXR.ini'
-    $sourceConfiguration = if (Test-Path -LiteralPath $gameConfiguration -PathType Leaf) {
-        $gameConfiguration
-    } else {
-        Join-Path $repositoryRoot 'TMOXR.ini'
-    }
+    $sourceConfiguration = Join-Path $repositoryRoot 'TMOXR.ini'
     Copy-Item -LiteralPath $sourceConfiguration -Destination $destinationConfiguration
-    Write-Host "Installed editable configuration from '$sourceConfiguration'."
+    Write-Host "Installed editable TMOXR configuration: '$destinationConfiguration'."
 }
 else {
-    Write-Host "Preserved existing TMLoader configuration '$destinationConfiguration'."
+    Write-Host "Preserved existing TMOXR configuration '$destinationConfiguration'."
 }
+$legacyPackagedConfiguration = Join-Path $versionPath 'TMOXR.ini'
+if (Test-Path -LiteralPath $legacyPackagedConfiguration -PathType Leaf) {
+    Remove-Item -LiteralPath $legacyPackagedConfiguration -Force
+}
+Copy-Item -LiteralPath (Join-Path $repositoryRoot 'TMOXR.ini') -Destination (Join-Path $versionPath 'TMOXR.defaults.ini') -Force
 
 Write-Host "Installed local TMLoader product 'TrackMania OpenXR' $Version at '$versionPath'."
 Write-Host 'Restart TrackMania ModLoader, select the TrackMania OpenXR diamond for the desired profile, and launch that profile.'

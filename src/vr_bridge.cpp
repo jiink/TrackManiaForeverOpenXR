@@ -166,7 +166,7 @@ std::string ModulePath(HMODULE module) {
 }
 
 std::wstring LogFilePath() {
-    return ModuleFilePath(L"TMOXR.log").wstring();
+    return UserDataFilePath(L"TMOXR.log").wstring();
 }
 
 template <typename T>

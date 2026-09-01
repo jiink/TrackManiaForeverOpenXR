@@ -43,7 +43,13 @@ $destinationProxy = Join-Path $resolvedGamePath 'd3d9.dll'
 $proxyBackup = Join-Path $resolvedGamePath 'd3d9.before-tmoxr.dll'
 $destinationLoader = Join-Path $resolvedGamePath 'openxr_loader.dll'
 $sourceConfiguration = Join-Path $scriptRoot '..\TMOXR.ini'
-$destinationConfiguration = Join-Path $resolvedGamePath 'TMOXR.ini'
+$documentsPath = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
+if ([string]::IsNullOrWhiteSpace($documentsPath)) {
+    throw 'Windows did not provide a Documents folder for the TMOXR configuration.'
+}
+$userDataPath = Join-Path $documentsPath 'TrackMania'
+New-Item -ItemType Directory -Path $userDataPath -Force | Out-Null
+$destinationConfiguration = Join-Path $userDataPath 'TMOXR.ini'
 
 if (-not (Test-Path -LiteralPath $gameExecutable -PathType Leaf)) {
     throw "TmForever.exe was not found at '$gameExecutable'. Pass the correct -GamePath."

@@ -16,7 +16,7 @@ std::mutex g_mutex;
 std::ofstream g_file;
 
 std::filesystem::path LogPath() {
-    return ModuleFilePath(L"TMOXR.log");
+    return UserDataFilePath(L"TMOXR.log");
 }
 
 std::string Timestamp() {

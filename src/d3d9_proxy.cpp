@@ -635,10 +635,17 @@ void ReadCameraSettings(bool reloaded) {
 void LoadCameraSettings() {
     if (g_cameraSettings.loaded) return;
     g_cameraSettings.loaded = true;
-    const auto configurationPath = tmoxr::ModuleFilePath(L"TMOXR.ini");
+    const auto configurationPath = tmoxr::UserDataFilePath(L"TMOXR.ini");
     if (configurationPath.empty()) {
         tmoxr::log::Warn("Could not locate TMOXR.ini; using the default cockpit camera offset.");
         return;
+    }
+    if (GetFileAttributesW(configurationPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        const auto packagedConfiguration = tmoxr::ModuleFilePath(L"TMOXR.defaults.ini");
+        if (CopyFileW(packagedConfiguration.c_str(), configurationPath.c_str(), TRUE)) {
+            tmoxr::log::Info("Created the persistent configuration at " +
+                configurationPath.string() + ".");
+        }
     }
     g_cameraSettings.configurationPath = configurationPath;
     ReadCameraSettings(false);
