@@ -40,10 +40,16 @@ $resolvedGamePath = [System.IO.Path]::GetFullPath($GamePath)
 $resolvedModDll = [System.IO.Path]::GetFullPath($ModDll)
 $gameExecutable = Join-Path $resolvedGamePath 'TmForever.exe'
 $destinationProxy = Join-Path $resolvedGamePath 'd3d9.dll'
-$proxyBackup = Join-Path $resolvedGamePath 'd3d9.before-tmoxr.dll'
+$proxyBackup = Join-Path $resolvedGamePath 'd3d9.before-tmfoxr.dll'
 $destinationLoader = Join-Path $resolvedGamePath 'openxr_loader.dll'
-$sourceConfiguration = Join-Path $scriptRoot '..\TMOXR.ini'
-$destinationConfiguration = Join-Path $resolvedGamePath 'TMOXR.ini'
+$sourceConfiguration = Join-Path $scriptRoot '..\TMFOXR.defaults.ini'
+$documentsPath = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
+if ([string]::IsNullOrWhiteSpace($documentsPath)) {
+    throw 'Windows did not provide a Documents folder for the TMFOXR configuration.'
+}
+$userDataPath = Join-Path $documentsPath 'TrackMania'
+New-Item -ItemType Directory -Path $userDataPath -Force | Out-Null
+$destinationConfiguration = Join-Path $userDataPath 'TMFOXR.ini'
 
 if (-not (Test-Path -LiteralPath $gameExecutable -PathType Leaf)) {
     throw "TmForever.exe was not found at '$gameExecutable'. Pass the correct -GamePath."
@@ -60,7 +66,7 @@ if ((Test-Path -LiteralPath $destinationProxy -PathType Leaf) -and
     Write-Host "Preserved existing d3d9.dll as '$proxyBackup'."
 }
 Copy-Item -LiteralPath $resolvedModDll -Destination $destinationProxy -Force
-Write-Host "Installed TrackMania OpenXR proxy: '$destinationProxy'."
+Write-Host "Installed TrackMania Forever OpenXR proxy: '$destinationProxy'."
 
 if ((Test-Path -LiteralPath $sourceConfiguration -PathType Leaf) -and
     -not (Test-Path -LiteralPath $destinationConfiguration -PathType Leaf)) {
@@ -120,7 +126,7 @@ elseif ((Test-Path -LiteralPath $sourceConfiguration -PathType Leaf) -and
 $loaderIsWin32 = (Test-Path -LiteralPath $destinationLoader -PathType Leaf) -and
     ((Get-PeMachine -Path $destinationLoader) -eq $x86Machine)
 if ($RefreshOpenXrLoader -or -not $loaderIsWin32) {
-    $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('tmoxr-loader-' + [guid]::NewGuid().ToString('N'))
+    $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('tmfoxr-loader-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
     try {
         $archivePath = Join-Path $temporaryRoot "openxr_loader_windows-$loaderVersion.zip"

@@ -9,7 +9,7 @@
 #include <string>
 
 int main() {
-    HWND window = CreateWindowExW(0, L"STATIC", L"TMOXR D3D9On12 smoke", WS_OVERLAPPEDWINDOW,
+    HWND window = CreateWindowExW(0, L"STATIC", L"TMFOXR D3D9On12 smoke", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 64, 64, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!window) return 1;
     wchar_t systemDirectory[MAX_PATH]{};

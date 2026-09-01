@@ -1,4 +1,4 @@
-# TrackMania United Forever OpenXR mod
+# TrackMania Forever OpenXR
 
 https://github.com/user-attachments/assets/5b76c802-7499-458f-a74e-979e9e26bcc3
 
@@ -16,7 +16,7 @@ https://github.com/user-attachments/assets/5b76c802-7499-458f-a74e-979e9e26bcc3
 
 
 
-This project adds headset-only VR to the 32-bit Steam release of TrackMania United Forever. It uses the active Win32 OpenXR runtime, works with Virtual Desktop through VDXR, and leaves the game's input system unchanged. Motion controllers are ignored and are not required.
+TrackMania Forever OpenXR (TMFOXR) is a mod for the 32-bit Steam release of TrackMania United Forever. It adds headset-only VR using the active Win32 OpenXR runtime, works with Virtual Desktop through VDXR, and leaves the game's input system unchanged. Motion controllers are ignored and are not required.
 
 ## Current features
 
@@ -27,7 +27,7 @@ This project adds headset-only VR to the 32-bit Steam release of TrackMania Unit
 - Correct OpenXR predicted-pose timing so runtime reprojection can stabilize lower-rate game frames.
 - The original desktop render remains untouched as a troubleshooting view.
 - Menus, HUD elements, and other desktop-space UI are captured onto a world-locked virtual screen two metres in front of the initial headset pose.
-- Detailed `TMOXR.log` diagnostics for D3D9 hooks, shader coverage, tracking, frame timing, swapchains, uploads, and OpenXR errors.
+- Detailed `TMFOXR.log` diagnostics for D3D9 hooks, shader coverage, tracking, frame timing, swapchains, uploads, and OpenXR errors.
 
 The bridge renders private D3D9 eye surfaces, reads them back through system memory, and uploads them to D3D11 OpenXR swapchains because OpenXR cannot consume Direct3D 9 surfaces directly.
 
@@ -58,7 +58,7 @@ cmake --build build --target d3d9
 
 CMake downloads the official Khronos OpenXR 1.1.62 headers while configuring. The mod does not link an OpenXR import library; it loads `openxr_loader.dll` dynamically at runtime.
 
-Normal builds include the optional headset-aligned frustum fix. It remains inactive unless `FrustumCullingFix=1` is set in `TMOXR.ini`.
+Normal builds include the optional headset-aligned frustum fix. It remains inactive unless `FrustumCullingFix=1` is set in `TMFOXR.ini`.
 
 ## Install script
 
@@ -72,9 +72,10 @@ Set-ExecutionPolicy -Scope Process Bypass
 The installer:
 
 1. Validates the game and built mod paths.
-2. Preserves an existing proxy as `d3d9.before-tmoxr.dll` when that backup does not already exist.
+2. Preserves an existing proxy as `d3d9.before-tmfoxr.dll` when that backup does not already exist.
 3. Copies `build\d3d9.dll` beside `TmForever.exe`.
-4. Checks whether the local OpenXR loader is Win32. If it is missing or has the wrong architecture, it downloads the pinned official Khronos 1.1.62 Windows loader archive, verifies its SHA-256 checksum, and installs `Win32\bin\openxr_loader.dll`.
+4. Installs the editable settings at `Documents\TrackMania\TMFOXR.ini`, preserving the file when it already exists.
+5. Checks whether the local OpenXR loader is Win32. If it is missing or has the wrong architecture, it downloads the pinned official Khronos 1.1.62 Windows loader archive, verifies its SHA-256 checksum, and installs `Win32\bin\openxr_loader.dll`.
 
 Use a different game path or deliberately refresh the pinned loader with:
 
@@ -82,14 +83,38 @@ Use a different game path or deliberately refresh the pinned loader with:
 .\scripts\install.ps1 -GamePath 'D:\Games\TrackMania United' -RefreshOpenXrLoader
 ```
 
+### TrackMania ModLoader
+
+The same build can be installed as a toggleable local
+[TrackMania ModLoader](https://tomashu.dev/software/tmloader/) product. Build
+`d3d9`, then run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-tmloader.ps1
+```
+
+Restart TMLoader after installation. `TrackMania Forever OpenXR` will appear with the
+other mods and can be enabled independently for each profile. The installer
+installs the repository's `TMFOXR.defaults.ini` when the shared settings file is
+absent and preserves subsequent edits. Both installation methods use the same
+stable, discoverable settings and log paths:
+`Documents\TrackMania\TMFOXR.ini` and `Documents\TrackMania\TMFOXR.log`.
+The TMLoader product description also identifies the settings location.
+
+The TMLoader package is self-contained: `TMFOXR.dll` redirects the managed
+game's existing Direct3D 9 imports when injected, while the normal installation
+continues to use the same binary as a `d3d9.dll` proxy. Both TMLoader 2.12.0
+and its 2.12.0-compat executable layouts are supported.
+
 ## Manual install
 
 1. Back up any existing `d3d9.dll` in the TrackMania folder.
 2. Copy `build\d3d9.dll` beside `TmForever.exe` (normally `C:\Program Files (x86)\Steam\steamapps\common\TrackMania United`).
 3. Download the official Khronos [`openxr_loader_windows-1.1.62.zip`](https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-1.1.62/openxr_loader_windows-1.1.62.zip).
 4. Extract the archive and copy **`Win32\bin\openxr_loader.dll`** beside `TmForever.exe`. Do not use `x64\bin\openxr_loader.dll`.
-5. For Virtual Desktop, select **VirtualDesktopXR (VDXR)** as the OpenXR runtime, connect the headset, and launch TrackMania normally.
-6. Put on the headset and enter a race.
+5. Copy `TMFOXR.defaults.ini` beside `TmForever.exe`. On first launch the mod creates the editable `Documents\TrackMania\TMFOXR.ini` automatically.
+6. For Virtual Desktop, select **VirtualDesktopXR (VDXR)** as the OpenXR runtime, connect the headset, and launch TrackMania normally.
+7. Put on the headset and enter a race.
 
 The loader package being version 1.1.62 does not require the application or active runtime to use OpenXR API 1.1. The mod deliberately requests OpenXR 1.0 for compatibility with runtimes that expose 1.0; newer loaders can negotiate that version normally.
 
@@ -97,7 +122,7 @@ The loader package being version 1.1.62 does not require the application or acti
 
 Press camera key **3** (the numeric keypad key used by TrackMania, or a top-row 3 binding) to enable the VR driver-seat offset. Pressing camera keys 1, 2, or 4–7 disables it. The seat transform affects only the two headset views. The native-car visibility override is game-wide, so the monitor may also show parts of the car while camera 3 is selected.
 
-The install script places `TMOXR.ini` beside `TmForever.exe`. It preserves existing settings and adds any missing per-environment camera sections. The mod detects the active Stadium, Island, Desert, Rally, Bay, Coast, or Snow vehicle and selects the matching `[Camera.<Environment>]` section automatically. Each section contains offsets measured in metres in the camera's local axes:
+All installation methods read `Documents\TrackMania\TMFOXR.ini`. The install scripts preserve existing settings, and the normal installer adds any missing per-environment camera sections. The mod detects the active Stadium, Island, Desert, Rally, Bay, Coast, or Snow vehicle and selects the matching `[Camera.<Environment>]` section automatically. Each section contains offsets measured in metres in the camera's local axes:
 
 - `CockpitOffsetRight`: positive moves the viewpoint to the right.
 - `CockpitOffsetUp`: positive moves it upward.
@@ -105,23 +130,23 @@ The install script places `TMOXR.ini` beside `TmForever.exe`. It preserves exist
 - `CockpitNearClip`: nearest visible distance; the 0.05 m default keeps nearby cockpit geometry from being clipped.
 - `HorizonLock`: keeps the headset view level with the world while preserving the car's yaw. It releases smoothly between `HorizonLockReleaseStart` and `HorizonLockReleaseEnd` degrees of car tilt, follows the car through loops and inverted sections, then restores stabilization after the car returns upright.
 
-Each supplied profile has its own starting position. Tune the seven sections for their car interiors; saving `TMOXR.ini` reloads every profile automatically while the game is running. Keys under `[Camera]` remain supported as fallbacks when a named section is absent. While camera 3 is selected, the mod also overrides TrackMania's request to hide the native player-vehicle model. Set `CockpitEnabled=0` to turn the feature off.
+Each supplied profile has its own starting position. Tune the seven sections for their car interiors; saving `TMFOXR.ini` reloads every profile automatically while the game is running. Keys under `[Camera]` remain supported as fallbacks when a named section is absent. While camera 3 is selected, the mod also overrides TrackMania's request to hide the native player-vehicle model. Set `CockpitEnabled=0` to turn the feature off.
 
 ## Performance
 
 The mod always honors the eye resolution recommended by the active OpenXR runtime. Adjust headset render resolution in Virtual Desktop, SteamVR, or the relevant runtime rather than applying a second scale in the mod.
 
-`MirrorEyeToDesktop=1` skips TrackMania's redundant original perspective draw, renders the two tracked headset eyes, and mirrors the completed center/left-eye scene through the game's normal post-processing path for the monitor. This reduces scene geometry work from three views to two. The setting reloads live when `TMOXR.ini` is saved; set it to `0` if a track or unusual post-processing effect does not mirror correctly.
+`MirrorEyeToDesktop=1` skips TrackMania's redundant original perspective draw, renders the two tracked headset eyes, and mirrors the completed center/left-eye scene through the game's normal post-processing path for the monitor. This reduces scene geometry work from three views to two. The setting reloads live when `TMFOXR.ini` is saved; set it to `0` if a track or unusual post-processing effect does not mirror correctly.
 
-`FrustumCullingFix=1` makes TrackMania's CPU visibility volume follow the headset, preventing scenery from disappearing when looking far to either side or behind. It retains the game's normal six-plane culling, avoiding the severe performance cost of rendering the desktop camera's view and the headset view simultaneously. The fix is disabled by default because it hooks version-specific TrackMania rendering code; enable it under `[Performance]` when using the supported Steam United Forever 2.11.26 executable. The setting reloads live when `TMOXR.ini` is saved.
+`FrustumCullingFix=1` makes TrackMania's CPU visibility volume follow the headset, preventing scenery from disappearing when looking far to either side or behind. It retains the game's normal six-plane culling, avoiding the severe performance cost of rendering the desktop camera's view and the headset view simultaneously. The fix is disabled by default because it hooks version-specific TrackMania rendering code; enable it under `[Performance]` when using the supported Steam United Forever 2.11.26 executable. The setting reloads live when `TMFOXR.ini` is saved.
 
 The mod tracks manual camera keys 1–7. While its camera state is initially unknown, TrackMania's first native vehicle-hide request can identify a persisted camera 3 selection. This restores the cockpit offset and visible car before the first race frame without allowing unrelated visibility changes later in the race to disturb the camera.
 
 ## Diagnostics
 
-Every launch replaces `TMOXR.log` beside `TmForever.exe`, so the file contains only the current session. Attach the complete file when reporting a crash or initialization problem. For rendering problems, the periodic stereo, shader-coverage, tracked-pose, and OpenXR-timing lines are usually sufficient.
+Every launch replaces `Documents\TrackMania\TMFOXR.log`, so the file contains only the current session regardless of the installation method. Attach the complete file when reporting a crash or initialization problem. For rendering problems, the periodic stereo, shader-coverage, tracked-pose, and OpenXR-timing lines are usually sufficient.
 
-If OpenXR initialization fails, the mod displays a one-time error dialog over the game with the failing stage, symbolic error name, and a suggested action. Dismiss it to continue playing on the monitor without VR; the complete details remain in `TMOXR.log`.
+If OpenXR initialization fails, the mod displays a one-time error dialog over the game with the failing stage, symbolic error name, and a suggested action. Dismiss it to continue playing on the monitor without VR; the complete details remain in `TMFOXR.log`.
 
 Before OpenXR initialization, the mod also validates TrackMania's actual D3D9 presentation settings. Fullscreen mode, D3D9 multisample anti-aliasing, or a requested window whose complete outer dimensions exceed the monitor's usable work area produces a one-time modal explaining how to correct the launcher settings. In that case the game continues on the desktop without installing VR rendering or cockpit hooks.
 
@@ -139,7 +164,7 @@ Common messages:
 - `OpenXR timing: ...`: reports the runtime display period and TrackMania's measured presentation rate.
 ## Uninstall
 
-Remove this mod's `d3d9.dll` from the TrackMania folder and restore `d3d9.before-tmoxr.dll` if the installer created it. The local Win32 `openxr_loader.dll` may also be removed if no other local mod needs it.
+Remove this mod's `d3d9.dll` from the TrackMania folder and restore `d3d9.before-tmfoxr.dll` if the installer created it. The local Win32 `openxr_loader.dll` may also be removed if no other local mod needs it.
 
 > [!NOTE]
 > ANOTHER HUMAN-WRITTEN NOTE:

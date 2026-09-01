@@ -11,11 +11,11 @@ This is distinct from final GPU clipping with the eye projection: stereo replay 
 - Work started from `master` at commit `36e3b43` (tag `v6`).
 - The worktree later appeared on `12-bad-frustrum-culling`, whose base was the same commit.
 - The current clipping-plane diagnostic is committed on that branch as `17c4ddf` (`more diagnostics`). The two handoff note files themselves are not yet committed.
-- CMake option `TMOXR_EXPERIMENTAL_CULLING` is normally `OFF` in source.
-- The local `build` cache was explicitly configured with `-DTMOXR_EXPERIMENTAL_CULLING=ON`.
+- CMake option `TMFOXR_EXPERIMENTAL_CULLING` is normally `OFF` in source.
+- The local `build` cache was explicitly configured with `-DTMFOXR_EXPERIMENTAL_CULLING=ON`.
 - The installed DLL currently contains the downstream clipping-plane diagnostic described below. It had not yet been user-tested when this file was created.
 
-Before continuing, inspect the branch, `git status`, `build/CMakeCache.txt`, installed DLL hash, and current `TMOXR.log` rather than assuming this state remains unchanged.
+Before continuing, inspect the branch, `git status`, `build/CMakeCache.txt`, installed DLL hash, and current `TMFOXR.log` rather than assuming this state remains unchanged.
 
 ## Original `master` experiment
 
@@ -130,7 +130,7 @@ The periodic log is:
 - A downstream routine could interpret zero planes differently and cause corruption or missing geometry.
 - The first frame can use normal culling because pose is first sampled in the D3D `BeginScene` hook, after some TrackMania visibility work.
 
-For the next test, record side-geometry behavior, corruption, performance, and the `builds`/`disabled` values in `TMOXR.log`.
+For the next test, record side-geometry behavior, corruption, performance, and the `builds`/`disabled` values in `TMFOXR.log`.
 
 ## Why one widened perspective frustum cannot be a complete solution
 
