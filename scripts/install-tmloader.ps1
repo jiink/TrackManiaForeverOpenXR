@@ -62,7 +62,7 @@ New-Item -ItemType Directory -Path $versionPath -Force | Out-Null
 
 $productDescription = @'
 name: TrackMania Forever OpenXR
-author: TrackMania Forever OpenXR contributors
+author: jiink
 type: modification
 description: Native stereoscopic OpenXR rendering and headset tracking for TrackMania United Forever. Settings are stored in Documents\TrackMania\TMFOXR.ini.
 '@
