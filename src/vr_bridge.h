@@ -28,6 +28,7 @@ class VrBridge {
 public:
     static VrBridge& Instance();
     void OnDeviceCreated(IDirect3DDevice9* device, const D3DPRESENT_PARAMETERS& parameters);
+    bool TryInitialize();
     void OnBeginScene();
     void OnBeforePresent(IDirect3DDevice9* device);
     void OnBeforeReset();
