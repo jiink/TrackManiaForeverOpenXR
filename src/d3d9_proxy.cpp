@@ -1284,8 +1284,17 @@ void __fastcall ComputeClippingPlanesHook(void* clippingFrustum, void*,
 
     void* clippingLocation = location;
     float hmdLocation[12]{};
+    // RenderCameraNormal has two mutually exclusive main-camera call sites
+    // (indices 0 and 1), depending on which camera-frustum source is active.
+    // The vision renderer then builds its own world clipping volume at the
+    // layout-specific call site. All of them feed world-object rejection and
+    // must follow the HMD. Previously only the vision-layer volume was changed,
+    // so RenderTree could report rescued parents while packed track pieces were
+    // still rejected by the untouched RenderCameraNormal volume.
+    const bool mainWorldCallSite = callSiteIndex == 0 || callSiteIndex == 1 ||
+        callSiteIndex == g_executableLayout->worldClippingPlaneCallSiteIndex;
     if (g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed) &&
-        callSiteIndex == g_executableLayout->worldClippingPlaneCallSiteIndex && location &&
+        mainWorldCallSite && location &&
         g_stereo.renderTreeCullingValid) {
         const auto* const originalLocation = static_cast<const float*>(location);
         std::memcpy(hmdLocation, originalLocation, sizeof(hmdLocation));
