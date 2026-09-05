@@ -409,6 +409,10 @@ struct ID3DXBuffer : public IUnknown {
     virtual DWORD STDMETHODCALLTYPE GetBufferSize() = 0;
 };
 using D3DXDisassembleShaderFn = HRESULT(WINAPI*)(const DWORD*, BOOL, LPCSTR, ID3DXBuffer**);
+using D3DXAssembleShaderFn = HRESULT(WINAPI*)(LPCSTR, UINT, const void*, void*, DWORD,
+    ID3DXBuffer**, ID3DXBuffer**);
+using D3DXSaveTextureToFileWFn = HRESULT(WINAPI*)(LPCWSTR, int,
+    IDirect3DBaseTexture9*, const PALETTEENTRY*);
 PresentFn g_originalPresent = nullptr;
 BeginSceneFn g_originalBeginScene = nullptr;
 EndSceneFn g_originalEndScene = nullptr;
@@ -1734,6 +1738,10 @@ struct StereoResources {
         bool packed;
     };
     struct ShaderPositionInfo { IDirect3DVertexShader9* shader; UINT baseRegister; };
+    struct SkyGradientShaderInfo {
+        IDirect3DVertexShader9* shader;
+        IDirect3DVertexShader9* trackedShader;
+    };
     IDirect3DSurface9* leftColor = nullptr;
     IDirect3DSurface9* leftDepth = nullptr;
     IDirect3DSurface9* depthSource = nullptr;
@@ -1824,6 +1832,7 @@ struct StereoResources {
     IDirect3DVertexShader9* vertexShader = nullptr;
     std::vector<IDirect3DVertexShader9*> analyzedShaders;
     std::vector<ShaderPositionInfo> shaderPositionInfo;
+    std::vector<SkyGradientShaderInfo> skyGradientShaderInfo;
     bool shaderPositionLogWritten = false;
     UINT primaryWidth = 0;
     UINT primaryHeight = 0;
@@ -2274,6 +2283,9 @@ void ReleaseStereoResources() {
     }
     if (g_stereo.uiTexture) g_stereo.uiTexture->Release();
     g_stereo.uiTexture = nullptr;
+    for (const auto& info : g_stereo.skyGradientShaderInfo) {
+        if (info.trackedShader) info.trackedShader->Release();
+    }
     // The shader-analysis cache retains one reference per shader so a later
     // track cannot recycle the same COM pointer for different bytecode and
     // inherit a stale camera-constant mapping.
@@ -3302,6 +3314,50 @@ bool IsDesktopSpaceAdditiveSprite(IDirect3DDevice9* device) {
         (sourceBlend == D3DBLEND_ONE || sourceBlend == D3DBLEND_SRCALPHA);
 }
 
+IDirect3DVertexShader9* CreateTrackedSkyGradientShader(IDirect3DVertexShader9* original) {
+    if (!original) return nullptr;
+    HMODULE d3dx = GetModuleHandleW(L"d3dx9_30.dll");
+    if (!d3dx) d3dx = LoadLibraryW(L"d3dx9_30.dll");
+    const auto assemble = d3dx ? reinterpret_cast<D3DXAssembleShaderFn>(
+        GetProcAddress(d3dx, "D3DXAssembleShader")) : nullptr;
+    if (!assemble) return nullptr;
+
+    static constexpr char source[] =
+        "vs_1_1\n"
+        "dcl_position v0\n"
+        "dcl_texcoord1 v1\n"
+        "dp4 oPos.x, v0, c0\n"
+        "dp4 oPos.y, v0, c1\n"
+        "dp4 oPos.z, v0, c2\n"
+        "dp4 oPos.w, v0, c3\n"
+        "dp4 oT0.x, v0, c4\n"
+        "dp4 oT0.y, v0, c5\n"
+        "add oT1.xy, v1, c95\n";
+    ID3DXBuffer* bytecode = nullptr;
+    ID3DXBuffer* errors = nullptr;
+    const HRESULT assembled = assemble(source, static_cast<UINT>(std::strlen(source)),
+        nullptr, nullptr, 0, &bytecode, &errors);
+    if (FAILED(assembled) || !bytecode) {
+        if (errors) {
+            tmoxr::log::Warn("Could not assemble the tracked sky-gradient shader: " +
+                std::string(static_cast<const char*>(errors->GetBufferPointer()), errors->GetBufferSize()));
+            errors->Release();
+        }
+        if (bytecode) bytecode->Release();
+        return nullptr;
+    }
+    if (errors) errors->Release();
+
+    IDirect3DDevice9* device = nullptr;
+    IDirect3DVertexShader9* tracked = nullptr;
+    if (SUCCEEDED(original->GetDevice(&device)) && device) {
+        device->CreateVertexShader(static_cast<const DWORD*>(bytecode->GetBufferPointer()), &tracked);
+        device->Release();
+    }
+    bytecode->Release();
+    return tracked;
+}
+
 void AnalyzeVertexShader(IDirect3DVertexShader9* shader) {
     if (!shader || std::find(g_stereo.analyzedShaders.begin(), g_stereo.analyzedShaders.end(), shader) != g_stereo.analyzedShaders.end()) return;
     // TrackMania uses many material variants for the same scene. Every distinct
@@ -3349,6 +3405,17 @@ void AnalyzeVertexShader(IDirect3DVertexShader9* shader) {
         }
     }
 
+    // The sky's vertical color lookup is independent of oPos. Identify that
+    // shader by its named constant and output shape instead of discovery order,
+    // which can vary with menus and environments.
+    if (disassembly.find("GbxVPositionToTexCoord0") != std::string::npos &&
+        disassembly.find("dp4 oT0.x, v0, c") != std::string::npos &&
+        disassembly.find("dp4 oT0.y, v0, c") != std::string::npos &&
+        disassembly.find("mov oT1.xy, v1") != std::string::npos) {
+        IDirect3DVertexShader9* const trackedShader = CreateTrackedSkyGradientShader(shader);
+        if (trackedShader) g_stereo.skyGradientShaderInfo.push_back({shader, trackedShader});
+    }
+
     std::istringstream lines(disassembly);
     std::string line;
     std::string matrixInstructions;
@@ -3388,6 +3455,188 @@ void AnalyzeVertexShader(IDirect3DVertexShader9* shader) {
         positionMapped && (positionWriteCount != 4 || !standardPositionWrites)) {
         tmoxr::log::Info("Nonstandard mapped vertex shader position instructions (possible billboard path): " +
             (positionInstructions.empty() ? std::string("none found") : positionInstructions));
+    }
+}
+
+#if 0
+void LogSkyShaderDrawDiagnostic(IDirect3DDevice9* device) {
+    static bool logged = false;
+    if (logged || g_stereo.analyzedShaders.size() < 11 ||
+        g_stereo.vertexShader != g_stereo.analyzedShaders[10]) return;
+    logged = true;
+
+    std::array<float, 19 * 4> constants{};
+    std::ostringstream details;
+    details << "Sky shader 11 first draw state:";
+    if (SUCCEEDED(device->GetVertexShaderConstantF(0, constants.data(), 19))) {
+        for (UINT shaderRegister = 0; shaderRegister < 19; ++shaderRegister) {
+            const float* value = constants.data() + shaderRegister * 4;
+            details << "\n c" << shaderRegister << "=(" << value[0] << ',' << value[1]
+                    << ',' << value[2] << ',' << value[3] << ')';
+        }
+    }
+
+    for (D3DRENDERSTATETYPE state : {D3DRS_ZENABLE, D3DRS_ZWRITEENABLE,
+            D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND,
+            D3DRS_FOGENABLE, D3DRS_CULLMODE}) {
+        DWORD value = 0;
+        if (SUCCEEDED(device->GetRenderState(state, &value))) {
+            details << "\n render-state " << static_cast<unsigned>(state) << '=' << value;
+        }
+    }
+    for (DWORD stage = 0; stage < 8; ++stage) {
+        IDirect3DBaseTexture9* texture = nullptr;
+        if (FAILED(device->GetTexture(stage, &texture)) || !texture) continue;
+        details << "\n texture" << stage << " type=" << static_cast<unsigned>(texture->GetType());
+        if (texture->GetType() == D3DRTYPE_TEXTURE) {
+            D3DSURFACE_DESC description{};
+            if (SUCCEEDED(static_cast<IDirect3DTexture9*>(texture)->GetLevelDesc(0, &description))) {
+                details << " " << description.Width << 'x' << description.Height
+                        << " format=" << static_cast<unsigned>(description.Format);
+            }
+        }
+        texture->Release();
+    }
+    tmoxr::log::Info(details.str());
+
+    IDirect3DPixelShader9* pixelShader = nullptr;
+    if (FAILED(device->GetPixelShader(&pixelShader)) || !pixelShader) return;
+    UINT byteCount = 0;
+    if (SUCCEEDED(pixelShader->GetFunction(nullptr, &byteCount)) && byteCount) {
+        std::vector<DWORD> bytecode((byteCount + sizeof(DWORD) - 1) / sizeof(DWORD));
+        if (SUCCEEDED(pixelShader->GetFunction(bytecode.data(), &byteCount))) {
+            HMODULE d3dx = GetModuleHandleW(L"d3dx9_30.dll");
+            if (!d3dx) d3dx = LoadLibraryW(L"d3dx9_30.dll");
+            const auto disassemble = d3dx ? reinterpret_cast<D3DXDisassembleShaderFn>(
+                GetProcAddress(d3dx, "D3DXDisassembleShader")) : nullptr;
+            ID3DXBuffer* output = nullptr;
+            if (disassemble && SUCCEEDED(disassemble(bytecode.data(), FALSE, nullptr, &output)) && output) {
+                const std::string disassembly(static_cast<const char*>(output->GetBufferPointer()),
+                    output->GetBufferSize());
+                tmoxr::log::Info("Sky shader 11 pixel program:\n" + disassembly);
+                output->Release();
+            }
+        }
+    }
+    pixelShader->Release();
+}
+#endif
+
+struct SkyGradientEyeState {
+    IDirect3DVertexShader9* trackedShader = nullptr;
+    std::array<float, 4> originalCorrection{};
+    bool active = false;
+};
+
+void DumpSkyMaterialDiagnostic(IDirect3DDevice9* device) {
+    static bool dumped = false;
+    if (dumped) return;
+    dumped = true;
+    HMODULE d3dx = GetModuleHandleW(L"d3dx9_30.dll");
+    if (!d3dx) d3dx = LoadLibraryW(L"d3dx9_30.dll");
+    const auto saveTexture = d3dx ? reinterpret_cast<D3DXSaveTextureToFileWFn>(
+        GetProcAddress(d3dx, "D3DXSaveTextureToFileW")) : nullptr;
+    if (saveTexture) {
+        for (DWORD stage = 0; stage < 2; ++stage) {
+            IDirect3DBaseTexture9* texture = nullptr;
+            if (SUCCEEDED(device->GetTexture(stage, &texture)) && texture) {
+                const auto path = tmoxr::UserDataFilePath(
+                    stage == 0 ? L"TMFOXR-sky-texture0.png" : L"TMFOXR-sky-texture1.png");
+                const HRESULT saved = saveTexture(path.c_str(), 3, texture, nullptr);
+                tmoxr::log::Info("Sky diagnostic texture " + std::to_string(stage) +
+                    " save result=" + std::to_string(static_cast<long>(saved)) +
+                    " at " + path.string() + ".");
+                texture->Release();
+            }
+        }
+    }
+    std::array<float, 8> pixelConstants{};
+    if (SUCCEEDED(device->GetPixelShaderConstantF(0, pixelConstants.data(), 2))) {
+        tmoxr::log::Info("Sky pixel constants: c0=(" +
+            std::to_string(pixelConstants[0]) + "," + std::to_string(pixelConstants[1]) + "," +
+            std::to_string(pixelConstants[2]) + "," + std::to_string(pixelConstants[3]) +
+            "), c1=(" + std::to_string(pixelConstants[4]) + "," +
+            std::to_string(pixelConstants[5]) + "," + std::to_string(pixelConstants[6]) +
+            "," + std::to_string(pixelConstants[7]) + ").");
+    }
+}
+
+SkyGradientEyeState CaptureSkyGradientEyeState(IDirect3DDevice9* device) {
+    SkyGradientEyeState state;
+    const auto shader = std::find_if(g_stereo.skyGradientShaderInfo.begin(),
+        g_stereo.skyGradientShaderInfo.end(), [](const auto& info) {
+            return info.shader == g_stereo.vertexShader;
+        });
+    if (shader == g_stereo.skyGradientShaderInfo.end()) return state;
+
+    DWORD zWrite = TRUE;
+    DWORD alphaBlend = FALSE;
+    DWORD sourceBlend = D3DBLEND_ZERO;
+    DWORD destinationBlend = D3DBLEND_ZERO;
+    DWORD fog = TRUE;
+    if (FAILED(device->GetRenderState(D3DRS_ZWRITEENABLE, &zWrite)) || zWrite ||
+        FAILED(device->GetRenderState(D3DRS_ALPHABLENDENABLE, &alphaBlend)) || !alphaBlend ||
+        FAILED(device->GetRenderState(D3DRS_SRCBLEND, &sourceBlend)) || sourceBlend != D3DBLEND_ONE ||
+        FAILED(device->GetRenderState(D3DRS_DESTBLEND, &destinationBlend)) || destinationBlend != D3DBLEND_SRCALPHA ||
+        FAILED(device->GetRenderState(D3DRS_FOGENABLE, &fog)) || fog) return state;
+
+    IDirect3DBaseTexture9* blendTexture = nullptr;
+    if (FAILED(device->GetTexture(1, &blendTexture)) || !blendTexture) return state;
+    bool skyTextureShape = false;
+    if (blendTexture->GetType() == D3DRTYPE_TEXTURE) {
+        D3DSURFACE_DESC description{};
+        if (SUCCEEDED(static_cast<IDirect3DTexture9*>(blendTexture)->GetLevelDesc(0, &description))) {
+            skyTextureShape = description.Width == 128 && description.Height == 32;
+        }
+    }
+    blendTexture->Release();
+    if (!skyTextureShape) return state;
+    DumpSkyMaterialDiagnostic(device);
+
+    state.trackedShader = shader->trackedShader;
+    constexpr UINT correctionRegister = 95;
+    if (g_stereo.validVertexShaderConstants[correctionRegister]) {
+        std::memcpy(state.originalCorrection.data(),
+            g_stereo.vertexShaderConstants.data() + correctionRegister * 4,
+            sizeof(float) * 4);
+        state.active = true;
+    } else {
+        state.active = SUCCEEDED(device->GetVertexShaderConstantF(
+            correctionRegister, state.originalCorrection.data(), 1));
+    }
+    return state;
+}
+
+void ApplySkyGradientHeadPitch(IDirect3DDevice9* device, const SkyGradientEyeState& state) {
+    if (!state.active || !g_stereo.haveHeadPose) return;
+    const float x = g_stereo.headPose.orientation[0];
+    const float y = g_stereo.headPose.orientation[1];
+    const float z = g_stereo.headPose.orientation[2];
+    const float w = g_stereo.headPose.orientation[3];
+    const float forwardUp = std::clamp(2.0f * (x * w - y * z), -1.0f, 1.0f);
+    const std::array<float, 4> correction{0.0f, 0.5f * forwardUp, 0.0f, 0.0f};
+    const HRESULT bindResult = g_originalSetVertexShader(device, state.trackedShader);
+    const HRESULT constantResult = g_originalSetVertexShaderConstantF(device, 95, correction.data(), 1);
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        tmoxr::log::Info("Applying headset pitch to TMUF's separate sky-gradient texture coordinates; shader bind HRESULT=" +
+            std::to_string(static_cast<long>(bindResult)) + ", constant HRESULT=" +
+            std::to_string(static_cast<long>(constantResult)) + ".");
+    }
+    static bool tiltLogged = false;
+    if (!tiltLogged && std::abs(forwardUp) > 0.2f) {
+        tiltLogged = true;
+        tmoxr::log::Info("Sky-gradient headset tilt sample: forward-up=" +
+            std::to_string(forwardUp) + ", quaternion=(" + std::to_string(x) + "," +
+            std::to_string(y) + "," + std::to_string(z) + "," + std::to_string(w) + ").");
+    }
+}
+
+void RestoreSkyGradientState(IDirect3DDevice9* device, const SkyGradientEyeState& state) {
+    if (state.active) {
+        g_originalSetVertexShaderConstantF(device, 95, state.originalCorrection.data(), 1);
+        g_originalSetVertexShader(device, g_stereo.vertexShader);
     }
 }
 
@@ -3740,6 +3989,7 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITI
     const auto replayStart = std::chrono::steady_clock::now();
     AnalyzeVertexShader(g_stereo.vertexShader);
     const ShaderEyeState shaderEye = CaptureShaderEyeState(device);
+    const SkyGradientEyeState skyGradient = CaptureSkyGradientEyeState(device);
     PrepareDeferredShaderEyeState(device, shaderEye);
     const D3DVIEWPORT9 gameViewport = g_stereo.gameViewport;
     const bool haveGameViewport = g_stereo.haveGameViewport;
@@ -3765,9 +4015,11 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITI
     }
     BeginTrackedEye(device, false, !shaderEye.active, setEyeViewport);
     ApplyShaderEyeState(device, shaderEye, 0.0f, false);
+    ApplySkyGradientHeadPitch(device, skyGradient);
     const HRESULT left = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
     BeginTrackedEye(device, true, !shaderEye.active, false);
     ApplyShaderEyeState(device, shaderEye, -0.064f, true);
+    ApplySkyGradientHeadPitch(device, skyGradient);
     const HRESULT right = g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
     if (FAILED(right) && !g_stereo.rightDrawFailureLogged) {
         g_stereo.rightDrawFailureLogged = true;
@@ -3775,6 +4027,7 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITI
     }
     if (mirrorEyeToDesktop) DeferShaderEyeStateRestore(shaderEye);
     else RestoreShaderEyeState(device, shaderEye);
+    RestoreSkyGradientState(device, skyGradient);
     RestoreGameEye(device, !shaderEye.active, !mirrorEyeToDesktop);
     if (mirrorEyeToDesktop && setEyeViewport && haveGameViewport) {
         ++g_stereo.deferredGameViewportRestores;
@@ -3815,6 +4068,7 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3D
     const auto replayStart = std::chrono::steady_clock::now();
     AnalyzeVertexShader(g_stereo.vertexShader);
     const ShaderEyeState shaderEye = CaptureShaderEyeState(device);
+    const SkyGradientEyeState skyGradient = CaptureSkyGradientEyeState(device);
     PrepareDeferredShaderEyeState(device, shaderEye);
     const D3DVIEWPORT9 gameViewport = g_stereo.gameViewport;
     const bool haveGameViewport = g_stereo.haveGameViewport;
@@ -3840,9 +4094,11 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3D
     }
     BeginTrackedEye(device, false, !shaderEye.active, setEyeViewport);
     ApplyShaderEyeState(device, shaderEye, 0.0f, false);
+    ApplySkyGradientHeadPitch(device, skyGradient);
     const HRESULT left = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
     BeginTrackedEye(device, true, !shaderEye.active, false);
     ApplyShaderEyeState(device, shaderEye, -0.064f, true);
+    ApplySkyGradientHeadPitch(device, skyGradient);
     const HRESULT right = g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex, vertexCount, startIndex, primitiveCount);
     if (FAILED(right) && !g_stereo.rightDrawFailureLogged) {
         g_stereo.rightDrawFailureLogged = true;
@@ -3850,6 +4106,7 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3D
     }
     if (mirrorEyeToDesktop) DeferShaderEyeStateRestore(shaderEye);
     else RestoreShaderEyeState(device, shaderEye);
+    RestoreSkyGradientState(device, skyGradient);
     RestoreGameEye(device, !shaderEye.active, !mirrorEyeToDesktop);
     if (mirrorEyeToDesktop && setEyeViewport && haveGameViewport) {
         ++g_stereo.deferredGameViewportRestores;
