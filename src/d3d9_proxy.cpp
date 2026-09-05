@@ -1,4 +1,5 @@
 #include "log.h"
+#include "large_address_aware.h"
 #include "runtime_paths.h"
 #define Direct3DCreate9 TMFOXR_SDK_DECLARATION_Direct3DCreate9
 #define Direct3DCreate9Ex TMFOXR_SDK_DECLARATION_Direct3DCreate9Ex
@@ -7,6 +8,7 @@
 
 #include <Windows.h>
 #include <d3d9.h>
+#include <ddraw.h>
 #undef Direct3DCreate9
 #undef Direct3DCreate9Ex
 #undef D3DPERF_SetOptions
@@ -36,6 +38,8 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 
 __declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT sdkVersion);
 extern "C" __declspec(dllexport) void WINAPI D3DPERF_SetOptions(DWORD options);
+extern "C" __declspec(dllexport) void CALLBACK TMFOXR_PatchAfterExit(
+    HWND, HINSTANCE, LPSTR, int);
 
 namespace {
 using Matrix4 = std::array<float, 16>;
@@ -43,16 +47,38 @@ using Matrix4 = std::array<float, 16>;
 using Create9Fn = IDirect3D9* (WINAPI*)(UINT);
 using Create9ExFn = HRESULT (WINAPI*)(UINT, IDirect3D9Ex**);
 using PerfSetOptionsFn = void (WINAPI*)(DWORD);
+using GetAvailableTextureMemFn = UINT(STDMETHODCALLTYPE*)(IDirect3DDevice9*);
+using GetProcAddressFn = FARPROC(WINAPI*)(HMODULE, LPCSTR);
+using DirectDrawCreateExFn = HRESULT(WINAPI*)(GUID*, LPVOID*, REFIID, IUnknown*);
+using GetAvailableVidMemFn = HRESULT(STDMETHODCALLTYPE*)(
+    IDirectDraw7*, LPDDSCAPS2, LPDWORD, LPDWORD);
 
 HMODULE g_realD3D9 = nullptr;
+HMODULE g_tmfoxrModule = nullptr;
 Create9Fn g_create9 = nullptr;
 Create9ExFn g_create9Ex = nullptr;
 PFN_Direct3DCreate9On12 g_create9On12 = nullptr;
 PerfSetOptionsFn g_perfSetOptions = nullptr;
+GetAvailableTextureMemFn g_originalGetAvailableTextureMem = nullptr;
+GetProcAddressFn g_originalExecutableGetProcAddress = nullptr;
+DirectDrawCreateExFn g_originalDirectDrawCreateEx = nullptr;
+GetAvailableVidMemFn g_originalGetAvailableVidMem = nullptr;
 std::atomic<bool> g_tmLoaderIatHookInstalled = false;
 std::atomic<DWORD> g_tmLoaderInjectionStatus = 0;
+std::atomic<bool> g_directDrawResolverHookInstalled = false;
+std::atomic<bool> g_directDrawMemoryHookInstalled = false;
+std::atomic<bool> g_directDrawMemoryQueryLogged = false;
+std::atomic<bool> g_directDrawAgpQueryLogged = false;
+std::atomic<uint32_t> g_directDrawMemoryQueryCount = 0;
+std::atomic<bool> g_videoMemoryHookInstalled = false;
+std::atomic<bool> g_videoMemoryQueryLogged = false;
+std::atomic<bool> g_videoMemoryBaselineCaptured = false;
+std::atomic<UINT> g_videoMemoryDriverBaseline = 0;
+std::atomic<uint32_t> g_videoMemoryQueryCount = 0;
+std::atomic<bool> g_largeAddressPromptShown = false;
+std::atomic<bool> g_largeAddressRestartRequired = false;
 
-bool IsTrackManiaGameProcess() {
+bool IsCurrentProcessNamed(const wchar_t* expectedName) {
     wchar_t executablePath[MAX_PATH]{};
     const DWORD length = GetModuleFileNameW(nullptr, executablePath, static_cast<DWORD>(std::size(executablePath)));
     if (!length || length >= std::size(executablePath)) return false;
@@ -60,7 +86,284 @@ bool IsTrackManiaGameProcess() {
     for (const wchar_t* cursor = executablePath; *cursor; ++cursor) {
         if (*cursor == L'\\' || *cursor == L'/') fileName = cursor + 1;
     }
-    return _wcsicmp(fileName, L"TmForever.exe") == 0;
+    return _wcsicmp(fileName, expectedName) == 0;
+}
+
+bool IsTrackManiaGameProcess() {
+    return IsCurrentProcessNamed(L"TmForever.exe");
+}
+
+bool IsTrackManiaLauncherProcess() {
+    return IsCurrentProcessNamed(L"TmForeverLauncher.exe");
+}
+
+std::wstring MainExecutablePath() {
+    std::wstring path(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(
+        nullptr, path.data(), static_cast<DWORD>(path.size()));
+    if (!length || length >= path.size()) return {};
+    path.resize(length);
+    return path;
+}
+
+std::wstring ReadEnvironmentVariable(const wchar_t* name) {
+    const DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
+    if (!required) return {};
+    std::wstring value(required, L'\0');
+    const DWORD length = GetEnvironmentVariableW(
+        name, value.data(), static_cast<DWORD>(value.size()));
+    if (!length || length >= value.size()) return {};
+    value.resize(length);
+    return value;
+}
+
+bool ScheduleLargeAddressAwarePatchAfterExit(
+    const std::wstring& executablePath) {
+    if (!g_tmfoxrModule) return false;
+
+    std::wstring dllPath(32768, L'\0');
+    const DWORD dllLength = GetModuleFileNameW(
+        g_tmfoxrModule, dllPath.data(), static_cast<DWORD>(dllPath.size()));
+    if (!dllLength || dllLength >= dllPath.size()) return false;
+    dllPath.resize(dllLength);
+
+    wchar_t systemDirectory[MAX_PATH]{};
+    const UINT systemLength = GetSystemDirectoryW(
+        systemDirectory, static_cast<UINT>(std::size(systemDirectory)));
+    if (!systemLength || systemLength >= std::size(systemDirectory)) return false;
+    const std::wstring rundllPath =
+        (std::filesystem::path(systemDirectory) / L"rundll32.exe").wstring();
+
+    constexpr wchar_t kParentVariable[] = L"TMFOXR_PATCH_PARENT_PID";
+    constexpr wchar_t kTargetVariable[] = L"TMFOXR_PATCH_TARGET";
+    const std::wstring previousParent = ReadEnvironmentVariable(kParentVariable);
+    const std::wstring previousTarget = ReadEnvironmentVariable(kTargetVariable);
+    const bool hadParent = !previousParent.empty();
+    const bool hadTarget = !previousTarget.empty();
+    const std::wstring parent = std::to_wstring(GetCurrentProcessId());
+    if (!SetEnvironmentVariableW(kParentVariable, parent.c_str()) ||
+        !SetEnvironmentVariableW(kTargetVariable, executablePath.c_str())) {
+        SetEnvironmentVariableW(
+            kParentVariable, hadParent ? previousParent.c_str() : nullptr);
+        SetEnvironmentVariableW(
+            kTargetVariable, hadTarget ? previousTarget.c_str() : nullptr);
+        return false;
+    }
+
+    std::wstring commandLine = L"\"" + rundllPath + L"\" \"" +
+        dllPath + L"\",TMFOXR_PatchAfterExit";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    const BOOL created = CreateProcessW(
+        rundllPath.c_str(), commandLine.data(), nullptr, nullptr, FALSE,
+        0, nullptr, std::filesystem::path(dllPath).parent_path().c_str(),
+        &startup, &process);
+    const DWORD createError = created ? ERROR_SUCCESS : GetLastError();
+
+    SetEnvironmentVariableW(
+        kParentVariable, hadParent ? previousParent.c_str() : nullptr);
+    SetEnvironmentVariableW(
+        kTargetVariable, hadTarget ? previousTarget.c_str() : nullptr);
+    if (created) {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        return true;
+    }
+    tmoxr::log::Error(
+        "Could not start the deferred Large-Address-Aware patch helper: Win32 error=" +
+        std::to_string(createError) + ".");
+    return false;
+}
+
+bool OfferLargeAddressAwarePatch(bool launchedFromSettingsTool) {
+    if (g_largeAddressPromptShown.exchange(true, std::memory_order_acq_rel)) {
+        return g_largeAddressRestartRequired.load(std::memory_order_relaxed);
+    }
+
+    std::wstring executablePath = MainExecutablePath();
+    if (executablePath.empty()) return false;
+    if (launchedFromSettingsTool) {
+        executablePath =
+            (std::filesystem::path(executablePath).parent_path() / L"TmForever.exe").wstring();
+        if (GetFileAttributesW(executablePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            tmoxr::log::Warn(
+                "Could not locate TmForever.exe beside TmForeverLauncher.exe; skipped the Large-Address-Aware compatibility check.");
+            return false;
+        }
+    }
+    DWORD inspectionError = ERROR_SUCCESS;
+    const bool alreadyEnabled = launchedFromSettingsTool
+        ? tmoxr::laa::IsExecutableLargeAddressAware(executablePath, &inspectionError)
+        : tmoxr::laa::IsCurrentProcessLargeAddressAware();
+    if (alreadyEnabled) {
+        MEMORYSTATUSEX memory{};
+        memory.dwLength = sizeof(memory);
+        if (!launchedFromSettingsTool && GlobalMemoryStatusEx(&memory)) {
+            tmoxr::log::Info(
+                "TmForever.exe is Large-Address-Aware; process virtual-address capacity=" +
+                std::to_string(memory.ullTotalVirtual / (1024ull * 1024ull)) +
+                " MiB.");
+        }
+        else {
+            tmoxr::log::Info(
+                "TmForever.exe is Large-Address-Aware; up to 4 GB of virtual address space is available on 64-bit Windows.");
+        }
+        return false;
+    }
+    if (launchedFromSettingsTool && inspectionError != ERROR_SUCCESS) {
+        tmoxr::log::Warn(
+            "Could not inspect TmForever.exe for Large-Address-Aware support: Win32 error=" +
+            std::to_string(inspectionError) + ".");
+    }
+
+    // Inspecting through PatchExecutable would create the backup only after it
+    // confirms that a change is necessary. Ask first because the operation
+    // intentionally modifies the game's executable on disk.
+    const std::wstring prompt =
+        L"TrackMania is not Large-Address-Aware. The original 2 GB process "
+        L"limit can make complex tracks run out of address space while VR is active.\n\n"
+        L"TrackMania Forever OpenXR can enable the standard Large-Address-Aware "
+        L"flag in TmForever.exe. It will first preserve the original as:\n\n"
+        L"TmForever.exe.TMFOXR-backup\n\n"
+        L"Only that executable-header flag will be changed. Allow this fix?";
+    const int choice = MessageBoxW(
+        nullptr, prompt.c_str(),
+        L"TrackMania Forever OpenXR - memory compatibility",
+        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1 | MB_SETFOREGROUND);
+    if (choice != IDYES) {
+        tmoxr::log::Warn(
+            "The user declined the Large-Address-Aware executable patch; the manual installation remains limited to 2 GB of virtual address space.");
+        return false;
+    }
+
+    const tmoxr::laa::PatchResult result =
+        tmoxr::laa::PatchExecutable(executablePath);
+    if (result.status == tmoxr::laa::PatchStatus::AlreadyEnabled) {
+        tmoxr::log::Info(
+            "The on-disk TmForever.exe is already Large-Address-Aware.");
+        return false;
+    }
+    if (result.status != tmoxr::laa::PatchStatus::Patched) {
+        if (result.windowsError == ERROR_SHARING_VIOLATION &&
+            ScheduleLargeAddressAwarePatchAfterExit(executablePath)) {
+            tmoxr::log::Info(
+                "TmForever.exe is currently locked; scheduled the Large-Address-Aware patch for immediately after this process exits.");
+            MessageBoxW(
+                nullptr,
+                L"TmForever.exe is currently in use, so TMFOXR will close this "
+                L"program and apply the memory fix immediately afterward.\n\n"
+                L"Wait for the success message, then launch TrackMania again.",
+                L"TrackMania Forever OpenXR - applying memory fix",
+                MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+            ExitProcess(0);
+        }
+        tmoxr::log::Error(
+            "Could not enable Large-Address-Aware in TmForever.exe: status=" +
+            std::to_string(static_cast<int>(result.status)) +
+            ", Win32 error=" + std::to_string(result.windowsError) + ".");
+        const std::wstring failure =
+            L"TMFOXR could not update TmForever.exe. No executable changes were "
+            L"made after the backup step.\n\nWin32 error: " +
+            std::to_wstring(result.windowsError) +
+            L"\n\nTry running TmForeverLauncher.exe, or use the "
+            L"TrackMania ModLoader installation, whose game executable is already "
+            L"Large-Address-Aware.";
+        MessageBoxW(
+            nullptr, failure.c_str(),
+            L"TrackMania Forever OpenXR - memory fix failed",
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+        return false;
+    }
+
+    tmoxr::log::Info(
+        "Enabled Large-Address-Aware in TmForever.exe and created TmForever.exe.TMFOXR-backup.");
+    if (launchedFromSettingsTool) {
+        MessageBoxW(
+            nullptr,
+            L"The memory compatibility fix was installed successfully. You may "
+            L"continue configuring TrackMania; the next game launch will be able "
+            L"to use up to 4 GB of virtual address space.",
+            L"TrackMania Forever OpenXR - memory fix installed",
+            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+        return false;
+    }
+
+    g_largeAddressRestartRequired.store(true, std::memory_order_relaxed);
+    MessageBoxW(
+        nullptr,
+        L"The memory compatibility fix was installed successfully. Close and "
+        L"restart TrackMania so Windows can apply the new 4 GB address-space "
+        L"limit. VR will remain disabled for this launch.",
+        L"TrackMania Forever OpenXR - restart required",
+        MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+    return true;
+}
+
+FARPROC WINAPI GetProcAddressHook(HMODULE module, LPCSTR name);
+
+bool InstallDirectDrawResolverHook() {
+    if (!IsTrackManiaGameProcess() && !IsTrackManiaLauncherProcess()) return false;
+    if (g_directDrawResolverHookInstalled.exchange(true, std::memory_order_acq_rel)) {
+        return true;
+    }
+
+    auto* const module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    if (!module) goto failed;
+    {
+        auto* const dos = reinterpret_cast<IMAGE_DOS_HEADER*>(module);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) goto failed;
+        auto* const nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(module + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE ||
+            nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) goto failed;
+        const auto& directory =
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (!directory.VirtualAddress ||
+            directory.Size < sizeof(IMAGE_IMPORT_DESCRIPTOR)) goto failed;
+
+        auto* descriptor = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
+            module + directory.VirtualAddress);
+        for (; descriptor->Name; ++descriptor) {
+            const char* const libraryName = reinterpret_cast<const char*>(
+                module + descriptor->Name);
+            if (_stricmp(libraryName, "kernel32.dll") != 0) continue;
+
+            auto* names = reinterpret_cast<IMAGE_THUNK_DATA32*>(module +
+                (descriptor->OriginalFirstThunk ? descriptor->OriginalFirstThunk
+                                                : descriptor->FirstThunk));
+            auto* functions = reinterpret_cast<IMAGE_THUNK_DATA32*>(
+                module + descriptor->FirstThunk);
+            for (; names->u1.AddressOfData; ++names, ++functions) {
+                if (IMAGE_SNAP_BY_ORDINAL32(names->u1.Ordinal)) continue;
+                auto* const import = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
+                    module + names->u1.AddressOfData);
+                if (std::strcmp(reinterpret_cast<const char*>(import->Name),
+                                "GetProcAddress") != 0) continue;
+
+                DWORD oldProtection = 0;
+                if (!VirtualProtect(&functions->u1.Function,
+                                    sizeof(functions->u1.Function), PAGE_READWRITE,
+                                    &oldProtection)) goto failed;
+                g_originalExecutableGetProcAddress =
+                    reinterpret_cast<GetProcAddressFn>(functions->u1.Function);
+                functions->u1.Function = static_cast<DWORD>(
+                    reinterpret_cast<uintptr_t>(&GetProcAddressHook));
+                DWORD ignored = 0;
+                VirtualProtect(&functions->u1.Function,
+                               sizeof(functions->u1.Function), oldProtection,
+                               &ignored);
+                FlushInstructionCache(GetCurrentProcess(),
+                                      &functions->u1.Function,
+                                      sizeof(functions->u1.Function));
+                return true;
+            }
+            break;
+        }
+    }
+
+failed:
+    g_directDrawResolverHookInstalled.store(false, std::memory_order_release);
+    return false;
 }
 
 void LoadRealD3D9(bool reportLoad = true) {
@@ -333,6 +636,7 @@ struct CameraSettings {
     std::atomic<bool> mirrorEyeToDesktop{true};
     std::atomic<bool> d3d9On12{true};
     std::atomic<bool> frustumCullingFix{false};
+    std::atomic<int> videoMemoryMB{2048};
     std::atomic<bool> verboseDiagnostics{false};
     std::atomic<int> selectedCamera{0};
     std::array<std::atomic<bool>, 8> cameraKeyDown{};
@@ -661,6 +965,10 @@ void ReadCameraSettings(bool reloaded) {
         GetPrivateProfileIntW(L"Performance", L"D3D9On12", 1, path.c_str()) != 0;
     const bool frustumCullingFix =
         GetPrivateProfileIntW(L"Performance", L"FrustumCullingFix", 0, path.c_str()) != 0;
+    const int videoMemoryMB = std::clamp(
+        static_cast<int>(GetPrivateProfileIntW(
+            L"Compatibility", L"VideoMemoryMB", 2048, path.c_str())),
+        0, 2048);
     const bool verboseDiagnostics =
         GetPrivateProfileIntW(L"Diagnostics", L"Verbose", 0, path.c_str()) != 0;
     g_cameraSettings.cockpitEnabled.store(enabled, std::memory_order_relaxed);
@@ -671,6 +979,7 @@ void ReadCameraSettings(bool reloaded) {
     g_cameraSettings.mirrorEyeToDesktop.store(mirrorEyeToDesktop, std::memory_order_relaxed);
     g_cameraSettings.d3d9On12.store(d3d9On12, std::memory_order_relaxed);
     g_cameraSettings.frustumCullingFix.store(frustumCullingFix, std::memory_order_relaxed);
+    g_cameraSettings.videoMemoryMB.store(videoMemoryMB, std::memory_order_relaxed);
     g_cameraSettings.verboseDiagnostics.store(verboseDiagnostics, std::memory_order_relaxed);
     tmoxr::VrBridge::Instance().SetVerboseDiagnostics(verboseDiagnostics);
     const auto activeProfile = g_cameraSettings.activeVehicleProfile.load(std::memory_order_relaxed);
@@ -687,6 +996,7 @@ void ReadCameraSettings(bool reloaded) {
         std::to_string(horizonReleaseEnd) + " degrees, mirror eye to desktop=" +
         std::to_string(mirrorEyeToDesktop) + ", D3D9On12=" + std::to_string(d3d9On12) +
         ", frustum culling fix=" + std::to_string(frustumCullingFix) +
+        ", configured video memory=" + std::to_string(videoMemoryMB) + " MB" +
         ", verbose diagnostics=" +
         std::to_string(verboseDiagnostics) + ".");
 }
@@ -1296,8 +1606,17 @@ void __fastcall ComputeClippingPlanesHook(void* clippingFrustum, void*,
 
     void* clippingLocation = location;
     float hmdLocation[12]{};
+    // RenderCameraNormal has two mutually exclusive main-camera call sites
+    // (indices 0 and 1), depending on which camera-frustum source is active.
+    // The vision renderer then builds its own world clipping volume at the
+    // layout-specific call site. All of them feed world-object rejection and
+    // must follow the HMD. Previously only the vision-layer volume was changed,
+    // so RenderTree could report rescued parents while packed track pieces were
+    // still rejected by the untouched RenderCameraNormal volume.
+    const bool mainWorldCallSite = callSiteIndex == 0 || callSiteIndex == 1 ||
+        callSiteIndex == g_executableLayout->worldClippingPlaneCallSiteIndex;
     if (g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed) &&
-        callSiteIndex == g_executableLayout->worldClippingPlaneCallSiteIndex && location &&
+        mainWorldCallSite && location &&
         g_stereo.renderTreeCullingValid) {
         const auto* const originalLocation = static_cast<const float*>(location);
         std::memcpy(hmdLocation, originalLocation, sizeof(hmdLocation));
@@ -3096,6 +3415,270 @@ HRESULT STDMETHODCALLTYPE ClearHook(IDirect3DDevice9* device, DWORD count, const
     return left;
 }
 
+DWORD ConfiguredVideoMemoryBytes() {
+    const int configuredMB =
+        g_cameraSettings.videoMemoryMB.load(std::memory_order_relaxed);
+    if (configuredMB <= 0) return 0;
+    const uint64_t requestedBytes =
+        static_cast<uint64_t>(configuredMB) * 1024ull * 1024ull;
+    // TMUF stores the detected MiB count in a WORD, reconstructs bytes with
+    // `count << 20`, then sign-extends that 32-bit value into a 64-bit field.
+    // Consequently 2048 MiB (0x80000000) becomes negative even though the
+    // original DirectDraw value itself is unsigned. Keep the effective ceiling
+    // at exactly 2047 MiB; the INI may still use the familiar 2048 MB setting.
+    constexpr uint64_t kMaximumPositiveTmufBytes =
+        2047ull * 1024ull * 1024ull;
+    return static_cast<DWORD>(
+        std::min<uint64_t>(requestedBytes, kMaximumPositiveTmufBytes));
+}
+
+DWORD EstimatePrimaryFramebufferBytes() {
+    const int width = GetSystemMetrics(SM_CXSCREEN);
+    const int height = GetSystemMetrics(SM_CYSCREEN);
+    if (width <= 0 || height <= 0) return 0;
+
+    int bitsPerPixel = 32;
+    if (HDC desktopDc = GetDC(nullptr)) {
+        const int detectedBits =
+            GetDeviceCaps(desktopDc, BITSPIXEL) * GetDeviceCaps(desktopDc, PLANES);
+        if (detectedBits > 0) bitsPerPixel = detectedBits;
+        ReleaseDC(nullptr, desktopDc);
+    }
+    const uint64_t bytesPerPixel =
+        static_cast<uint64_t>(std::max(bitsPerPixel, 8) + 7) / 8;
+    const uint64_t framebufferBytes =
+        static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * bytesPerPixel;
+    return static_cast<DWORD>(std::min<uint64_t>(framebufferBytes, 0xffffffffull));
+}
+
+HRESULT STDMETHODCALLTYPE GetAvailableVidMemHook(
+    IDirectDraw7* directDraw, LPDDSCAPS2 caps, LPDWORD totalBytes,
+    LPDWORD freeBytes) {
+    const HRESULT result = g_originalGetAvailableVidMem
+        ? g_originalGetAvailableVidMem(directDraw, caps, totalBytes, freeBytes)
+        : E_FAIL;
+    if (FAILED(result)) return result;
+
+    const DWORD requestedCaps = caps ? caps->dwCaps : 0;
+    if (!g_cameraSettings.loaded) {
+        tmoxr::log::Initialize();
+        LoadCameraSettings();
+    }
+    const DWORD targetBytes = ConfiguredVideoMemoryBytes();
+    if (!targetBytes) {
+        if (!g_directDrawMemoryQueryLogged.exchange(
+                true, std::memory_order_relaxed)) {
+            tmoxr::log::Info(
+                "DirectDraw video-memory override is disabled; retaining the driver's report.");
+        }
+        return result;
+    }
+
+    // TMUF adds local video memory and non-local AGP memory in a signed 32-bit
+    // field. A 2048 MB local result plus even a small AGP result crosses
+    // INT_MAX and becomes negative. The game logs and settings confirm that it
+    // does not use AGP memory on modern hardware, so report zero for this
+    // legacy category while the compatibility override is active.
+    if ((requestedCaps & DDSCAPS_NONLOCALVIDMEM) != 0) {
+        const DWORD driverTotal = totalBytes ? *totalBytes : 0;
+        const DWORD driverFree = freeBytes ? *freeBytes : 0;
+        if (totalBytes) *totalBytes = 0;
+        if (freeBytes) *freeBytes = 0;
+        if (!g_directDrawAgpQueryLogged.exchange(
+                true, std::memory_order_relaxed)) {
+            tmoxr::log::Info(
+                "Suppressing legacy DirectDraw AGP memory to prevent TMUF's signed video-memory total from overflowing: driver total/free=" +
+                std::to_string(driverTotal / (1024u * 1024u)) + "/" +
+                std::to_string(driverFree / (1024u * 1024u)) + " MiB.");
+        }
+        return result;
+    }
+
+    const DWORD driverTotal = totalBytes ? *totalBytes : 0;
+    const DWORD driverFree = freeBytes ? *freeBytes : driverTotal;
+    // ComputeVideoMemorySize_WithoutCurrentFB returns this free figure and TMUF
+    // subsequently adds its current framebuffer allocation back to it. The
+    // driver's total-minus-free delta is not always identical to the amount
+    // TMUF adds (notably on hybrid-GPU systems), so reserve at least the primary
+    // desktop framebuffer plus one MiB of rounding room. This guarantees that
+    // TMUF's reconstructed/rounded count remains below the signed 2048 MiB
+    // boundary while still exposing approximately two GiB for texture choices.
+    const DWORD driverConsumedBytes = driverFree <= driverTotal
+        ? driverTotal - driverFree : 0;
+    constexpr DWORD kRoundingReserveBytes = 1024u * 1024u;
+    const uint64_t framebufferReserve =
+        static_cast<uint64_t>(EstimatePrimaryFramebufferBytes()) +
+        kRoundingReserveBytes;
+    const DWORD consumedBytes = static_cast<DWORD>(std::min<uint64_t>(
+        std::max<uint64_t>(driverConsumedBytes, framebufferReserve),
+        targetBytes));
+    const DWORD reportedFree = consumedBytes < targetBytes
+        ? targetBytes - consumedBytes : 0;
+    if (totalBytes) *totalBytes = targetBytes;
+    if (freeBytes) *freeBytes = reportedFree;
+
+    const uint32_t query = g_directDrawMemoryQueryCount.fetch_add(
+        1, std::memory_order_relaxed) + 1;
+    if (!g_directDrawMemoryQueryLogged.exchange(
+            true, std::memory_order_relaxed)) {
+        tmoxr::log::Info(
+            "Correcting TMUF's DirectDraw video-memory report: driver total/free=" +
+            std::to_string(driverTotal / (1024u * 1024u)) + "/" +
+            std::to_string(driverFree / (1024u * 1024u)) +
+            " MiB, returned total/free=" +
+            std::to_string(targetBytes / (1024u * 1024u)) + "/" +
+            std::to_string(reportedFree / (1024u * 1024u)) + " MiB.");
+    }
+    if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed) &&
+        query <= 16) {
+        std::ostringstream message;
+        message << "DirectDraw video-memory query " << query << ": caps=0x"
+                << std::hex << requestedCaps << std::dec
+                << ", driver total/free="
+                << driverTotal / (1024u * 1024u) << "/"
+                << driverFree / (1024u * 1024u)
+                << " MiB, returned total/free="
+                << targetBytes / (1024u * 1024u) << "/"
+                << reportedFree / (1024u * 1024u) << " MiB.";
+        tmoxr::log::Info(message.str());
+    }
+    return result;
+}
+
+bool InstallDirectDrawMemoryHook(IDirectDraw7* directDraw) {
+    if (!directDraw) return false;
+    if (g_directDrawMemoryHookInstalled.exchange(
+            true, std::memory_order_acq_rel)) return true;
+
+    // IDirectDraw7 vtable index 23 is GetAvailableVidMem.
+    auto table = *reinterpret_cast<void***>(directDraw);
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(&table[23], sizeof(void*), PAGE_EXECUTE_READWRITE,
+                        &oldProtection)) {
+        g_directDrawMemoryHookInstalled.store(false, std::memory_order_release);
+        tmoxr::log::Warn(
+            "Could not install the DirectDraw video-memory reporting fix: " +
+            std::to_string(GetLastError()) + ".");
+        return false;
+    }
+    g_originalGetAvailableVidMem =
+        reinterpret_cast<GetAvailableVidMemFn>(table[23]);
+    table[23] = reinterpret_cast<void*>(&GetAvailableVidMemHook);
+    DWORD ignored = 0;
+    VirtualProtect(&table[23], sizeof(void*), oldProtection, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), &table[23], sizeof(void*));
+    tmoxr::log::Info(
+        "Installed the TMUF DirectDraw video-memory reporting fix.");
+    return true;
+}
+
+HRESULT WINAPI DirectDrawCreateExHook(
+    GUID* guid, LPVOID* object, REFIID interfaceId, IUnknown* outer) {
+    const HRESULT result = g_originalDirectDrawCreateEx
+        ? g_originalDirectDrawCreateEx(guid, object, interfaceId, outer)
+        : E_FAIL;
+    if (SUCCEEDED(result) && object && *object && interfaceId == IID_IDirectDraw7) {
+        tmoxr::log::Initialize();
+        if (!g_cameraSettings.loaded) LoadCameraSettings();
+        InstallDirectDrawMemoryHook(static_cast<IDirectDraw7*>(*object));
+    }
+    return result;
+}
+
+bool IsDirectDrawModule(HMODULE module) {
+    if (!module) return false;
+    wchar_t path[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(
+        module, path, static_cast<DWORD>(std::size(path)));
+    if (!length || length >= std::size(path)) return false;
+    const wchar_t* fileName = path;
+    for (const wchar_t* cursor = path; *cursor; ++cursor) {
+        if (*cursor == L'\\' || *cursor == L'/') fileName = cursor + 1;
+    }
+    return _wcsicmp(fileName, L"ddraw.dll") == 0;
+}
+
+FARPROC WINAPI GetProcAddressHook(HMODULE module, LPCSTR name) {
+    const auto original = g_originalExecutableGetProcAddress;
+    const FARPROC resolved = original ? original(module, name) : nullptr;
+    if (!resolved || reinterpret_cast<uintptr_t>(name) <= 0xffffu ||
+        std::strcmp(name, "DirectDrawCreateEx") != 0 ||
+        !IsDirectDrawModule(module)) {
+        return resolved;
+    }
+    g_originalDirectDrawCreateEx =
+        reinterpret_cast<DirectDrawCreateExFn>(resolved);
+    return reinterpret_cast<FARPROC>(&DirectDrawCreateExHook);
+}
+
+UINT STDMETHODCALLTYPE GetAvailableTextureMemHook(IDirect3DDevice9* device) {
+    const UINT driverBytes = g_originalGetAvailableTextureMem
+        ? g_originalGetAvailableTextureMem(device) : 0;
+    const int configuredMB =
+        g_cameraSettings.videoMemoryMB.load(std::memory_order_relaxed);
+    if (configuredMB <= 0) {
+        if (!g_videoMemoryQueryLogged.exchange(true, std::memory_order_relaxed)) {
+            tmoxr::log::Info("D3D9 video-memory override is disabled; driver reported " +
+                std::to_string(driverBytes / (1024u * 1024u)) + " MiB.");
+        }
+        return driverBytes;
+    }
+
+    const UINT targetBytes = ConfiguredVideoMemoryBytes();
+    if (!g_videoMemoryBaselineCaptured.exchange(true, std::memory_order_acq_rel)) {
+        g_videoMemoryDriverBaseline.store(driverBytes, std::memory_order_release);
+    }
+    const UINT driverBaseline =
+        g_videoMemoryDriverBaseline.load(std::memory_order_acquire);
+    const UINT consumedBytes = driverBytes <= driverBaseline
+        ? driverBaseline - driverBytes : 0;
+    const UINT reportedBytes = consumedBytes < targetBytes
+        ? targetBytes - consumedBytes : 0;
+    const uint32_t query =
+        g_videoMemoryQueryCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!g_videoMemoryQueryLogged.exchange(true, std::memory_order_relaxed)) {
+        tmoxr::log::Info("Correcting D3D9 video-memory report for TMUF: driver=" +
+            std::to_string(driverBytes / (1024u * 1024u)) + " MiB, configured=" +
+            std::to_string(configuredMB) + " MB, returned=" +
+            std::to_string(reportedBytes / (1024u * 1024u)) +
+            " MiB; subsequent reports will preserve the driver's allocation deltas.");
+    }
+    if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed) &&
+        query <= 16) {
+        tmoxr::log::Info("D3D9 video-memory query " + std::to_string(query) +
+            ": driver=" + std::to_string(driverBytes / (1024u * 1024u)) +
+            " MiB, driver consumption=" +
+            std::to_string(consumedBytes / (1024u * 1024u)) +
+            " MiB, returned=" +
+            std::to_string(reportedBytes / (1024u * 1024u)) + " MiB.");
+    }
+    return reportedBytes;
+}
+
+bool InstallVideoMemoryHook(IDirect3DDevice9* device) {
+    if (!device) return false;
+    if (g_videoMemoryHookInstalled.exchange(true, std::memory_order_acq_rel)) {
+        return true;
+    }
+    // IDirect3DDevice9 vtable index 4 is GetAvailableTextureMem.
+    auto table = *reinterpret_cast<void***>(device);
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(&table[4], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        g_videoMemoryHookInstalled.store(false, std::memory_order_release);
+        tmoxr::log::Warn("Could not install the D3D9 video-memory reporting fix: " +
+            std::to_string(GetLastError()) + ".");
+        return false;
+    }
+    g_originalGetAvailableTextureMem =
+        reinterpret_cast<GetAvailableTextureMemFn>(table[4]);
+    table[4] = reinterpret_cast<void*>(&GetAvailableTextureMemHook);
+    DWORD ignored = 0;
+    VirtualProtect(&table[4], sizeof(void*), oldProtect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), &table[4], sizeof(void*));
+    tmoxr::log::Info("Installed the TMUF D3D9 video-memory reporting fix.");
+    return true;
+}
+
 bool InstallDeviceHooks(IDirect3DDevice9* device) {
     if (g_hooked.exchange(true)) return true;
     // IDirect3DDevice9 vtable indexes from the Direct3D 9 SDK: Reset=16, Present=17.
@@ -3238,8 +3821,9 @@ void DisableVrForIncompatibleGraphics(HWND owner, bool fullscreen, D3DMULTISAMPL
 
 class D3D9Proxy final : public IDirect3D9 {
 public:
-    explicit D3D9Proxy(IDirect3D9* real, IDirect3D9* nativeFallback = nullptr)
-        : real_(real), nativeFallback_(nativeFallback) {}
+    explicit D3D9Proxy(IDirect3D9* real, IDirect3D9* nativeFallback = nullptr,
+                       bool vrEnabled = true)
+        : real_(real), nativeFallback_(nativeFallback), vrEnabled_(vrEnabled) {}
     ~D3D9Proxy() {
         if (nativeFallback_) nativeFallback_->Release();
         real_->Release();
@@ -3267,6 +3851,14 @@ public:
     HRESULT STDMETHODCALLTYPE CreateDevice(UINT a,D3DDEVTYPE type,HWND window,DWORD flags,D3DPRESENT_PARAMETERS* parameters,IDirect3DDevice9** device) override {
         if (!parameters || !device) return D3DERR_INVALIDCALL;
         *device = nullptr;
+        if (!vrEnabled_) {
+            const HRESULT result =
+                real_->CreateDevice(a, type, window, flags, parameters, device);
+            if (SUCCEEDED(result) && device && *device) {
+                InstallVideoMemoryHook(*device);
+            }
+            return result;
+        }
         const D3DPRESENT_PARAMETERS originalParameters = *parameters;
         const bool fullscreen = parameters->Windowed == FALSE;
         const bool antialiasing = parameters->MultiSampleType != D3DMULTISAMPLE_NONE;
@@ -3289,10 +3881,18 @@ public:
                 tmoxr::log::Error("Native desktop D3D9 device creation failed after VR was disabled: HRESULT=" +
                     std::to_string(static_cast<long>(result)) + ".");
             }
+            else if (device && *device) {
+                InstallVideoMemoryHook(*device);
+            }
             return result;
         }
         if (g_vrDisabledForIncompatibleGraphics.load(std::memory_order_relaxed)) {
-            return real_->CreateDevice(a, type, window, flags, parameters, device);
+            const HRESULT result =
+                real_->CreateDevice(a, type, window, flags, parameters, device);
+            if (SUCCEEDED(result) && device && *device) {
+                InstallVideoMemoryHook(*device);
+            }
+            return result;
         }
         HRESULT result = real_->CreateDevice(a,type,window,flags,parameters,device);
         if (FAILED(result) && nativeFallback_) {
@@ -3310,10 +3910,40 @@ public:
             tmoxr::log::Info("D3D9 device created: " + std::to_string(parameters->BackBufferWidth) + "x" +
                 std::to_string(parameters->BackBufferHeight) + ", windowed=" + std::to_string(parameters->Windowed != FALSE) +
                 ", presentation interval=" + std::to_string(parameters->PresentationInterval) + ".");
+            tmoxr::VrBridge::Instance().OnDeviceCreated(*device, *parameters);
+            if (!tmoxr::VrBridge::Instance().TryInitialize()) {
+                tmoxr::VrBridge::Instance().Shutdown();
+                RemoveCullingFrustumHook();
+                RemoveVehicleVisibilityHook();
+                g_vrDisabledForIncompatibleGraphics.store(true, std::memory_order_relaxed);
+
+                if (nativeFallback_) {
+                    IDirect3DDevice9* nativeDevice = nullptr;
+                    *parameters = originalParameters;
+                    const HRESULT nativeResult = nativeFallback_->CreateDevice(
+                        a, type, window, flags, parameters, &nativeDevice);
+                    if (SUCCEEDED(nativeResult) && nativeDevice) {
+                        (*device)->Release();
+                        *device = nativeDevice;
+                        real_->Release();
+                        real_ = nativeFallback_;
+                        nativeFallback_ = nullptr;
+                        result = nativeResult;
+                        tmoxr::log::Info("OpenXR startup failed; recreated a native D3D9 device for desktop-only play.");
+                    }
+                    else {
+                        tmoxr::log::Warn("OpenXR startup failed and native D3D9 recreation also failed; retaining the existing desktop device. HRESULT=" +
+                            std::to_string(static_cast<long>(nativeResult)) + ".");
+                    }
+                }
+                InstallVideoMemoryHook(*device);
+                return result;
+            }
+
+            InstallVideoMemoryHook(*device);
             if (InstallDeviceHooks(*device)) {
                 const HWND gameWindow = parameters->hDeviceWindow ? parameters->hDeviceWindow : window;
                 LockGameWindowSize(gameWindow);
-                tmoxr::VrBridge::Instance().OnDeviceCreated(*device, *parameters);
                 if (CreateStereoResources(*device)) InitializeSettingsOverlay(*device, gameWindow);
             }
         } else {
@@ -3324,6 +3954,7 @@ public:
 private:
     IDirect3D9* real_;
     IDirect3D9* nativeFallback_ = nullptr;
+    bool vrEnabled_ = true;
     std::atomic<ULONG> references_{1};
 };
 } // namespace
@@ -3331,13 +3962,32 @@ private:
 __declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT sdkVersion) {
     if (!IsTrackManiaGameProcess()) {
         LoadRealD3D9(false);
-        return g_create9 ? g_create9(sdkVersion) : nullptr;
+        IDirect3D9* real = g_create9 ? g_create9(sdkVersion) : nullptr;
+        if (!real || !IsTrackManiaLauncherProcess()) return real;
+        tmoxr::log::Initialize();
+        LoadCameraSettings();
+        OfferLargeAddressAwarePatch(true);
+        tmoxr::log::Info("Applying the TMUF video-memory reporting fix to TmForeverLauncher.exe hardware detection.");
+        return new D3D9Proxy(real, nullptr, false);
     }
     tmoxr::log::Initialize();
-    if (g_tmLoaderIatHookInstalled.load(std::memory_order_relaxed)) {
+    const bool tmLoaderInjection =
+        g_tmLoaderIatHookInstalled.load(std::memory_order_relaxed);
+    if (tmLoaderInjection) {
         tmoxr::log::Info("Activated through TrackMania ModLoader injection; redirected the game's D3D9 imports to TMFOXR.dll.");
     }
     LoadCameraSettings();
+    if (!tmLoaderInjection && OfferLargeAddressAwarePatch(false)) {
+        // The loader chose the current process's 2 GB address-space policy
+        // before TMFOXR was loaded. Keep this first launch safely desktop-only;
+        // the newly patched executable takes effect on the next launch.
+        LoadRealD3D9(false);
+        IDirect3D9* real = g_create9 ? g_create9(sdkVersion) : nullptr;
+        if (!real) return nullptr;
+        tmoxr::log::Warn(
+            "VR initialization skipped because the Large-Address-Aware patch requires a game restart.");
+        return new D3D9Proxy(real, nullptr, false);
+    }
     InstallVehicleVisibilityHook();
     if (g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed)) {
         InstallCullingFrustumHook();
@@ -3383,9 +4033,83 @@ extern "C" __declspec(dllexport) DWORD WINAPI TMFOXR_GetInjectionStatus() {
     return g_tmLoaderInjectionStatus.load(std::memory_order_relaxed);
 }
 
+extern "C" __declspec(dllexport) void CALLBACK TMFOXR_PatchAfterExit(
+    HWND, HINSTANCE, LPSTR, int) {
+    const std::wstring target =
+        ReadEnvironmentVariable(L"TMFOXR_PATCH_TARGET");
+    const std::wstring parentText =
+        ReadEnvironmentVariable(L"TMFOXR_PATCH_PARENT_PID");
+    const bool silent =
+        ReadEnvironmentVariable(L"TMFOXR_PATCH_SILENT") == L"1";
+
+    if (target.empty()) {
+        if (!silent) {
+            MessageBoxW(
+                nullptr,
+                L"TMFOXR's deferred memory-fix helper did not receive the "
+                L"TmForever.exe path.",
+                L"TrackMania Forever OpenXR - memory fix failed",
+                MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+        }
+        return;
+    }
+
+    wchar_t* parseEnd = nullptr;
+    const unsigned long parsedParent = parentText.empty()
+        ? 0ul : std::wcstoul(parentText.c_str(), &parseEnd, 10);
+    if (parsedParent != 0 && parseEnd && *parseEnd == L'\0') {
+        HANDLE parent = OpenProcess(
+            SYNCHRONIZE, FALSE, static_cast<DWORD>(parsedParent));
+        if (parent) {
+            WaitForSingleObject(parent, 60000);
+            CloseHandle(parent);
+        }
+    }
+
+    tmoxr::laa::PatchResult result{};
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        result = tmoxr::laa::PatchExecutable(target);
+        if (result.status == tmoxr::laa::PatchStatus::Patched ||
+            result.status == tmoxr::laa::PatchStatus::AlreadyEnabled) {
+            break;
+        }
+        if (result.windowsError != ERROR_SHARING_VIOLATION &&
+            result.windowsError != ERROR_LOCK_VIOLATION) {
+            break;
+        }
+        Sleep(100);
+    }
+
+    if (silent) return;
+    if (result.status == tmoxr::laa::PatchStatus::Patched ||
+        result.status == tmoxr::laa::PatchStatus::AlreadyEnabled) {
+        MessageBoxW(
+            nullptr,
+            L"The memory compatibility fix was installed successfully. "
+            L"Launch TrackMania again to use the new 4 GB address-space limit.\n\n"
+            L"The original executable is preserved as "
+            L"TmForever.exe.TMFOXR-backup.",
+            L"TrackMania Forever OpenXR - memory fix installed",
+            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+        return;
+    }
+
+    const std::wstring failure =
+        L"TMFOXR could not update TmForever.exe after the program closed.\n\n"
+        L"Win32 error: " + std::to_wstring(result.windowsError) +
+        L"\n\nThe TrackMania ModLoader installation can be used instead; its "
+        L"game executable is already Large-Address-Aware.";
+    MessageBoxW(
+        nullptr, failure.c_str(),
+        L"TrackMania Forever OpenXR - memory fix failed",
+        MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+}
+
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
+        g_tmfoxrModule = module;
         DisableThreadLibraryCalls(module);
+        InstallDirectDrawResolverHook();
         InstallInjectedD3D9ImportHooks(module);
     } else if (reason == DLL_PROCESS_DETACH && IsTrackManiaGameProcess()) {
         RemoveCullingFrustumHook();

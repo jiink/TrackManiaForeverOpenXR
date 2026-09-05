@@ -1397,6 +1397,12 @@ void VrBridge::OnDeviceCreated(IDirect3DDevice9* device, const D3DPRESENT_PARAME
     impl_->present = parameters;
 }
 
+bool VrBridge::TryInitialize() {
+    if (!impl_) return false;
+    std::scoped_lock lock(impl_->mutex);
+    return impl_->Initialize();
+}
+
 void VrBridge::OnBeginScene() {
     if (!impl_) return;
     std::scoped_lock lock(impl_->mutex);
