@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cwctype>
 #include <filesystem>
 #include <intrin.h>
 #include <sstream>
@@ -436,6 +437,9 @@ int g_settingsOverlayVehicleProfile = 0;
 RECT g_settingsOverlayPreviousClip{};
 bool g_settingsOverlayHadCursorClip = false;
 bool g_renderingSettingsOverlay = false;
+std::atomic<UINT> g_settingsOverlayToggleKey{VK_F10};
+bool g_settingsOverlayCapturingKey = false;
+ULONGLONG g_settingsOverlayHintUntil = 0;
 
 struct WindowFitResult {
     bool tooLarge = false;
@@ -451,6 +455,50 @@ void DisableVrForIncompatibleGraphics(HWND owner, bool fullscreen,
                                       const WindowFitResult& windowFit);
 void SetSettingsOverlayOpen(bool open);
 void ShutdownSettingsOverlay();
+void AssignSettingsOverlayToggleKey(UINT virtualKey);
+
+bool IsSupportedSettingsOverlayKey(UINT virtualKey) {
+    if ((virtualKey >= '0' && virtualKey <= '9') ||
+        (virtualKey >= 'A' && virtualKey <= 'Z') ||
+        (virtualKey >= VK_F1 && virtualKey <= VK_F24) ||
+        (virtualKey >= VK_NUMPAD0 && virtualKey <= VK_DIVIDE)) {
+        return true;
+    }
+    switch (virtualKey) {
+    case VK_BACK:
+    case VK_TAB:
+    case VK_RETURN:
+    case VK_PAUSE:
+    case VK_CAPITAL:
+    case VK_SPACE:
+    case VK_PRIOR:
+    case VK_NEXT:
+    case VK_END:
+    case VK_HOME:
+    case VK_LEFT:
+    case VK_UP:
+    case VK_RIGHT:
+    case VK_DOWN:
+    case VK_SNAPSHOT:
+    case VK_INSERT:
+    case VK_DELETE:
+    case VK_SCROLL:
+    case VK_OEM_1:
+    case VK_OEM_PLUS:
+    case VK_OEM_COMMA:
+    case VK_OEM_MINUS:
+    case VK_OEM_PERIOD:
+    case VK_OEM_2:
+    case VK_OEM_3:
+    case VK_OEM_4:
+    case VK_OEM_5:
+    case VK_OEM_6:
+    case VK_OEM_7:
+        return true;
+    default:
+        return false;
+    }
+}
 
 bool IsSettingsOverlayInputMessage(UINT message) {
     switch (message) {
@@ -489,14 +537,30 @@ LRESULT CALLBACK FixedSizeGameWindowProcedure(HWND window, UINT message, WPARAM 
     WNDPROC original = g_originalGameWindowProcedure;
     if (!original) return DefWindowProcW(window, message, wParam, lParam);
 
-    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && wParam == VK_F10) {
+    const bool keyDownMessage = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+    const bool keyUpMessage = message == WM_KEYUP || message == WM_SYSKEYUP;
+    if (g_settingsOverlayInitialized && g_settingsOverlayOpen &&
+        g_settingsOverlayCapturingKey && keyDownMessage) {
+        if ((lParam & (1LL << 30)) == 0) {
+            if (wParam == VK_ESCAPE) {
+                g_settingsOverlayCapturingKey = false;
+            } else if (IsSupportedSettingsOverlayKey(static_cast<UINT>(wParam))) {
+                AssignSettingsOverlayToggleKey(static_cast<UINT>(wParam));
+            }
+        }
+        return 0;
+    }
+    if (g_settingsOverlayCapturingKey && keyUpMessage) return 0;
+
+    const UINT toggleKey = g_settingsOverlayToggleKey.load(std::memory_order_relaxed);
+    if (keyDownMessage && wParam == toggleKey) {
         if ((lParam & (1LL << 30)) == 0) SetSettingsOverlayOpen(!g_settingsOverlayOpen);
         return 0;
     }
-    if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wParam == VK_F10) return 0;
+    if (keyUpMessage && wParam == toggleKey) return 0;
     if (g_settingsOverlayInitialized && g_settingsOverlayOpen) {
         ImGui_ImplWin32_WndProcHandler(window, message, wParam, lParam);
-        if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && wParam == VK_ESCAPE) {
+        if (keyDownMessage && wParam == VK_ESCAPE) {
             SetSettingsOverlayOpen(false);
             return 0;
         }
@@ -936,6 +1000,128 @@ float ReadIniFloat(const std::filesystem::path& path, const wchar_t* key, float 
     return end != value && std::isfinite(parsed) ? parsed : defaultValue;
 }
 
+struct NamedVirtualKey {
+    const wchar_t* configurationName;
+    const char* displayName;
+    UINT virtualKey;
+};
+
+constexpr std::array kNamedVirtualKeys{
+    NamedVirtualKey{L"Backspace", "Backspace", VK_BACK},
+    NamedVirtualKey{L"Tab", "Tab", VK_TAB},
+    NamedVirtualKey{L"Enter", "Enter", VK_RETURN},
+    NamedVirtualKey{L"Pause", "Pause", VK_PAUSE},
+    NamedVirtualKey{L"CapsLock", "Caps Lock", VK_CAPITAL},
+    NamedVirtualKey{L"Space", "Space", VK_SPACE},
+    NamedVirtualKey{L"PageUp", "Page Up", VK_PRIOR},
+    NamedVirtualKey{L"PageDown", "Page Down", VK_NEXT},
+    NamedVirtualKey{L"End", "End", VK_END},
+    NamedVirtualKey{L"Home", "Home", VK_HOME},
+    NamedVirtualKey{L"Left", "Left Arrow", VK_LEFT},
+    NamedVirtualKey{L"Up", "Up Arrow", VK_UP},
+    NamedVirtualKey{L"Right", "Right Arrow", VK_RIGHT},
+    NamedVirtualKey{L"Down", "Down Arrow", VK_DOWN},
+    NamedVirtualKey{L"PrintScreen", "Print Screen", VK_SNAPSHOT},
+    NamedVirtualKey{L"Insert", "Insert", VK_INSERT},
+    NamedVirtualKey{L"Delete", "Delete", VK_DELETE},
+    NamedVirtualKey{L"ScrollLock", "Scroll Lock", VK_SCROLL},
+    NamedVirtualKey{L"Semicolon", "Semicolon", VK_OEM_1},
+    NamedVirtualKey{L"Equals", "Equals", VK_OEM_PLUS},
+    NamedVirtualKey{L"Comma", "Comma", VK_OEM_COMMA},
+    NamedVirtualKey{L"Minus", "Minus", VK_OEM_MINUS},
+    NamedVirtualKey{L"Period", "Period", VK_OEM_PERIOD},
+    NamedVirtualKey{L"Slash", "Slash", VK_OEM_2},
+    NamedVirtualKey{L"Backtick", "Backtick", VK_OEM_3},
+    NamedVirtualKey{L"LeftBracket", "Left Bracket", VK_OEM_4},
+    NamedVirtualKey{L"Backslash", "Backslash", VK_OEM_5},
+    NamedVirtualKey{L"RightBracket", "Right Bracket", VK_OEM_6},
+    NamedVirtualKey{L"Quote", "Quote", VK_OEM_7},
+};
+
+std::wstring NormalizeVirtualKeyName(const wchar_t* text) {
+    std::wstring normalized;
+    if (!text) return normalized;
+    for (; *text; ++text) {
+        if (std::iswalnum(*text)) normalized.push_back(static_cast<wchar_t>(std::towupper(*text)));
+    }
+    return normalized;
+}
+
+UINT ParseSettingsOverlayKey(const wchar_t* text) {
+    const std::wstring name = NormalizeVirtualKeyName(text);
+    if (name.size() == 1) {
+        const wchar_t character = name.front();
+        if ((character >= L'A' && character <= L'Z') ||
+            (character >= L'0' && character <= L'9')) {
+            return static_cast<UINT>(character);
+        }
+    }
+    if (name.size() >= 2 && name.front() == L'F') {
+        wchar_t* end = nullptr;
+        const unsigned long number = std::wcstoul(name.c_str() + 1, &end, 10);
+        if (end && *end == L'\0' && number >= 1 && number <= 24) {
+            return VK_F1 + static_cast<UINT>(number - 1);
+        }
+    }
+    constexpr wchar_t numpadPrefix[] = L"NUMPAD";
+    if (name.starts_with(numpadPrefix) && name.size() == 7 &&
+        name.back() >= L'0' && name.back() <= L'9') {
+        return VK_NUMPAD0 + static_cast<UINT>(name.back() - L'0');
+    }
+    struct NumpadKey { const wchar_t* name; UINT virtualKey; };
+    constexpr std::array numpadKeys{
+        NumpadKey{L"MULTIPLY", VK_MULTIPLY}, NumpadKey{L"ADD", VK_ADD},
+        NumpadKey{L"SEPARATOR", VK_SEPARATOR}, NumpadKey{L"SUBTRACT", VK_SUBTRACT},
+        NumpadKey{L"DECIMAL", VK_DECIMAL}, NumpadKey{L"DIVIDE", VK_DIVIDE},
+    };
+    for (const auto& key : numpadKeys) {
+        if (name == key.name) return key.virtualKey;
+    }
+    for (const auto& key : kNamedVirtualKeys) {
+        if (name == NormalizeVirtualKeyName(key.configurationName)) return key.virtualKey;
+    }
+    return 0;
+}
+
+std::wstring SettingsOverlayKeyConfigurationName(UINT virtualKey) {
+    if ((virtualKey >= '0' && virtualKey <= '9') ||
+        (virtualKey >= 'A' && virtualKey <= 'Z')) {
+        return std::wstring(1, static_cast<wchar_t>(virtualKey));
+    }
+    if (virtualKey >= VK_F1 && virtualKey <= VK_F24) {
+        return L"F" + std::to_wstring(virtualKey - VK_F1 + 1);
+    }
+    if (virtualKey >= VK_NUMPAD0 && virtualKey <= VK_NUMPAD9) {
+        return L"Numpad" + std::to_wstring(virtualKey - VK_NUMPAD0);
+    }
+    switch (virtualKey) {
+    case VK_MULTIPLY: return L"Multiply";
+    case VK_ADD: return L"Add";
+    case VK_SEPARATOR: return L"Separator";
+    case VK_SUBTRACT: return L"Subtract";
+    case VK_DECIMAL: return L"Decimal";
+    case VK_DIVIDE: return L"Divide";
+    default: break;
+    }
+    for (const auto& key : kNamedVirtualKeys) {
+        if (key.virtualKey == virtualKey) return key.configurationName;
+    }
+    return L"F10";
+}
+
+std::string SettingsOverlayKeyDisplayName(UINT virtualKey) {
+    for (const auto& key : kNamedVirtualKeys) {
+        if (key.virtualKey == virtualKey) return key.displayName;
+    }
+    const std::wstring name = SettingsOverlayKeyConfigurationName(virtualKey);
+    std::string displayName;
+    displayName.reserve(name.size());
+    for (const wchar_t character : name) {
+        displayName.push_back(static_cast<char>(character));
+    }
+    return displayName;
+}
+
 void ReadCameraSettings(bool reloaded) {
     const auto& path = g_cameraSettings.configurationPath;
     const bool enabled = GetPrivateProfileIntW(L"Camera", L"CockpitEnabled", 1, path.c_str()) != 0;
@@ -971,6 +1157,15 @@ void ReadCameraSettings(bool reloaded) {
         0, 2048);
     const bool verboseDiagnostics =
         GetPrivateProfileIntW(L"Diagnostics", L"Verbose", 0, path.c_str()) != 0;
+    wchar_t settingsKeyText[64]{};
+    GetPrivateProfileStringW(L"Interface", L"SettingsToggleKey", L"F10",
+                             settingsKeyText, static_cast<DWORD>(std::size(settingsKeyText)),
+                             path.c_str());
+    UINT settingsToggleKey = ParseSettingsOverlayKey(settingsKeyText);
+    if (!IsSupportedSettingsOverlayKey(settingsToggleKey)) {
+        tmoxr::log::Warn("Unsupported Interface.SettingsToggleKey; using F10.");
+        settingsToggleKey = VK_F10;
+    }
     g_cameraSettings.cockpitEnabled.store(enabled, std::memory_order_relaxed);
     g_cameraSettings.cockpitNearClip.store(nearClip, std::memory_order_relaxed);
     g_cameraSettings.horizonLock.store(horizonLock, std::memory_order_relaxed);
@@ -981,6 +1176,7 @@ void ReadCameraSettings(bool reloaded) {
     g_cameraSettings.frustumCullingFix.store(frustumCullingFix, std::memory_order_relaxed);
     g_cameraSettings.videoMemoryMB.store(videoMemoryMB, std::memory_order_relaxed);
     g_cameraSettings.verboseDiagnostics.store(verboseDiagnostics, std::memory_order_relaxed);
+    g_settingsOverlayToggleKey.store(settingsToggleKey, std::memory_order_relaxed);
     tmoxr::VrBridge::Instance().SetVerboseDiagnostics(verboseDiagnostics);
     const auto activeProfile = g_cameraSettings.activeVehicleProfile.load(std::memory_order_relaxed);
     const auto& activeOffset = g_cameraSettings.vehicleProfiles[static_cast<size_t>(activeProfile)];
@@ -997,6 +1193,7 @@ void ReadCameraSettings(bool reloaded) {
         std::to_string(mirrorEyeToDesktop) + ", D3D9On12=" + std::to_string(d3d9On12) +
         ", frustum culling fix=" + std::to_string(frustumCullingFix) +
         ", configured video memory=" + std::to_string(videoMemoryMB) + " MB" +
+        ", settings key=" + SettingsOverlayKeyDisplayName(settingsToggleKey) +
         ", verbose diagnostics=" +
         std::to_string(verboseDiagnostics) + ".");
 }
@@ -1097,6 +1294,10 @@ bool SaveSettingsOverlayConfiguration() {
               g_cameraSettings.mirrorEyeToDesktop.load(std::memory_order_relaxed));
     writeBool(L"Performance", L"D3D9On12",
               g_cameraSettings.d3d9On12.load(std::memory_order_relaxed));
+    succeeded = WriteOverlayIniValue(
+        L"Interface", L"SettingsToggleKey",
+        SettingsOverlayKeyConfigurationName(
+            g_settingsOverlayToggleKey.load(std::memory_order_relaxed))) && succeeded;
     writeBool(L"Diagnostics", L"Verbose",
               g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed));
     WritePrivateProfileStringW(nullptr, nullptr, nullptr,
@@ -1119,10 +1320,20 @@ void QueueSettingsOverlaySave() {
     g_settingsOverlaySaveAt = GetTickCount64() + 350;
 }
 
+void AssignSettingsOverlayToggleKey(UINT virtualKey) {
+    if (!IsSupportedSettingsOverlayKey(virtualKey)) return;
+    g_settingsOverlayToggleKey.store(virtualKey, std::memory_order_relaxed);
+    g_settingsOverlayCapturingKey = false;
+    QueueSettingsOverlaySave();
+    tmoxr::log::Info("Settings-panel toggle key changed to " +
+                     SettingsOverlayKeyDisplayName(virtualKey) + ".");
+}
+
 void SetSettingsOverlayOpen(bool open) {
     if (g_settingsOverlayOpen == open) return;
     g_settingsOverlayOpen = open;
     if (open) {
+        g_settingsOverlayHintUntil = 0;
         g_settingsOverlayVehicleProfile = static_cast<int>(
             g_cameraSettings.activeVehicleProfile.load(std::memory_order_relaxed));
         RECT clip{};
@@ -1136,6 +1347,7 @@ void SetSettingsOverlayOpen(bool open) {
         }
         ClipCursor(nullptr);
     } else {
+        g_settingsOverlayCapturingKey = false;
         if (g_settingsOverlayDirty) SaveSettingsOverlayConfiguration();
         if (g_settingsOverlayHadCursorClip) ClipCursor(&g_settingsOverlayPreviousClip);
         g_settingsOverlayHadCursorClip = false;
@@ -1177,7 +1389,11 @@ bool InitializeSettingsOverlay(IDirect3DDevice9* device, HWND window) {
     }
     g_settingsOverlayInitialized = true;
     io.MouseDrawCursor = g_settingsOverlayOpen;
-    tmoxr::log::Info("Initialized the in-headset settings panel; press F10 to open it.");
+    g_settingsOverlayHintUntil = GetTickCount64() + 6000;
+    tmoxr::log::Info("Initialized the in-headset settings panel; press " +
+                     SettingsOverlayKeyDisplayName(
+                         g_settingsOverlayToggleKey.load(std::memory_order_relaxed)) +
+                     " to open it.");
     return true;
 }
 
@@ -1187,6 +1403,8 @@ void ShutdownSettingsOverlay() {
     if (g_settingsOverlayHadCursorClip) ClipCursor(&g_settingsOverlayPreviousClip);
     g_settingsOverlayHadCursorClip = false;
     g_settingsOverlayOpen = false;
+    g_settingsOverlayCapturingKey = false;
+    g_settingsOverlayHintUntil = 0;
     ImGui_ImplDX9_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
@@ -1213,6 +1431,8 @@ bool OverlaySlider(const char* label, std::atomic<float>& setting,
 
 void BuildSettingsOverlay() {
     ImGuiIO& io = ImGui::GetIO();
+    const std::string toggleKey = SettingsOverlayKeyDisplayName(
+        g_settingsOverlayToggleKey.load(std::memory_order_relaxed));
     const ImVec2 available = ImGui::GetMainViewport()->WorkSize;
     ImGui::SetNextWindowPos(ImVec2(20.0f, 20.0f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(
@@ -1222,7 +1442,7 @@ void BuildSettingsOverlay() {
     bool remainOpen = true;
     if (ImGui::Begin("TrackMania Forever OpenXR", &remainOpen,
                      ImGuiWindowFlags_NoCollapse)) {
-        ImGui::TextUnformatted("F10 or Escape closes this panel");
+        ImGui::Text("%s or Escape closes this panel", toggleKey.c_str());
         ImGui::TextWrapped("Changes apply immediately and are saved automatically to Documents\\TrackMania\\TMFOXR.ini.");
         ImGui::Separator();
 
@@ -1287,6 +1507,17 @@ void BuildSettingsOverlay() {
                 ImGui::TextWrapped("The current session log is Documents\\TrackMania\\TMFOXR.log.");
                 ImGui::EndTabItem();
             }
+            if (ImGui::BeginTabItem("Interface")) {
+                ImGui::Text("Settings toggle key: %s", toggleKey.c_str());
+                if (g_settingsOverlayCapturingKey) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.25f, 1.0f),
+                                       "Press the new key now...");
+                    ImGui::TextWrapped("Press Escape to cancel. Modifier-only keys are not accepted.");
+                } else if (ImGui::Button("Change toggle key")) {
+                    g_settingsOverlayCapturingKey = true;
+                }
+                ImGui::EndTabItem();
+            }
             ImGui::EndTabBar();
         }
         if (g_settingsOverlayDirty) {
@@ -1300,6 +1531,32 @@ void BuildSettingsOverlay() {
         SaveSettingsOverlayConfiguration();
     }
     io.MouseDrawCursor = g_settingsOverlayOpen;
+}
+
+void BuildSettingsOverlayHint() {
+    const ULONGLONG now = GetTickCount64();
+    const float secondsRemaining = g_settingsOverlayHintUntil > now
+        ? static_cast<float>(g_settingsOverlayHintUntil - now) / 1000.0f : 0.0f;
+    const float alpha = std::clamp(secondsRemaining, 0.0f, 1.0f);
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(
+        ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
+               viewport->WorkPos.y + viewport->WorkSize.y * 0.12f),
+        ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.90f * alpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+    if (ImGui::Begin("TMFOXR startup hint", nullptr,
+                     ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoDecoration |
+                     ImGuiWindowFlags_NoInputs |
+                     ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoSavedSettings)) {
+        const std::string toggleKey = SettingsOverlayKeyDisplayName(
+            g_settingsOverlayToggleKey.load(std::memory_order_relaxed));
+        ImGui::Text("Press %s to open VR settings", toggleKey.c_str());
+    }
+    ImGui::End();
+    ImGui::PopStyleVar();
 }
 
 bool GameHasKeyboardFocus() {
@@ -2778,17 +3035,21 @@ void CaptureMouseCursor(IDirect3DDevice9* device, HWND window) {
 }
 
 void RenderSettingsOverlay(IDirect3DDevice9* device, HWND window) {
-    if (!g_settingsOverlayOpen || !device || !window || !g_stereo.ready ||
+    if (!device || !window || !g_stereo.ready ||
         !g_stereo.uiSurface || !g_stereo.primaryWidth || !g_stereo.primaryHeight) return;
     if (!InitializeSettingsOverlay(device, window)) return;
+    const bool showHint = !g_settingsOverlayOpen &&
+        GetTickCount64() < g_settingsOverlayHintUntil;
+    if (!g_settingsOverlayOpen && !showHint) return;
 
     // TrackMania normally confines the pointer while driving. Release it every
     // frame while the panel is open because the game may reapply its clip.
-    ClipCursor(nullptr);
+    if (g_settingsOverlayOpen) ClipCursor(nullptr);
     ImGui_ImplDX9_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
-    BuildSettingsOverlay();
+    if (g_settingsOverlayOpen) BuildSettingsOverlay();
+    else BuildSettingsOverlayHint();
     ImGui::Render();
     ImDrawData* const drawData = ImGui::GetDrawData();
     if (!drawData || drawData->DisplaySize.x <= 0.0f || drawData->DisplaySize.y <= 0.0f) return;
