@@ -16,6 +16,7 @@ FetchContent_MakeAvailable(openxr_headers)
 
 add_library(d3d9 SHARED
   src/d3d9_proxy.cpp
+  src/large_address_aware.cpp
   src/log.cpp
   src/runtime_paths.cpp
   src/vr_bridge.cpp
@@ -39,6 +40,23 @@ add_executable(tmloader_iat_smoke EXCLUDE_FROM_ALL tests/tmloader_iat_smoke.cpp)
 target_compile_features(tmloader_iat_smoke PRIVATE cxx_std_20)
 target_compile_definitions(tmloader_iat_smoke PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 set_target_properties(tmloader_iat_smoke PROPERTIES OUTPUT_NAME "TmForever")
+
+add_executable(d3d9_vram_probe EXCLUDE_FROM_ALL tests/d3d9_vram_probe.cpp)
+target_compile_features(d3d9_vram_probe PRIVATE cxx_std_20)
+target_compile_definitions(d3d9_vram_probe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(d3d9_vram_probe PRIVATE dxguid)
+set_target_properties(d3d9_vram_probe PROPERTIES
+  OUTPUT_NAME "TmForeverLauncher"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/vram-probe"
+)
+
+add_executable(large_address_aware_smoke EXCLUDE_FROM_ALL
+  tests/large_address_aware_smoke.cpp
+  src/large_address_aware.cpp
+)
+target_compile_features(large_address_aware_smoke PRIVATE cxx_std_20)
+target_compile_definitions(large_address_aware_smoke PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(large_address_aware_smoke PRIVATE src)
 
 set_target_properties(d3d9 PROPERTIES
   OUTPUT_NAME "d3d9"

@@ -116,6 +116,16 @@ and its 2.12.0-compat executable layouts are supported.
 6. For Virtual Desktop, select **VirtualDesktopXR (VDXR)** as the OpenXR runtime, connect the headset, and launch TrackMania normally.
 7. Put on the headset and enter a race.
 
+On the first manual launch, TMFOXR checks whether `TmForever.exe` can use more
+than 2 GB of virtual address space. If needed, it offers to enable Windows'
+standard Large-Address-Aware executable flag and preserves the untouched file as
+`TmForever.exe.TMFOXR-backup`. Accepting from a direct game launch requires
+closing and restarting the game once. If Windows has the executable locked,
+TMFOXR closes the game or launcher, applies the change immediately afterward,
+and displays a success message when it is safe to launch TrackMania again. If
+Windows instead reports an access-denied error, use the TMLoader installation,
+whose managed game executable already has this capability.
+
 The loader package being version 1.1.62 does not require the application or active runtime to use OpenXR API 1.1. The mod deliberately requests OpenXR 1.0 for compatibility with runtimes that expose 1.0; newer loaders can negotiate that version normally.
 
 ## Cockpit camera
@@ -139,6 +149,20 @@ The mod always honors the eye resolution recommended by the active OpenXR runtim
 `MirrorEyeToDesktop=1` skips TrackMania's redundant original perspective draw, renders the two tracked headset eyes, and mirrors the completed center/left-eye scene through the game's normal post-processing path for the monitor. This reduces scene geometry work from three views to two. The setting reloads live when `TMFOXR.ini` is saved; set it to `0` if a track or unusual post-processing effect does not mirror correctly.
 
 `FrustumCullingFix=1` makes TrackMania's CPU visibility volume follow the headset, preventing scenery from disappearing when looking far to either side or behind. It retains the game's normal six-plane culling, avoiding the severe performance cost of rendering the desktop camera's view and the headset view simultaneously. The fix is disabled by default because it hooks version-specific TrackMania rendering code; enable it under `[Performance]` when using the supported Steam United Forever 2.11.26 executable. The setting reloads live when `TMFOXR.ini` is saved.
+
+## Video-memory compatibility
+
+TMUF can incorrectly report very little or even negative video memory on modern GPUs and dual-GPU laptops. This causes blurry textures and can crash complex or Stadium maps. TMFOXR corrects both legacy DirectDraw hardware detection and `IDirect3DDevice9::GetAvailableTextureMem` to approximately 2 GB by default, covering the launcher and the game without requiring dgVoodoo's separate `DDraw.dll` and `D3D9.dll`. Internally the result stays below 2048 MiB because TMUF turns exactly 2048 MiB into a negative number when it reconstructs the value through signed 32-bit arithmetic. The fix also remains active when VR initialization is declined and the game continues in desktop mode.
+
+Set `VideoMemoryMB` under `[Compatibility]` to `0` to restore the graphics driver's original report. Values above 2048 are clamped, and a setting of 2048 uses TMFOXR's highest safe effective value below TMUF's signed boundary. This setting is read when the D3D9 device is created, so restart the game after changing it.
+
+Do not install dgVoodoo's `D3D9.dll` over TMFOXR's `d3d9.dll`; only one proxy can use that filename. TMFOXR now provides the relevant video-memory correction itself. TMLoader's managed TMUF executable is also Large-Address-Aware and can use up to 4 GB of process address space, while the original executable remains limited to 2 GB; that address-space patch is separate from the D3D9 video-memory report corrected here.
+
+For manual installations, TMFOXR detects that original 2 GB executable and
+offers the same Large-Address-Aware capability through a consent-based patch.
+This changes only the PE header flag and creates a backup before writing.
+Restoring the backup or asking Steam to verify the game files removes the
+executable change.
 
 The mod tracks manual camera keys 1–7. While its camera state is initially unknown, TrackMania's first native vehicle-hide request can identify a persisted camera 3 selection. This restores the cockpit offset and visible car before the first race frame without allowing unrelated visibility changes later in the race to disturb the camera.
 
