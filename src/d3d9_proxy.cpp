@@ -12,6 +12,9 @@
 #undef D3DPERF_SetOptions
 
 #include <d3d9on12.h>
+#include <imgui.h>
+#include <imgui_impl_dx9.h>
+#include <imgui_impl_win32.h>
 
 #include <atomic>
 #include <algorithm>
@@ -27,6 +30,9 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
+    HWND window, UINT message, WPARAM wParam, LPARAM lParam);
 
 __declspec(dllexport) IDirect3D9* WINAPI Direct3DCreate9(UINT sdkVersion);
 extern "C" __declspec(dllexport) void WINAPI D3DPERF_SetOptions(DWORD options);
@@ -119,6 +125,14 @@ HWND g_lockedGameWindow = nullptr;
 WNDPROC g_originalGameWindowProcedure = nullptr;
 LONG g_lockedWindowWidth = 0;
 LONG g_lockedWindowHeight = 0;
+bool g_settingsOverlayInitialized = false;
+bool g_settingsOverlayOpen = false;
+bool g_settingsOverlayDirty = false;
+ULONGLONG g_settingsOverlaySaveAt = 0;
+int g_settingsOverlayVehicleProfile = 0;
+RECT g_settingsOverlayPreviousClip{};
+bool g_settingsOverlayHadCursorClip = false;
+bool g_renderingSettingsOverlay = false;
 
 struct WindowFitResult {
     bool tooLarge = false;
@@ -132,6 +146,36 @@ void RemoveDeviceHooks(IDirect3DDevice9* device);
 void DisableVrForIncompatibleGraphics(HWND owner, bool fullscreen,
                                       D3DMULTISAMPLE_TYPE multisampleType, DWORD multisampleQuality,
                                       const WindowFitResult& windowFit);
+void SetSettingsOverlayOpen(bool open);
+void ShutdownSettingsOverlay();
+
+bool IsSettingsOverlayInputMessage(UINT message) {
+    switch (message) {
+    case WM_MOUSEMOVE:
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_LBUTTONDBLCLK:
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONUP:
+    case WM_RBUTTONDBLCLK:
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONUP:
+    case WM_MBUTTONDBLCLK:
+    case WM_XBUTTONDOWN:
+    case WM_XBUTTONUP:
+    case WM_XBUTTONDBLCLK:
+    case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL:
+    case WM_KEYDOWN:
+    case WM_KEYUP:
+    case WM_SYSKEYDOWN:
+    case WM_SYSKEYUP:
+    case WM_CHAR:
+        return true;
+    default:
+        return false;
+    }
+}
 
 bool IsResizeHitTest(LRESULT hitTest) {
     return hitTest == HTLEFT || hitTest == HTRIGHT || hitTest == HTTOP || hitTest == HTBOTTOM ||
@@ -141,6 +185,20 @@ bool IsResizeHitTest(LRESULT hitTest) {
 LRESULT CALLBACK FixedSizeGameWindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     WNDPROC original = g_originalGameWindowProcedure;
     if (!original) return DefWindowProcW(window, message, wParam, lParam);
+
+    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && wParam == VK_F10) {
+        if ((lParam & (1LL << 30)) == 0) SetSettingsOverlayOpen(!g_settingsOverlayOpen);
+        return 0;
+    }
+    if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wParam == VK_F10) return 0;
+    if (g_settingsOverlayInitialized && g_settingsOverlayOpen) {
+        ImGui_ImplWin32_WndProcHandler(window, message, wParam, lParam);
+        if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && wParam == VK_ESCAPE) {
+            SetSettingsOverlayOpen(false);
+            return 0;
+        }
+        if (IsSettingsOverlayInputMessage(message)) return 0;
+    }
 
     if (message == WM_SYSCOMMAND) {
         const WPARAM command = wParam & 0xfff0;
@@ -160,6 +218,7 @@ LRESULT CALLBACK FixedSizeGameWindowProcedure(HWND window, UINT message, WPARAM 
         return result;
     }
     if (message == WM_NCDESTROY && window == g_lockedGameWindow) {
+        ShutdownSettingsOverlay();
         SetWindowLongPtrW(window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(original));
         g_lockedGameWindow = nullptr;
         g_originalGameWindowProcedure = nullptr;
@@ -668,6 +727,269 @@ void ReloadCameraSettingsIfChanged() {
     g_cameraSettings.configurationWriteTime = attributes.ftLastWriteTime;
     g_cameraSettings.haveConfigurationWriteTime = true;
     ReadCameraSettings(true);
+}
+
+bool WriteOverlayIniValue(const wchar_t* section, const wchar_t* key,
+                          const std::wstring& value) {
+    if (g_cameraSettings.configurationPath.empty()) return false;
+    return WritePrivateProfileStringW(section, key, value.c_str(),
+                                      g_cameraSettings.configurationPath.c_str()) != FALSE;
+}
+
+std::wstring OverlayFloatText(float value) {
+    wchar_t text[32]{};
+    swprintf_s(text, L"%.3f", value);
+    return text;
+}
+
+void RefreshConfigurationWriteTime() {
+    WIN32_FILE_ATTRIBUTE_DATA attributes{};
+    if (GetFileAttributesExW(g_cameraSettings.configurationPath.c_str(),
+                             GetFileExInfoStandard, &attributes)) {
+        g_cameraSettings.configurationWriteTime = attributes.ftLastWriteTime;
+        g_cameraSettings.haveConfigurationWriteTime = true;
+        g_cameraSettings.nextConfigurationCheck = GetTickCount64() + 250;
+    }
+}
+
+bool SaveSettingsOverlayConfiguration() {
+    if (g_cameraSettings.configurationPath.empty()) return false;
+    bool succeeded = true;
+    const auto writeBool = [&](const wchar_t* section, const wchar_t* key, bool value) {
+        succeeded = WriteOverlayIniValue(section, key, value ? L"1" : L"0") && succeeded;
+    };
+    const auto writeFloat = [&](const wchar_t* section, const wchar_t* key, float value) {
+        succeeded = WriteOverlayIniValue(section, key, OverlayFloatText(value)) && succeeded;
+    };
+
+    writeBool(L"Camera", L"CockpitEnabled",
+              g_cameraSettings.cockpitEnabled.load(std::memory_order_relaxed));
+    writeFloat(L"Camera", L"CockpitNearClip",
+               g_cameraSettings.cockpitNearClip.load(std::memory_order_relaxed));
+    writeBool(L"Camera", L"HorizonLock",
+              g_cameraSettings.horizonLock.load(std::memory_order_relaxed));
+    writeFloat(L"Camera", L"HorizonLockReleaseStart",
+               g_cameraSettings.horizonLockReleaseStart.load(std::memory_order_relaxed));
+    writeFloat(L"Camera", L"HorizonLockReleaseEnd",
+               g_cameraSettings.horizonLockReleaseEnd.load(std::memory_order_relaxed));
+    for (size_t index = 0; index < kVehicleProfileCount; ++index) {
+        const auto& profile = g_cameraSettings.vehicleProfiles[index];
+        writeFloat(kVehicleProfileSections[index], L"CockpitOffsetRight",
+                   profile.right.load(std::memory_order_relaxed));
+        writeFloat(kVehicleProfileSections[index], L"CockpitOffsetUp",
+                   profile.up.load(std::memory_order_relaxed));
+        writeFloat(kVehicleProfileSections[index], L"CockpitOffsetForward",
+                   profile.forward.load(std::memory_order_relaxed));
+    }
+    writeBool(L"Performance", L"FrustumCullingFix",
+              g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed));
+    writeBool(L"Performance", L"MirrorEyeToDesktop",
+              g_cameraSettings.mirrorEyeToDesktop.load(std::memory_order_relaxed));
+    writeBool(L"Performance", L"D3D9On12",
+              g_cameraSettings.d3d9On12.load(std::memory_order_relaxed));
+    writeBool(L"Diagnostics", L"Verbose",
+              g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed));
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr,
+                               g_cameraSettings.configurationPath.c_str());
+    if (succeeded) {
+        g_settingsOverlayDirty = false;
+        RefreshConfigurationWriteTime();
+    } else {
+        static bool failureLogged = false;
+        if (!failureLogged) {
+            failureLogged = true;
+            tmoxr::log::Warn("The in-headset settings panel could not save TMFOXR.ini.");
+        }
+    }
+    return succeeded;
+}
+
+void QueueSettingsOverlaySave() {
+    g_settingsOverlayDirty = true;
+    g_settingsOverlaySaveAt = GetTickCount64() + 350;
+}
+
+void SetSettingsOverlayOpen(bool open) {
+    if (g_settingsOverlayOpen == open) return;
+    g_settingsOverlayOpen = open;
+    if (open) {
+        g_settingsOverlayVehicleProfile = static_cast<int>(
+            g_cameraSettings.activeVehicleProfile.load(std::memory_order_relaxed));
+        RECT clip{};
+        if (GetClipCursor(&clip)) {
+            const RECT desktop{GetSystemMetrics(SM_XVIRTUALSCREEN),
+                               GetSystemMetrics(SM_YVIRTUALSCREEN),
+                               GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                               GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN)};
+            g_settingsOverlayPreviousClip = clip;
+            g_settingsOverlayHadCursorClip = !EqualRect(&clip, &desktop);
+        }
+        ClipCursor(nullptr);
+    } else {
+        if (g_settingsOverlayDirty) SaveSettingsOverlayConfiguration();
+        if (g_settingsOverlayHadCursorClip) ClipCursor(&g_settingsOverlayPreviousClip);
+        g_settingsOverlayHadCursorClip = false;
+    }
+    if (g_settingsOverlayInitialized) ImGui::GetIO().MouseDrawCursor = open;
+    tmoxr::log::Info(std::string("In-headset settings panel ") +
+                     (open ? "opened." : "closed."));
+}
+
+bool InitializeSettingsOverlay(IDirect3DDevice9* device, HWND window) {
+    if (g_settingsOverlayInitialized) return true;
+    if (!device || !window || !IsWindow(window)) return false;
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.LogFilename = nullptr;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    ImFontConfig fontConfiguration{};
+    fontConfiguration.SizePixels = 18.0f;
+    io.Fonts->AddFontDefault(&fontConfiguration);
+    ImGui::StyleColorsDark();
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.ScaleAllSizes(1.10f);
+    style.WindowRounding = 7.0f;
+    style.FrameRounding = 4.0f;
+    style.WindowBorderSize = 1.0f;
+    style.Colors[ImGuiCol_WindowBg].w = 0.96f;
+    if (!ImGui_ImplWin32_Init(window)) {
+        ImGui::DestroyContext();
+        tmoxr::log::Warn("Could not initialize the Win32 settings-panel backend.");
+        return false;
+    }
+    if (!ImGui_ImplDX9_Init(device)) {
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+        tmoxr::log::Warn("Could not initialize the Direct3D 9 settings-panel backend.");
+        return false;
+    }
+    g_settingsOverlayInitialized = true;
+    io.MouseDrawCursor = g_settingsOverlayOpen;
+    tmoxr::log::Info("Initialized the in-headset settings panel; press F10 to open it.");
+    return true;
+}
+
+void ShutdownSettingsOverlay() {
+    if (!g_settingsOverlayInitialized) return;
+    if (g_settingsOverlayDirty) SaveSettingsOverlayConfiguration();
+    if (g_settingsOverlayHadCursorClip) ClipCursor(&g_settingsOverlayPreviousClip);
+    g_settingsOverlayHadCursorClip = false;
+    g_settingsOverlayOpen = false;
+    ImGui_ImplDX9_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
+    g_settingsOverlayInitialized = false;
+}
+
+bool OverlayCheckbox(const char* label, std::atomic<bool>& setting) {
+    bool value = setting.load(std::memory_order_relaxed);
+    if (!ImGui::Checkbox(label, &value)) return false;
+    setting.store(value, std::memory_order_relaxed);
+    QueueSettingsOverlaySave();
+    return true;
+}
+
+bool OverlaySlider(const char* label, std::atomic<float>& setting,
+                   float minimum, float maximum, const char* format) {
+    float value = setting.load(std::memory_order_relaxed);
+    if (!ImGui::SliderFloat(label, &value, minimum, maximum, format,
+                            ImGuiSliderFlags_AlwaysClamp)) return false;
+    setting.store(value, std::memory_order_relaxed);
+    QueueSettingsOverlaySave();
+    return true;
+}
+
+void BuildSettingsOverlay() {
+    ImGuiIO& io = ImGui::GetIO();
+    const ImVec2 available = ImGui::GetMainViewport()->WorkSize;
+    ImGui::SetNextWindowPos(ImVec2(20.0f, 20.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(
+        ImVec2(std::clamp(available.x - 40.0f, 520.0f, 720.0f),
+               std::clamp(available.y - 40.0f, 480.0f, 700.0f)),
+        ImGuiCond_FirstUseEver);
+    bool remainOpen = true;
+    if (ImGui::Begin("TrackMania Forever OpenXR", &remainOpen,
+                     ImGuiWindowFlags_NoCollapse)) {
+        ImGui::TextUnformatted("F10 or Escape closes this panel");
+        ImGui::TextWrapped("Changes apply immediately and are saved automatically to Documents\\TrackMania\\TMFOXR.ini.");
+        ImGui::Separator();
+
+        if (ImGui::BeginTabBar("TMFOXR settings")) {
+            if (ImGui::BeginTabItem("Camera")) {
+                OverlayCheckbox("Enable cockpit camera offset", g_cameraSettings.cockpitEnabled);
+                OverlaySlider("Near clip", g_cameraSettings.cockpitNearClip,
+                              0.01f, 0.50f, "%.3f m");
+                ImGui::SeparatorText("Horizon lock");
+                OverlayCheckbox("Enable horizon lock", g_cameraSettings.horizonLock);
+                float releaseStart = g_cameraSettings.horizonLockReleaseStart.load(std::memory_order_relaxed);
+                if (ImGui::SliderFloat("Release begins", &releaseStart, 0.0f, 80.0f,
+                                       "%.1f deg", ImGuiSliderFlags_AlwaysClamp)) {
+                    const float releaseEnd = g_cameraSettings.horizonLockReleaseEnd.load(std::memory_order_relaxed);
+                    releaseStart = std::min(releaseStart, releaseEnd - 1.0f);
+                    g_cameraSettings.horizonLockReleaseStart.store(releaseStart, std::memory_order_relaxed);
+                    QueueSettingsOverlaySave();
+                }
+                float releaseEnd = g_cameraSettings.horizonLockReleaseEnd.load(std::memory_order_relaxed);
+                if (ImGui::SliderFloat("Fully released", &releaseEnd, 1.0f, 89.0f,
+                                       "%.1f deg", ImGuiSliderFlags_AlwaysClamp)) {
+                    const float releaseStartNow = g_cameraSettings.horizonLockReleaseStart.load(std::memory_order_relaxed);
+                    releaseEnd = std::max(releaseEnd, releaseStartNow + 1.0f);
+                    g_cameraSettings.horizonLockReleaseEnd.store(releaseEnd, std::memory_order_relaxed);
+                    QueueSettingsOverlaySave();
+                }
+
+                ImGui::SeparatorText("Cockpit position");
+                const auto activeProfile = g_cameraSettings.activeVehicleProfile.load(std::memory_order_relaxed);
+                ImGui::Text("Current car: %s", kVehicleProfileNames[static_cast<size_t>(activeProfile)]);
+                if (ImGui::BeginCombo("Edit car", kVehicleProfileNames[static_cast<size_t>(
+                                          g_settingsOverlayVehicleProfile)])) {
+                    for (int index = 0; index < static_cast<int>(kVehicleProfileCount); ++index) {
+                        const bool selected = index == g_settingsOverlayVehicleProfile;
+                        if (ImGui::Selectable(kVehicleProfileNames[static_cast<size_t>(index)], selected)) {
+                            g_settingsOverlayVehicleProfile = index;
+                        }
+                        if (selected) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+                auto& profile = g_cameraSettings.vehicleProfiles[static_cast<size_t>(
+                    g_settingsOverlayVehicleProfile)];
+                OverlaySlider("Right / left", profile.right, -2.0f, 2.0f, "%.3f m");
+                OverlaySlider("Up / down", profile.up, -2.0f, 2.0f, "%.3f m");
+                OverlaySlider("Forward / back", profile.forward, -2.0f, 2.0f, "%.3f m");
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Performance")) {
+                OverlayCheckbox("Mirror one eye to the desktop", g_cameraSettings.mirrorEyeToDesktop);
+                OverlayCheckbox("Enable headset-aligned frustum culling fix", g_cameraSettings.frustumCullingFix);
+                ImGui::Spacing();
+                OverlayCheckbox("Use D3D9On12", g_cameraSettings.d3d9On12);
+                ImGui::TextWrapped("D3D9On12 is selected before the graphics device is created, so this change takes effect after restarting the game.");
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Diagnostics")) {
+                if (OverlayCheckbox("Verbose diagnostic logging", g_cameraSettings.verboseDiagnostics)) {
+                    tmoxr::VrBridge::Instance().SetVerboseDiagnostics(
+                        g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed));
+                }
+                ImGui::TextWrapped("The current session log is Documents\\TrackMania\\TMFOXR.log.");
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
+        if (g_settingsOverlayDirty) {
+            ImGui::Separator();
+            ImGui::TextDisabled("Saving changes...");
+        }
+    }
+    ImGui::End();
+    if (!remainOpen) SetSettingsOverlayOpen(false);
+    if (g_settingsOverlayDirty && GetTickCount64() >= g_settingsOverlaySaveAt) {
+        SaveSettingsOverlayConfiguration();
+    }
+    io.MouseDrawCursor = g_settingsOverlayOpen;
 }
 
 bool GameHasKeyboardFocus() {
@@ -2136,6 +2458,60 @@ void CaptureMouseCursor(IDirect3DDevice9* device, HWND window) {
     if (beginTemporaryScene) g_originalEndScene(device);
 }
 
+void RenderSettingsOverlay(IDirect3DDevice9* device, HWND window) {
+    if (!g_settingsOverlayOpen || !device || !window || !g_stereo.ready ||
+        !g_stereo.uiSurface || !g_stereo.primaryWidth || !g_stereo.primaryHeight) return;
+    if (!InitializeSettingsOverlay(device, window)) return;
+
+    // TrackMania normally confines the pointer while driving. Release it every
+    // frame while the panel is open because the game may reapply its clip.
+    ClipCursor(nullptr);
+    ImGui_ImplDX9_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGui::NewFrame();
+    BuildSettingsOverlay();
+    ImGui::Render();
+    ImDrawData* const drawData = ImGui::GetDrawData();
+    if (!drawData || drawData->DisplaySize.x <= 0.0f || drawData->DisplaySize.y <= 0.0f) return;
+
+    IDirect3DStateBlock9* state = nullptr;
+    if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &state))) return;
+    const bool beginTemporaryScene = !g_stereo.sceneActive;
+    if (beginTemporaryScene && FAILED(g_originalBeginScene(device))) {
+        state->Release();
+        return;
+    }
+
+    g_renderingSettingsOverlay = true;
+    g_originalSetDepthStencilSurface(device, nullptr);
+    if (SUCCEEDED(g_originalSetRenderTarget(device, 0, g_stereo.uiSurface))) {
+        if (!g_stereo.uiOverlayClearedThisFrame) {
+            g_originalClear(device, 0, nullptr, D3DCLEAR_TARGET, 0x00000000u, 1.0f, 0);
+            g_stereo.uiOverlayClearedThisFrame = true;
+        }
+        ImGui_ImplDX9_RenderDrawData(drawData);
+        ++g_stereo.uiDrawsThisFrame;
+        ++g_stereo.capturedUiDraws;
+    }
+
+    // Draw the same panel over the completed desktop eye mirror. The headset
+    // receives the transparent UI texture above, so this second draw cannot be
+    // replayed into either stereo eye.
+    if (g_stereo.activeColor &&
+        SUCCEEDED(g_originalSetRenderTarget(device, 0, g_stereo.activeColor))) {
+        ImGui_ImplDX9_RenderDrawData(drawData);
+    }
+    g_renderingSettingsOverlay = false;
+
+    state->Apply();
+    state->Release();
+    g_originalSetDepthStencilSurface(device, nullptr);
+    g_originalSetRenderTarget(device, 0, g_stereo.activeColor);
+    g_originalSetDepthStencilSurface(device, g_stereo.activeDepth);
+    if (g_stereo.haveGameViewport) g_originalSetViewport(device, &g_stereo.gameViewport);
+    if (beginTemporaryScene) g_originalEndScene(device);
+}
+
 bool IsDesktopSpaceAdditiveSprite(IDirect3DDevice9* device) {
     if (g_stereo.vertexShader) return false;
     bool pretransformed = false;
@@ -2270,7 +2646,8 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
     D3DDEVICE_CREATION_PARAMETERS creation{};
     HWND cursorWindow = window;
     if (!cursorWindow && SUCCEEDED(device->GetCreationParameters(&creation))) cursorWindow = creation.hFocusWindow;
-    CaptureMouseCursor(device, cursorWindow);
+    RenderSettingsOverlay(device, cursorWindow);
+    if (!g_settingsOverlayOpen) CaptureMouseCursor(device, cursorWindow);
     tmoxr::VrBridge::Instance().SetLeftEyeSurface(g_stereo.trackedLeftColor, g_stereo.trackedLeftSharedHandle);
     tmoxr::VrBridge::Instance().SetRightEyeSurface(g_stereo.rightColor, g_stereo.rightSharedHandle);
     tmoxr::VrBridge::Instance().SetUiSurface(g_stereo.uiDrawsThisFrame ? g_stereo.uiSurface : nullptr,
@@ -2417,6 +2794,7 @@ HRESULT STDMETHODCALLTYPE ResetHook(IDirect3DDevice9* device, D3DPRESENT_PARAMET
             resetWindow, parameters->Windowed == FALSE,
             parameters->MultiSampleType, parameters->MultiSampleQuality, windowFit);
         tmoxr::VrBridge::Instance().OnBeforeReset();
+        ShutdownSettingsOverlay();
         ReleaseStereoResources();
         tmoxr::VrBridge::Instance().Shutdown();
         UnlockGameWindowSize();
@@ -2425,16 +2803,19 @@ HRESULT STDMETHODCALLTYPE ResetHook(IDirect3DDevice9* device, D3DPRESENT_PARAMET
     }
     tmoxr::log::Info("IDirect3DDevice9::Reset intercepted; releasing OpenXR swapchains before reset.");
     tmoxr::VrBridge::Instance().OnBeforeReset();
+    if (g_settingsOverlayInitialized) ImGui_ImplDX9_InvalidateDeviceObjects();
     ReleaseStereoResources();
     const HRESULT result = g_originalReset(device, parameters);
     if (SUCCEEDED(result)) {
         CreateStereoResources(device);
+        if (g_settingsOverlayInitialized) ImGui_ImplDX9_CreateDeviceObjects();
         tmoxr::VrBridge::Instance().OnDeviceCreated(device, *parameters);
     }
     return result;
 }
 
 HRESULT STDMETHODCALLTYPE SetTransformHook(IDirect3DDevice9* device, D3DTRANSFORMSTATETYPE state, const D3DMATRIX* matrix) {
+    if (g_renderingSettingsOverlay) return g_originalSetTransform(device, state, matrix);
     if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed) && matrix &&
         (state == D3DTS_VIEW || state == D3DTS_PROJECTION)) {
         tmoxr::VrBridge::Instance().OnTransform(state, *matrix);
@@ -2457,6 +2838,7 @@ HRESULT STDMETHODCALLTYPE SetTransformHook(IDirect3DDevice9* device, D3DTRANSFOR
 }
 
 HRESULT STDMETHODCALLTYPE SetViewportHook(IDirect3DDevice9* device, const D3DVIEWPORT9* viewport) {
+    if (g_renderingSettingsOverlay) return g_originalSetViewport(device, viewport);
     if (viewport) {
         g_stereo.gameViewport = *viewport;
         g_stereo.haveGameViewport = true;
@@ -2465,6 +2847,7 @@ HRESULT STDMETHODCALLTYPE SetViewportHook(IDirect3DDevice9* device, const D3DVIE
 }
 
 HRESULT STDMETHODCALLTYPE SetRenderTargetHook(IDirect3DDevice9* device, DWORD index, IDirect3DSurface9* surface) {
+    if (g_renderingSettingsOverlay) return g_originalSetRenderTarget(device, index, surface);
     if (index == 0 && surface != g_stereo.activeColor) FlushDesktopEyeMirror(device);
     if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed) && index == 0 && surface) {
         tmoxr::VrBridge::Instance().OnRenderTarget(surface);
@@ -2474,17 +2857,22 @@ HRESULT STDMETHODCALLTYPE SetRenderTargetHook(IDirect3DDevice9* device, DWORD in
 }
 
 HRESULT STDMETHODCALLTYPE SetDepthStencilSurfaceHook(IDirect3DDevice9* device, IDirect3DSurface9* surface) {
+    if (g_renderingSettingsOverlay) return g_originalSetDepthStencilSurface(device, surface);
     g_stereo.activeDepth = surface;
     return g_originalSetDepthStencilSurface(device, surface);
 }
 
 HRESULT STDMETHODCALLTYPE SetVertexShaderHook(IDirect3DDevice9* device, IDirect3DVertexShader9* shader) {
+    if (g_renderingSettingsOverlay) return g_originalSetVertexShader(device, shader);
     g_stereo.customVertexShaderBound = shader != nullptr;
     g_stereo.vertexShader = shader;
     return g_originalSetVertexShader(device, shader);
 }
 
 HRESULT STDMETHODCALLTYPE SetVertexShaderConstantFHook(IDirect3DDevice9* device, UINT startRegister, const float* data, UINT vectorCount) {
+    if (g_renderingSettingsOverlay) {
+        return g_originalSetVertexShaderConstantF(device, startRegister, data, vectorCount);
+    }
     if (data && startRegister < g_stereo.validVertexShaderConstants.size()) {
         const UINT cachedVectors = std::min<UINT>(vectorCount,
             static_cast<UINT>(g_stereo.validVertexShaderConstants.size()) - startRegister);
@@ -2521,6 +2909,9 @@ HRESULT STDMETHODCALLTYPE SetVertexShaderConstantFHook(IDirect3DDevice9* device,
 }
 
 HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITIVETYPE type, UINT startVertex, UINT primitiveCount) {
+    if (g_renderingSettingsOverlay) {
+        return g_originalDrawPrimitive(device, type, startVertex, primitiveCount);
+    }
     if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed)) {
         tmoxr::VrBridge::Instance().OnDraw(false);
     }
@@ -2582,6 +2973,10 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITI
 
 HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITIVETYPE type, INT baseVertex, UINT minVertex,
                                                      UINT vertexCount, UINT startIndex, UINT primitiveCount) {
+    if (g_renderingSettingsOverlay) {
+        return g_originalDrawIndexedPrimitive(device, type, baseVertex, minVertex,
+                                              vertexCount, startIndex, primitiveCount);
+    }
     if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed)) {
         tmoxr::VrBridge::Instance().OnDraw(true);
     }
@@ -2643,6 +3038,9 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3D
 
 HRESULT STDMETHODCALLTYPE DrawPrimitiveUPHook(IDirect3DDevice9* device, D3DPRIMITIVETYPE type, UINT primitiveCount,
                                                const void* vertexData, UINT stride) {
+    if (g_renderingSettingsOverlay) {
+        return g_originalDrawPrimitiveUP(device, type, primitiveCount, vertexData, stride);
+    }
     if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed)) {
         tmoxr::VrBridge::Instance().OnDraw(false);
     }
@@ -2657,6 +3055,11 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveUPHook(IDirect3DDevice9* device, D3DPRIMI
 HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveUPHook(IDirect3DDevice9* device, D3DPRIMITIVETYPE type,
     UINT minVertex, UINT vertexCount, UINT primitiveCount, const void* indexData, D3DFORMAT indexFormat,
     const void* vertexData, UINT stride) {
+    if (g_renderingSettingsOverlay) {
+        return g_originalDrawIndexedPrimitiveUP(device, type, minVertex, vertexCount,
+                                                primitiveCount, indexData, indexFormat,
+                                                vertexData, stride);
+    }
     if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed)) {
         tmoxr::VrBridge::Instance().OnDraw(true);
     }
@@ -2673,6 +3076,9 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveUPHook(IDirect3DDevice9* device, D
 }
 
 HRESULT STDMETHODCALLTYPE ClearHook(IDirect3DDevice9* device, DWORD count, const D3DRECT* rects, DWORD flags, D3DCOLOR color, float z, DWORD stencil) {
+    if (g_renderingSettingsOverlay) {
+        return g_originalClear(device, count, rects, flags, color, z, stencil);
+    }
     if ((flags & D3DCLEAR_TARGET) != 0) g_stereo.desktopMirrorDirty = false;
     const HRESULT left = g_originalClear(device, count, rects, flags, color, z, stencil);
     if (g_stereo.ready && EnsureStereoEyeColor(device) && EnsureStereoEyeDepth(device) &&
@@ -2740,6 +3146,7 @@ bool InstallDeviceHooks(IDirect3DDevice9* device) {
 
 void RemoveDeviceHooks(IDirect3DDevice9* device) {
     if (!device || !g_hooked.exchange(false)) return;
+    ShutdownSettingsOverlay();
     auto table = *reinterpret_cast<void***>(device);
     DWORD oldProtect = 0;
     if (!VirtualProtect(&table[16], sizeof(void*) * 79, PAGE_EXECUTE_READWRITE, &oldProtect)) {
@@ -2904,9 +3311,10 @@ public:
                 std::to_string(parameters->BackBufferHeight) + ", windowed=" + std::to_string(parameters->Windowed != FALSE) +
                 ", presentation interval=" + std::to_string(parameters->PresentationInterval) + ".");
             if (InstallDeviceHooks(*device)) {
-                LockGameWindowSize(parameters->hDeviceWindow ? parameters->hDeviceWindow : window);
+                const HWND gameWindow = parameters->hDeviceWindow ? parameters->hDeviceWindow : window;
+                LockGameWindowSize(gameWindow);
                 tmoxr::VrBridge::Instance().OnDeviceCreated(*device, *parameters);
-                CreateStereoResources(*device);
+                if (CreateStereoResources(*device)) InitializeSettingsOverlay(*device, gameWindow);
             }
         } else {
             tmoxr::log::Error("IDirect3D9::CreateDevice failed: HRESULT=" + std::to_string(static_cast<long>(result)));

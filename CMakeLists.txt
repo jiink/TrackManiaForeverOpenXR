@@ -14,12 +14,25 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(openxr_headers)
 
+FetchContent_Declare(
+  dear_imgui
+  URL https://github.com/ocornut/imgui/archive/refs/tags/v1.92.9b.zip
+  URL_HASH SHA256=E1C46D676C2BCB7CED847BA27F50553E33A19DB97B3CADAEC7F8BE64449139F8
+)
+FetchContent_MakeAvailable(dear_imgui)
+
 add_library(d3d9 SHARED
   src/d3d9_proxy.cpp
   src/log.cpp
   src/runtime_paths.cpp
   src/vr_bridge.cpp
   src/d3d9_proxy.def
+  ${dear_imgui_SOURCE_DIR}/imgui.cpp
+  ${dear_imgui_SOURCE_DIR}/imgui_draw.cpp
+  ${dear_imgui_SOURCE_DIR}/imgui_tables.cpp
+  ${dear_imgui_SOURCE_DIR}/imgui_widgets.cpp
+  ${dear_imgui_SOURCE_DIR}/backends/imgui_impl_dx9.cpp
+  ${dear_imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
 )
 
 target_compile_features(d3d9 PRIVATE cxx_std_20)
@@ -27,6 +40,8 @@ target_compile_definitions(d3d9 PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX XR_USE_GRAP
 target_include_directories(d3d9 PRIVATE
   "${openxr_headers_SOURCE_DIR}/src"
   "${openxr_headers_BINARY_DIR}/include"
+  "${dear_imgui_SOURCE_DIR}"
+  "${dear_imgui_SOURCE_DIR}/backends"
 )
 target_link_libraries(d3d9 PRIVATE dxguid d3d11 dxgi)
 
@@ -51,5 +66,8 @@ add_custom_command(TARGET d3d9 POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     $<TARGET_FILE:d3d9>
     $<TARGET_FILE_DIR:d3d9>/TMFOXR.dll
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${dear_imgui_SOURCE_DIR}/LICENSE.txt
+    $<TARGET_FILE_DIR:d3d9>/DearImGui-LICENSE.txt
   COMMENT "Creating the TrackMania ModLoader TMFOXR.dll"
 )

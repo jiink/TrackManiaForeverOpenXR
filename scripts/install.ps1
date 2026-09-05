@@ -67,6 +67,10 @@ if ((Test-Path -LiteralPath $destinationProxy -PathType Leaf) -and
 }
 Copy-Item -LiteralPath $resolvedModDll -Destination $destinationProxy -Force
 Write-Host "Installed TrackMania Forever OpenXR proxy: '$destinationProxy'."
+$sourceImGuiLicense = Join-Path (Split-Path -Parent $resolvedModDll) 'DearImGui-LICENSE.txt'
+if (Test-Path -LiteralPath $sourceImGuiLicense -PathType Leaf) {
+    Copy-Item -LiteralPath $sourceImGuiLicense -Destination (Join-Path $resolvedGamePath 'DearImGui-LICENSE.txt') -Force
+}
 
 if ((Test-Path -LiteralPath $sourceConfiguration -PathType Leaf) -and
     -not (Test-Path -LiteralPath $destinationConfiguration -PathType Leaf)) {

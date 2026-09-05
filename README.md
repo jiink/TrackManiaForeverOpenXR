@@ -27,6 +27,7 @@ TrackMania Forever OpenXR (TMFOXR) is a mod for the 32-bit Steam release of Trac
 - Correct OpenXR predicted-pose timing so runtime reprojection can stabilize lower-rate game frames.
 - The original desktop render remains untouched as a troubleshooting view.
 - Menus, HUD elements, and other desktop-space UI are captured onto a world-locked virtual screen two metres in front of the initial headset pose.
+- An in-headset settings panel, opened with **F10**, provides mouse controls for the camera, per-car cockpit positions, performance options, and diagnostics without leaving VR.
 - Detailed `TMFOXR.log` diagnostics for D3D9 hooks, shader coverage, tracking, frame timing, swapchains, uploads, and OpenXR errors.
 
 The bridge renders private D3D9 eye surfaces, reads them back through system memory, and uploads them to D3D11 OpenXR swapchains because OpenXR cannot consume Direct3D 9 surfaces directly.
@@ -56,7 +57,7 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target d3d9
 ```
 
-CMake downloads the official Khronos OpenXR 1.1.62 headers while configuring. The mod does not link an OpenXR import library; it loads `openxr_loader.dll` dynamically at runtime.
+CMake downloads the official Khronos OpenXR 1.1.62 headers and Dear ImGui 1.92.9b while configuring. The mod does not link an OpenXR import library; it loads `openxr_loader.dll` dynamically at runtime. The build directory includes `DearImGui-LICENSE.txt` for redistribution with the binaries.
 
 Normal builds include the optional headset-aligned frustum fix. It remains inactive unless `FrustumCullingFix=1` is set in `TMFOXR.ini`.
 
@@ -76,6 +77,7 @@ The installer:
 3. Copies `build\d3d9.dll` beside `TmForever.exe`.
 4. Installs the editable settings at `Documents\TrackMania\TMFOXR.ini`, preserving the file when it already exists.
 5. Checks whether the local OpenXR loader is Win32. If it is missing or has the wrong architecture, it downloads the pinned official Khronos 1.1.62 Windows loader archive, verifies its SHA-256 checksum, and installs `Win32\bin\openxr_loader.dll`.
+6. Installs the Dear ImGui license generated beside the built DLL.
 
 Use a different game path or deliberately refresh the pinned loader with:
 
@@ -117,6 +119,12 @@ and its 2.12.0-compat executable layouts are supported.
 7. Put on the headset and enter a race.
 
 The loader package being version 1.1.62 does not require the application or active runtime to use OpenXR API 1.1. The mod deliberately requests OpenXR 1.0 for compatibility with runtimes that expose 1.0; newer loaders can negotiate that version normally.
+
+## In-headset settings
+
+Press **F10** at any time while VR is active to open the TrackMania Forever OpenXR settings panel. The panel appears on the same virtual screen as TrackMania's menus and is also drawn over the desktop mirror. Use the mouse to change settings; the panel consumes normal mouse and keyboard window input while it is open so clicks do not reach the UI behind it. Press **F10** again, press **Escape**, or click the window's close button to return to the game.
+
+Camera, cockpit-position, frustum-culling, desktop-mirror, and diagnostic changes apply immediately. Changes are saved automatically to `Documents\TrackMania\TMFOXR.ini`, so the panel and text editor always use the same settings. `D3D9On12` is saved from the panel but requires a game restart because it controls how the Direct3D device is created.
 
 ## Cockpit camera
 

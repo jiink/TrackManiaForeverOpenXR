@@ -81,6 +81,10 @@ changelog: Local development build with TrackMania ModLoader support
 
 Copy-Item -LiteralPath $resolvedModDll -Destination (Join-Path $versionPath 'TMFOXR.dll') -Force
 Copy-Item -LiteralPath $resolvedOpenXrLoader -Destination (Join-Path $versionPath 'openxr_loader.dll') -Force
+$sourceImGuiLicense = Join-Path (Split-Path -Parent $resolvedModDll) 'DearImGui-LICENSE.txt'
+if (Test-Path -LiteralPath $sourceImGuiLicense -PathType Leaf) {
+    Copy-Item -LiteralPath $sourceImGuiLicense -Destination (Join-Path $versionPath 'DearImGui-LICENSE.txt') -Force
+}
 
 $documentsPath = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
 if ([string]::IsNullOrWhiteSpace($documentsPath)) {
