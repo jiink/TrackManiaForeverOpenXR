@@ -216,6 +216,10 @@ struct VrBridge::Impl {
     struct PendingD3D9On12Copy {
         IDirect3DResource9* resource9 = nullptr;
         ID3D12Resource* resource12 = nullptr;
+    };
+    struct CachedD3D9On12Wrapper {
+        IDirect3DResource9* resource9 = nullptr;
+        ID3D12Resource* resource12 = nullptr;
         ID3D11Texture2D* wrapped11 = nullptr;
     };
     HMODULE loader = nullptr;
@@ -264,6 +268,8 @@ struct VrBridge::Impl {
     IDirect3DSurface9* uiSource = nullptr;
     HANDLE leftEyeSharedHandle = nullptr;
     HANDLE rightEyeSharedHandle = nullptr;
+    uint32_t leftEyeSourceX = 0;
+    uint32_t rightEyeSourceX = 0;
     HANDLE uiSharedHandle = nullptr;
     HANDLE leftEyeOpenAttempted = nullptr;
     HANDLE rightEyeOpenAttempted = nullptr;
@@ -279,6 +285,9 @@ struct VrBridge::Impl {
     bool d3d9On12TransferDisabled = false;
     bool d3d9On12FailureLogged = false;
     std::vector<PendingD3D9On12Copy> pendingD3D9On12Copies;
+    std::vector<CachedD3D9On12Wrapper> cachedD3D9On12Wrappers;
+    uint64_t d3d9On12WrapperCacheHits = 0;
+    uint64_t d3d9On12WrapperCacheMisses = 0;
     ID3D11Texture2D* leftEyeSharedTexture = nullptr;
     ID3D11Texture2D* rightEyeSharedTexture = nullptr;
     ID3D11Texture2D* uiSharedTexture = nullptr;
@@ -305,11 +314,27 @@ struct VrBridge::Impl {
     double endFrameMilliseconds = 0.0;
     double runtimeWaitMilliseconds = 0.0;
     double sceneSubmissionMilliseconds = 0.0;
+    double transferMaxMilliseconds = 0.0;
+    double endFrameMaxMilliseconds = 0.0;
+    double runtimeWaitMaxMilliseconds = 0.0;
+    double sceneSubmissionMaxMilliseconds = 0.0;
+    double activeApplicationMilliseconds = 0.0;
+    double activeApplicationMaxMilliseconds = 0.0;
+    double betweenFrameMilliseconds = 0.0;
+    double frameSetupMilliseconds = 0.0;
     uint64_t transferSamples = 0;
     uint64_t endFrameSamples = 0;
     uint64_t runtimeWaitSamples = 0;
     uint64_t sceneSubmissionSamples = 0;
+    uint64_t activeApplicationSamples = 0;
     std::chrono::steady_clock::time_point sceneSubmissionStart{};
+    std::chrono::steady_clock::time_point lastPresentComplete{};
+    double currentRuntimeWaitMilliseconds = 0.0;
+    double currentSceneSubmissionMilliseconds = 0.0;
+    double currentBetweenFrameMilliseconds = 0.0;
+    double currentFrameSetupMilliseconds = 0.0;
+    bool haveLastPresentComplete = false;
+    bool currentBetweenFrameValid = false;
     bool sceneSubmissionActive = false;
     bool verboseDiagnostics = false;
     uint32_t viewTransformsThisFrame = 0;
@@ -403,7 +428,6 @@ struct VrBridge::Impl {
                 copy.resource9, 1, values, fences) :
                 d3d9On12Device->ReturnUnderlyingResource(copy.resource9, 0, nullptr, nullptr);
             if (SUCCEEDED(result) && FAILED(returned)) result = returned;
-            copy.wrapped11->Release();
             copy.resource12->Release();
             copy.resource9->Release();
         }
@@ -415,8 +439,25 @@ struct VrBridge::Impl {
         return true;
     }
 
+    void ReleaseCachedD3D9On12Wrappers() {
+        for (auto& cached : cachedD3D9On12Wrappers) {
+            if (cached.wrapped11) cached.wrapped11->Release();
+            cached.wrapped11 = nullptr;
+        }
+        // D3D11On12 defers destruction until its immediate context is flushed.
+        // Flush after releasing the wrappers, before dropping our underlying
+        // resource references, as required by D3D11On12's lifetime rules.
+        if (!cachedD3D9On12Wrappers.empty() && d3d11Context) d3d11Context->Flush();
+        for (auto& cached : cachedD3D9On12Wrappers) {
+            if (cached.resource12) cached.resource12->Release();
+            if (cached.resource9) cached.resource9->Release();
+        }
+        cachedD3D9On12Wrappers.clear();
+    }
+
     void ReleaseD3D9On12Bridge() {
         if (!pendingD3D9On12Copies.empty()) FinalizeD3D9On12Copies();
+        ReleaseCachedD3D9On12Wrappers();
         if (d3d11On12Device) d3d11On12Device->Release();
         d3d11On12Device = nullptr;
         if (d3d12TransferFence) d3d12TransferFence->Release();
@@ -430,6 +471,8 @@ struct VrBridge::Impl {
         d3d12TransferFenceValue = 0;
         d3d9On12TransferDisabled = false;
         d3d9On12FailureLogged = false;
+        d3d9On12WrapperCacheHits = 0;
+        d3d9On12WrapperCacheMisses = 0;
     }
 
     void DisableD3D9On12Transfer(const char* stage, HRESULT result) {
@@ -441,8 +484,12 @@ struct VrBridge::Impl {
             std::to_string(static_cast<long>(result)) + ".");
     }
 
-    bool QueueD3D9On12SurfaceCopy(IDirect3DSurface9* source, ID3D11Texture2D* destination) {
-        if (!source || !destination || !d3d9On12Device || !d3d11On12Device ||
+    bool QueueD3D9On12SurfaceCopies(IDirect3DSurface9* source,
+                                    ID3D11Texture2D* const* destinations,
+                                    const uint32_t* sourceXs, size_t copyCount,
+                                    uint32_t copyWidth, uint32_t copyHeight) {
+        if (!source || !destinations || !sourceXs || copyCount == 0 ||
+            !d3d9On12Device || !d3d11On12Device ||
             !d3d12TransferQueue || !d3d12TransferFence || d3d9On12TransferDisabled) return false;
 
         IDirect3DResource9* resource9 = source;
@@ -453,29 +500,80 @@ struct VrBridge::Impl {
         ID3D12Resource* resource12 = nullptr;
         HRESULT result = d3d9On12Device->UnwrapUnderlyingResource(
             resource9, d3d12TransferQueue, IID_PPV_ARGS(&resource12));
-        ID3D11Texture2D* wrapped11 = nullptr;
         bool unwrapped = SUCCEEDED(result);
+        ID3D11Texture2D* wrapped11 = nullptr;
         if (SUCCEEDED(result)) {
+            const auto cached = std::find_if(cachedD3D9On12Wrappers.begin(),
+                cachedD3D9On12Wrappers.end(),
+                [resource9](const CachedD3D9On12Wrapper& candidate) {
+                    return candidate.resource9 == resource9;
+                });
+            if (cached != cachedD3D9On12Wrappers.end()) {
+                wrapped11 = cached->wrapped11;
+                ID3D11Resource* resources[]{wrapped11};
+                d3d11On12Device->AcquireWrappedResources(resources, 1);
+                ++d3d9On12WrapperCacheHits;
+            }
+        }
+        if (SUCCEEDED(result) && !wrapped11) {
             D3D11_RESOURCE_FLAGS flags{};
             flags.BindFlags = D3D11_BIND_SHADER_RESOURCE;
             result = d3d11On12Device->CreateWrappedResource(resource12, &flags,
                 D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON,
                 IID_PPV_ARGS(&wrapped11));
+            if (SUCCEEDED(result)) {
+                // A newly created wrapper starts acquired. Hold persistent
+                // references and reuse it on later frames; recreating these
+                // objects for every eye copy was visible in CPU traces.
+                resource9->AddRef();
+                resource12->AddRef();
+                cachedD3D9On12Wrappers.push_back({resource9, resource12, wrapped11});
+                ++d3d9On12WrapperCacheMisses;
+            }
         }
         if (SUCCEEDED(result)) {
-            d3d11Context->CopyResource(destination, wrapped11);
+            for (size_t copy = 0; copy < copyCount; ++copy) {
+                if (!destinations[copy]) {
+                    result = E_POINTER;
+                    break;
+                }
+                if (sourceXs[copy] == 0) {
+                    D3D11_TEXTURE2D_DESC sourceDescription{};
+                    D3D11_TEXTURE2D_DESC destinationDescription{};
+                    wrapped11->GetDesc(&sourceDescription);
+                    destinations[copy]->GetDesc(&destinationDescription);
+                    if (sourceDescription.Width == destinationDescription.Width &&
+                        sourceDescription.Height == destinationDescription.Height) {
+                        d3d11Context->CopyResource(destinations[copy], wrapped11);
+                        continue;
+                    }
+                }
+                const D3D11_BOX sourceBox{
+                    sourceXs[copy], 0, 0,
+                    sourceXs[copy] + copyWidth, copyHeight, 1};
+                d3d11Context->CopySubresourceRegion(
+                    destinations[copy], 0, 0, 0, 0, wrapped11, 0, &sourceBox);
+            }
+        }
+        if (SUCCEEDED(result)) {
             ID3D11Resource* resources[]{wrapped11};
             d3d11On12Device->ReleaseWrappedResources(resources, 1);
-            pendingD3D9On12Copies.push_back({resource9, resource12, wrapped11});
+            pendingD3D9On12Copies.push_back({resource9, resource12});
             return true;
         }
         if (unwrapped) d3d9On12Device->ReturnUnderlyingResource(resource9, 0, nullptr, nullptr);
-        if (wrapped11) wrapped11->Release();
         if (resource12) resource12->Release();
         resource9->Release();
         if (!pendingD3D9On12Copies.empty()) FinalizeD3D9On12Copies();
         DisableD3D9On12Transfer("resource unwrap/copy", result);
         return false;
+    }
+
+    bool QueueD3D9On12SurfaceCopy(IDirect3DSurface9* source,
+                                  ID3D11Texture2D* destination) {
+        ID3D11Texture2D* destinations[]{destination};
+        const uint32_t sourceXs[]{0};
+        return QueueD3D9On12SurfaceCopies(source, destinations, sourceXs, 1, 0, 0);
     }
 
     void ShowStartupFailure(const std::string& stage, const std::string& error, const std::string& guidance) {
@@ -685,6 +783,8 @@ struct VrBridge::Impl {
         haveBaseHeadPose = false;
         haveHeadPose = false;
         haveRenderConfiguration = false;
+        haveLastPresentComplete = false;
+        currentBetweenFrameValid = false;
         activeFrameState = XrFrameState{XR_TYPE_FRAME_STATE};
     }
 
@@ -751,6 +851,7 @@ struct VrBridge::Impl {
             }
             if (SUCCEEDED(on12Result)) {
                 pendingD3D9On12Copies.reserve(3);
+                cachedD3D9On12Wrappers.reserve(3);
                 log::Info("Created the OpenXR D3D11 bridge on TrackMania's D3D9On12 device; direct GPU eye transfer is active (feature level " +
                     std::to_string(acquired) + ").");
                 return true;
@@ -1048,6 +1149,7 @@ struct VrBridge::Impl {
 
     void BeginRenderFrame() {
         if (frameBegun) return;
+        currentRuntimeWaitMilliseconds = 0.0;
         if (!Initialize()) return;
         PollEvents();
         if (!sessionRunning) return;
@@ -1055,8 +1157,11 @@ struct VrBridge::Impl {
         activeFrameState = XrFrameState{XR_TYPE_FRAME_STATE};
         const auto waitStart = std::chrono::steady_clock::now();
         if (!Check(waitFrame(session, &waitInfo, &activeFrameState), "xrWaitFrame")) return;
-        runtimeWaitMilliseconds += std::chrono::duration<double, std::milli>(
+        const double runtimeWait = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - waitStart).count();
+        currentRuntimeWaitMilliseconds = runtimeWait;
+        runtimeWaitMilliseconds += runtimeWait;
+        runtimeWaitMaxMilliseconds = std::max(runtimeWaitMaxMilliseconds, runtimeWait);
         ++runtimeWaitSamples;
         XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};
         if (!Check(beginFrame(session, &begin), "xrBeginFrame")) return;
@@ -1082,8 +1187,11 @@ struct VrBridge::Impl {
     void Present() {
         ++frames;
         if (sceneSubmissionActive) {
-            sceneSubmissionMilliseconds += std::chrono::duration<double, std::milli>(
+            const double sceneSubmission = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - sceneSubmissionStart).count();
+            currentSceneSubmissionMilliseconds = sceneSubmission;
+            sceneSubmissionMilliseconds += sceneSubmission;
+            sceneSubmissionMaxMilliseconds = std::max(sceneSubmissionMaxMilliseconds, sceneSubmission);
             ++sceneSubmissionSamples;
             sceneSubmissionActive = false;
         }
@@ -1117,11 +1225,25 @@ struct VrBridge::Impl {
                     ", sync/release=" + std::to_string(syncReleaseMilliseconds / divisor) +
                     "), xrEndFrame=" + std::to_string(endFrameSamples ?
                         endFrameMilliseconds / static_cast<double>(endFrameSamples) : 0.0) +
-                    " ms, runtime wait=" + std::to_string(runtimeWaitSamples ?
+                    "/" + std::to_string(endFrameMaxMilliseconds) + " ms avg/max, runtime wait=" +
+                    std::to_string(runtimeWaitSamples ?
                         runtimeWaitMilliseconds / static_cast<double>(runtimeWaitSamples) : 0.0) +
-                    " ms, scene submit=" + std::to_string(sceneSubmissionSamples ?
+                    "/" + std::to_string(runtimeWaitMaxMilliseconds) + " ms avg/max, scene submit=" +
+                    std::to_string(sceneSubmissionSamples ?
                         sceneSubmissionMilliseconds / static_cast<double>(sceneSubmissionSamples) : 0.0) +
-                    " ms across " + std::to_string(transferSamples) + " frames.");
+                    "/" + std::to_string(sceneSubmissionMaxMilliseconds) +
+                    " ms avg/max, transfer max=" + std::to_string(transferMaxMilliseconds) +
+                    " ms, active app work=" + std::to_string(activeApplicationSamples ?
+                        activeApplicationMilliseconds / static_cast<double>(activeApplicationSamples) : 0.0) +
+                    "/" + std::to_string(activeApplicationMaxMilliseconds) +
+                    " ms avg/max (between frames=" + std::to_string(activeApplicationSamples ?
+                        betweenFrameMilliseconds / static_cast<double>(activeApplicationSamples) : 0.0) +
+                    " ms, XR setup excluding wait=" + std::to_string(activeApplicationSamples ?
+                        frameSetupMilliseconds / static_cast<double>(activeApplicationSamples) : 0.0) +
+                    " ms), D3D9On12 wrappers reused/created=" +
+                    std::to_string(d3d9On12WrapperCacheHits) + "/" +
+                    std::to_string(d3d9On12WrapperCacheMisses) + " across " +
+                    std::to_string(transferSamples) + " frames.");
                 transferMilliseconds = 0.0;
                 eyeReadbackMilliseconds = {};
                 eyeAcquireWaitMilliseconds = 0.0;
@@ -1131,10 +1253,21 @@ struct VrBridge::Impl {
                 endFrameMilliseconds = 0.0;
                 runtimeWaitMilliseconds = 0.0;
                 sceneSubmissionMilliseconds = 0.0;
+                transferMaxMilliseconds = 0.0;
+                endFrameMaxMilliseconds = 0.0;
+                runtimeWaitMaxMilliseconds = 0.0;
+                sceneSubmissionMaxMilliseconds = 0.0;
+                activeApplicationMilliseconds = 0.0;
+                activeApplicationMaxMilliseconds = 0.0;
+                betweenFrameMilliseconds = 0.0;
+                frameSetupMilliseconds = 0.0;
                 transferSamples = 0;
                 endFrameSamples = 0;
                 runtimeWaitSamples = 0;
                 sceneSubmissionSamples = 0;
+                activeApplicationSamples = 0;
+                d3d9On12WrapperCacheHits = 0;
+                d3d9On12WrapperCacheMisses = 0;
             }
             diagnosticStartTime = diagnosticNow;
             diagnosticStartFrame = frames;
@@ -1177,12 +1310,20 @@ struct VrBridge::Impl {
                 const HRESULT backBufferResult = device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &gameBackbuffer);
                 if (SUCCEEDED(backBufferResult)) {
                     projectionViews.resize(viewCount);
+                    const bool packedStereoSource = leftEyeSource &&
+                        leftEyeSource == rightEyeSource &&
+                        leftEyeSourceX != rightEyeSourceX;
+                    std::array<ID3D11Texture2D*, 2> packedDestinations{};
+                    std::array<uint32_t, 2> packedSourceXs{};
+                    size_t packedCopyCount = 0;
                     auto uploadEye = [&](uint32_t eye, IDirect3DSurface9* source, IDirect3DSurface9*& eyeReadback,
-                                         ID3D11Texture2D* sharedTexture) {
+                                         ID3D11Texture2D* sharedTexture, uint32_t sourceX) {
                         if (!source) return false;
                         D3DSURFACE_DESC sourceDescription{};
                         if (FAILED(source->GetDesc(&sourceDescription))) return false;
-                        if (sourceDescription.Width != viewConfigs[eye].recommendedImageRectWidth ||
+                        const uint32_t eyeWidth = viewConfigs[eye].recommendedImageRectWidth;
+                        const uint32_t eyeHeight = viewConfigs[eye].recommendedImageRectHeight;
+                        if (sourceDescription.Width < sourceX + eyeWidth ||
                             sourceDescription.Height != viewConfigs[eye].recommendedImageRectHeight) {
                             return false;
                         }
@@ -1234,12 +1375,32 @@ struct VrBridge::Impl {
                             acquiredSwapchains.push_back(swapchains[eye]);
                             const auto uploadStart = std::chrono::steady_clock::now();
                             if (useSharedTexture) {
-                                d3d11Context->CopyResource(images[eye][imageIndex].texture, sharedTexture);
+                                if (sourceX == 0 && sourceDescription.Width == eyeWidth) {
+                                    d3d11Context->CopyResource(images[eye][imageIndex].texture, sharedTexture);
+                                } else {
+                                    const D3D11_BOX sourceBox{
+                                        sourceX, 0, 0, sourceX + eyeWidth, eyeHeight, 1};
+                                    d3d11Context->CopySubresourceRegion(
+                                        images[eye][imageIndex].texture, 0, 0, 0, 0,
+                                        sharedTexture, 0, &sourceBox);
+                                }
                                 sharedCopyIssued = true;
                             } else if (useD3D9On12) {
-                                if (!QueueD3D9On12SurfaceCopy(source, images[eye][imageIndex].texture)) return false;
+                                if (packedStereoSource) {
+                                    packedDestinations[packedCopyCount] = images[eye][imageIndex].texture;
+                                    packedSourceXs[packedCopyCount] = sourceX;
+                                    ++packedCopyCount;
+                                } else if (!QueueD3D9On12SurfaceCopy(
+                                               source, images[eye][imageIndex].texture)) {
+                                    return false;
+                                }
                             } else {
-                                d3d11Context->UpdateSubresource(images[eye][imageIndex].texture, 0, nullptr, locked.pBits, locked.Pitch, 0);
+                                constexpr uint32_t bytesPerPixel = 4;
+                                const auto* pixels = static_cast<const uint8_t*>(locked.pBits) +
+                                    static_cast<size_t>(sourceX) * bytesPerPixel;
+                                d3d11Context->UpdateSubresource(
+                                    images[eye][imageIndex].texture, 0, nullptr,
+                                    pixels, locked.Pitch, 0);
                             }
                             eyeUploadMilliseconds += std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - uploadStart).count();
@@ -1248,8 +1409,8 @@ struct VrBridge::Impl {
                             projectionViews[eye].pose = activeViews[eye].pose;
                             projectionViews[eye].fov = activeViews[eye].fov;
                             projectionViews[eye].subImage.swapchain = swapchains[eye];
-                            projectionViews[eye].subImage.imageRect.extent.width = static_cast<int32_t>(sourceDescription.Width);
-                            projectionViews[eye].subImage.imageRect.extent.height = static_cast<int32_t>(sourceDescription.Height);
+                            projectionViews[eye].subImage.imageRect.extent.width = static_cast<int32_t>(eyeWidth);
+                            projectionViews[eye].subImage.imageRect.extent.height = static_cast<int32_t>(eyeHeight);
                         }
                         if (!useSharedTexture && !useD3D9On12) eyeReadback->UnlockRect();
                         if (verboseDiagnostics && eye == 1 && frames % 180 == 0) {
@@ -1264,8 +1425,16 @@ struct VrBridge::Impl {
                         return acquired;
                     };
                     IDirect3DSurface9* leftSource = leftEyeSource ? leftEyeSource : gameBackbuffer;
-                    const bool allEyesUploaded = uploadEye(0, leftSource, readback, leftEyeSharedTexture) &&
-                        uploadEye(1, rightEyeSource, rightReadback, rightEyeSharedTexture);
+                    bool allEyesUploaded = uploadEye(
+                        0, leftSource, readback, leftEyeSharedTexture, leftEyeSourceX) &&
+                        uploadEye(1, rightEyeSource, rightReadback,
+                                  rightEyeSharedTexture, rightEyeSourceX);
+                    if (allEyesUploaded && packedCopyCount != 0) {
+                        allEyesUploaded = QueueD3D9On12SurfaceCopies(
+                            leftSource, packedDestinations.data(), packedSourceXs.data(),
+                            packedCopyCount, viewConfigs[0].recommendedImageRectWidth,
+                            viewConfigs[0].recommendedImageRectHeight);
+                    }
                     if (!allEyesUploaded) projectionViews.clear();
                     gameBackbuffer->Release();
                     layer.space = space;
@@ -1366,8 +1535,10 @@ struct VrBridge::Impl {
             syncReleaseMilliseconds += std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - syncReleaseStart).count();
         }
-        transferMilliseconds += std::chrono::duration<double, std::milli>(
+        const double transfer = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - transferStart).count();
+        transferMilliseconds += transfer;
+        transferMaxMilliseconds = std::max(transferMaxMilliseconds, transfer);
         ++transferSamples;
         XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
         end.displayTime = activeFrameState.predictedDisplayTime;
@@ -1376,9 +1547,24 @@ struct VrBridge::Impl {
         end.layers = layerCount ? layers.data() : nullptr;
         const auto endFrameStart = std::chrono::steady_clock::now();
         Check(endFrame(session, &end), "xrEndFrame");
-        endFrameMilliseconds += std::chrono::duration<double, std::milli>(
+        const double endFrameDuration = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - endFrameStart).count();
+        endFrameMilliseconds += endFrameDuration;
+        endFrameMaxMilliseconds = std::max(endFrameMaxMilliseconds, endFrameDuration);
         ++endFrameSamples;
+        if (currentBetweenFrameValid) {
+            const double activeApplication = currentBetweenFrameMilliseconds +
+                currentFrameSetupMilliseconds + currentSceneSubmissionMilliseconds +
+                transfer + endFrameDuration;
+            activeApplicationMilliseconds += activeApplication;
+            activeApplicationMaxMilliseconds = std::max(
+                activeApplicationMaxMilliseconds, activeApplication);
+            betweenFrameMilliseconds += currentBetweenFrameMilliseconds;
+            frameSetupMilliseconds += currentFrameSetupMilliseconds;
+            ++activeApplicationSamples;
+        }
+        lastPresentComplete = std::chrono::steady_clock::now();
+        haveLastPresentComplete = true;
         frameBegun = false;
         activeViewsLocated = false;
         activeViews.clear();
@@ -1406,8 +1592,18 @@ bool VrBridge::TryInitialize() {
 void VrBridge::OnBeginScene() {
     if (!impl_) return;
     std::scoped_lock lock(impl_->mutex);
+    const auto beginSceneStart = std::chrono::steady_clock::now();
+    impl_->currentBetweenFrameValid = impl_->haveLastPresentComplete;
+    impl_->currentBetweenFrameMilliseconds = impl_->haveLastPresentComplete ?
+        std::chrono::duration<double, std::milli>(
+            beginSceneStart - impl_->lastPresentComplete).count() : 0.0;
     impl_->BeginRenderFrame();
+    impl_->currentFrameSetupMilliseconds = std::max(0.0,
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - beginSceneStart).count() -
+        impl_->currentRuntimeWaitMilliseconds);
     impl_->sceneSubmissionStart = std::chrono::steady_clock::now();
+    impl_->currentSceneSubmissionMilliseconds = 0.0;
     impl_->sceneSubmissionActive = true;
 }
 
@@ -1461,14 +1657,17 @@ void VrBridge::OnGameProjection(const D3DMATRIX& matrix) {
     impl_->haveGameFov = true;
 }
 
-void VrBridge::SetRightEyeSurface(IDirect3DSurface9* surface, HANDLE sharedHandle) {
+void VrBridge::SetRightEyeSurface(IDirect3DSurface9* surface, HANDLE sharedHandle,
+                                  uint32_t sourceX) {
     if (!impl_) impl_ = new Impl;
     std::scoped_lock lock(impl_->mutex);
-    if (impl_->rightEyeSource != surface || impl_->rightEyeSharedHandle != sharedHandle) {
+    if (impl_->rightEyeSource != surface || impl_->rightEyeSharedHandle != sharedHandle ||
+        impl_->rightEyeSourceX != sourceX) {
         if (surface) surface->AddRef();
         if (impl_->rightEyeSource) impl_->rightEyeSource->Release();
         impl_->rightEyeSource = surface;
         impl_->rightEyeSharedHandle = sharedHandle;
+        impl_->rightEyeSourceX = sourceX;
         impl_->rightEyeOpenAttempted = nullptr;
         if (impl_->rightEyeSharedTexture) impl_->rightEyeSharedTexture->Release();
         impl_->rightEyeSharedTexture = nullptr;
@@ -1477,14 +1676,17 @@ void VrBridge::SetRightEyeSurface(IDirect3DSurface9* surface, HANDLE sharedHandl
     impl_->OpenSharedTexture(sharedHandle, impl_->rightEyeOpenAttempted, impl_->rightEyeSharedTexture, "right-eye");
 }
 
-void VrBridge::SetLeftEyeSurface(IDirect3DSurface9* surface, HANDLE sharedHandle) {
+void VrBridge::SetLeftEyeSurface(IDirect3DSurface9* surface, HANDLE sharedHandle,
+                                 uint32_t sourceX) {
     if (!impl_) impl_ = new Impl;
     std::scoped_lock lock(impl_->mutex);
-    if (impl_->leftEyeSource != surface || impl_->leftEyeSharedHandle != sharedHandle) {
+    if (impl_->leftEyeSource != surface || impl_->leftEyeSharedHandle != sharedHandle ||
+        impl_->leftEyeSourceX != sourceX) {
         if (surface) surface->AddRef();
         if (impl_->leftEyeSource) impl_->leftEyeSource->Release();
         impl_->leftEyeSource = surface;
         impl_->leftEyeSharedHandle = sharedHandle;
+        impl_->leftEyeSourceX = sourceX;
         impl_->leftEyeOpenAttempted = nullptr;
         if (impl_->leftEyeSharedTexture) impl_->leftEyeSharedTexture->Release();
         impl_->leftEyeSharedTexture = nullptr;
@@ -1541,7 +1743,9 @@ void VrBridge::OnRenderTarget(IDirect3DSurface9* surface) {
 
 void VrBridge::OnDraw(bool indexed) {
     if (!impl_) return;
-    std::scoped_lock lock(impl_->mutex);
+    // D3D9 draw hooks and the transform/render-target hooks all run on the
+    // game's render thread. Locking this diagnostic-only counter once for every
+    // draw caused hundreds of needless mutex operations per frame.
     if (!impl_->perspectiveProjectionActive) return;
     ++impl_->perspectiveDrawsThisFrame;
     if (indexed) ++impl_->perspectiveIndexedDrawsThisFrame;
