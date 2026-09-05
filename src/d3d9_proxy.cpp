@@ -440,6 +440,8 @@ bool g_renderingSettingsOverlay = false;
 std::atomic<UINT> g_settingsOverlayToggleKey{VK_F10};
 bool g_settingsOverlayCapturingKey = false;
 ULONGLONG g_settingsOverlayHintUntil = 0;
+std::string g_settingsOverlayStatus;
+ULONGLONG g_settingsOverlayStatusUntil = 0;
 
 struct WindowFitResult {
     bool tooLarge = false;
@@ -1320,6 +1322,28 @@ void QueueSettingsOverlaySave() {
     g_settingsOverlaySaveAt = GetTickCount64() + 350;
 }
 
+bool ResetSettingsOverlayConfiguration() {
+    if (g_cameraSettings.configurationPath.empty()) return false;
+    const auto packagedConfiguration =
+        tmoxr::ModuleFilePath(L"TMFOXR.defaults.ini");
+    if (!CopyFileW(packagedConfiguration.c_str(),
+                   g_cameraSettings.configurationPath.c_str(), FALSE)) {
+        tmoxr::log::Warn(
+            "Could not reset TMFOXR.ini from the packaged defaults. Windows error=" +
+            std::to_string(GetLastError()) + ".");
+        return false;
+    }
+
+    g_settingsOverlayDirty = false;
+    g_settingsOverlayCapturingKey = false;
+    ReadCameraSettings(true);
+    RefreshConfigurationWriteTime();
+    g_settingsOverlayVehicleProfile = static_cast<int>(
+        g_cameraSettings.activeVehicleProfile.load(std::memory_order_relaxed));
+    tmoxr::log::Info("Reset all settings to the packaged defaults.");
+    return true;
+}
+
 void AssignSettingsOverlayToggleKey(UINT virtualKey) {
     if (!IsSupportedSettingsOverlayKey(virtualKey)) return;
     g_settingsOverlayToggleKey.store(virtualKey, std::memory_order_relaxed);
@@ -1519,6 +1543,35 @@ void BuildSettingsOverlay() {
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
+        }
+        ImGui::Separator();
+        if (ImGui::Button("Reset all settings to defaults...")) {
+            ImGui::OpenPopup("Reset all settings?");
+        }
+        if (ImGui::BeginPopupModal("Reset all settings?", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextWrapped(
+                "This replaces Documents\\TrackMania\\TMFOXR.ini with the "
+                "defaults included with this version of TMFOXR.");
+            ImGui::Spacing();
+            if (ImGui::Button("Reset", ImVec2(120.0f, 0.0f))) {
+                const bool reset = ResetSettingsOverlayConfiguration();
+                g_settingsOverlayStatus = reset
+                    ? "All settings were reset to defaults."
+                    : "Reset failed: TMFOXR.defaults.ini could not be copied.";
+                g_settingsOverlayStatusUntil = GetTickCount64() + 5000;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f))) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+        if (!g_settingsOverlayStatus.empty() &&
+            GetTickCount64() < g_settingsOverlayStatusUntil) {
+            ImGui::SameLine();
+            ImGui::TextUnformatted(g_settingsOverlayStatus.c_str());
         }
         if (g_settingsOverlayDirty) {
             ImGui::Separator();

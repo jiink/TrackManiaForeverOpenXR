@@ -87,5 +87,8 @@ add_custom_command(TARGET d3d9 POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     ${dear_imgui_SOURCE_DIR}/LICENSE.txt
     $<TARGET_FILE_DIR:d3d9>/DearImGui-LICENSE.txt
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${CMAKE_CURRENT_SOURCE_DIR}/TMFOXR.defaults.ini
+    $<TARGET_FILE_DIR:d3d9>/TMFOXR.defaults.ini
   COMMENT "Creating the TrackMania ModLoader TMFOXR.dll"
 )
