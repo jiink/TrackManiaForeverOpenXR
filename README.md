@@ -134,7 +134,9 @@ The loader package being version 1.1.62 does not require the application or acti
 
 When VR starts, a brief message shows the key that opens the TrackMania Forever OpenXR settings panel. The default is **F10**. The panel appears on the same virtual screen as TrackMania's menus and is also drawn over the desktop mirror. Use the mouse to change settings; the panel consumes normal mouse and keyboard window input while it is open so clicks do not reach the UI behind it. Press the configured toggle key again, press **Escape**, or click the window's close button to return to the game.
 
-Camera, cockpit-position, frustum-culling, desktop-mirror, diagnostic, and interface changes apply immediately. Select **Interface → Change toggle key** to rebind the panel; Escape cancels key capture. Changes are saved automatically to `Documents\TrackMania\TMFOXR.ini`, so the panel and text editor always use the same settings. The key can also be edited as `SettingsToggleKey` under `[Interface]`. `D3D9On12` is saved from the panel but requires a game restart because it controls how the Direct3D device is created.
+World-scale, camera, cockpit-position, frustum-culling, desktop-mirror, diagnostic, and interface changes apply immediately. Select **Interface → Change toggle key** to rebind the panel; Escape cancels key capture. Changes are saved automatically to `Documents\TrackMania\TMFOXR.ini`, so the panel and text editor always use the same settings. The key can also be edited as `SettingsToggleKey` under `[Interface]`. `D3D9On12` is saved from the panel but requires a game restart because it controls how the Direct3D device is created.
+
+The **VR → World scale** slider ranges from 100% down to 0.5% and defaults to 100%. Lower values increase stereo depth and positional head movement relative to the game, making the car and surrounding world feel miniature while keeping the neutral camera position anchored in the configured seat. The same value can be edited as `WorldScalePercent` under `[VR]`.
 
 ## Cockpit camera
 
