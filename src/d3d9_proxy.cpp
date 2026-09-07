@@ -689,6 +689,8 @@ struct CameraOffsetProfile {
 };
 
 struct CameraSettings {
+    std::atomic<float> worldScalePercent{100.0f};
+    std::atomic<bool> recenterOnTrackingJump{true};
     std::atomic<bool> cockpitEnabled{true};
     // User-facing axes: positive X is right, positive Y is up, and positive Z
     // is forward. TrackMania's reflected projection requires X to be negated
@@ -1126,6 +1128,10 @@ std::string SettingsOverlayKeyDisplayName(UINT virtualKey) {
 
 void ReadCameraSettings(bool reloaded) {
     const auto& path = g_cameraSettings.configurationPath;
+    const float worldScalePercent = std::clamp(
+        ReadIniFloat(path, L"WorldScalePercent", 100.0f, L"VR"), 0.5f, 100.0f);
+    const bool recenterOnTrackingJump =
+        GetPrivateProfileIntW(L"VR", L"RecenterOnTrackingJump", 1, path.c_str()) != 0;
     const bool enabled = GetPrivateProfileIntW(L"Camera", L"CockpitEnabled", 1, path.c_str()) != 0;
     // Keep the original Camera keys as the fallback so an existing installation
     // retains its Stadium calibration until the new named sections are added.
@@ -1168,6 +1174,8 @@ void ReadCameraSettings(bool reloaded) {
         tmoxr::log::Warn("Unsupported Interface.SettingsToggleKey; using F10.");
         settingsToggleKey = VK_F10;
     }
+    g_cameraSettings.worldScalePercent.store(worldScalePercent, std::memory_order_relaxed);
+    g_cameraSettings.recenterOnTrackingJump.store(recenterOnTrackingJump, std::memory_order_relaxed);
     g_cameraSettings.cockpitEnabled.store(enabled, std::memory_order_relaxed);
     g_cameraSettings.cockpitNearClip.store(nearClip, std::memory_order_relaxed);
     g_cameraSettings.horizonLock.store(horizonLock, std::memory_order_relaxed);
@@ -1179,11 +1187,14 @@ void ReadCameraSettings(bool reloaded) {
     g_cameraSettings.videoMemoryMB.store(videoMemoryMB, std::memory_order_relaxed);
     g_cameraSettings.verboseDiagnostics.store(verboseDiagnostics, std::memory_order_relaxed);
     g_settingsOverlayToggleKey.store(settingsToggleKey, std::memory_order_relaxed);
+    tmoxr::VrBridge::Instance().SetRecenterOnTrackingJump(recenterOnTrackingJump);
     tmoxr::VrBridge::Instance().SetVerboseDiagnostics(verboseDiagnostics);
     const auto activeProfile = g_cameraSettings.activeVehicleProfile.load(std::memory_order_relaxed);
     const auto& activeOffset = g_cameraSettings.vehicleProfiles[static_cast<size_t>(activeProfile)];
     tmoxr::log::Info(std::string(reloaded ? "Reloaded" : "Loaded") +
-        " cockpit camera configuration: enabled=" + std::to_string(enabled) +
+        " VR configuration: world scale=" + std::to_string(worldScalePercent) +
+        "%, recenter on tracking jump=" + std::to_string(recenterOnTrackingJump) +
+        ", cockpit camera enabled=" + std::to_string(enabled) +
         ", active vehicle=" + kVehicleProfileNames[static_cast<size_t>(activeProfile)] +
         ", right/up/forward=(" + std::to_string(activeOffset.right.load(std::memory_order_relaxed)) + "," +
         std::to_string(activeOffset.up.load(std::memory_order_relaxed)) + "," +
@@ -1271,6 +1282,10 @@ bool SaveSettingsOverlayConfiguration() {
         succeeded = WriteOverlayIniValue(section, key, OverlayFloatText(value)) && succeeded;
     };
 
+    writeFloat(L"VR", L"WorldScalePercent",
+               g_cameraSettings.worldScalePercent.load(std::memory_order_relaxed));
+    writeBool(L"VR", L"RecenterOnTrackingJump",
+              g_cameraSettings.recenterOnTrackingJump.load(std::memory_order_relaxed));
     writeBool(L"Camera", L"CockpitEnabled",
               g_cameraSettings.cockpitEnabled.load(std::memory_order_relaxed));
     writeFloat(L"Camera", L"CockpitNearClip",
@@ -1444,10 +1459,10 @@ bool OverlayCheckbox(const char* label, std::atomic<bool>& setting) {
 }
 
 bool OverlaySlider(const char* label, std::atomic<float>& setting,
-                   float minimum, float maximum, const char* format) {
+                   float minimum, float maximum, const char* format,
+                   ImGuiSliderFlags flags = ImGuiSliderFlags_AlwaysClamp) {
     float value = setting.load(std::memory_order_relaxed);
-    if (!ImGui::SliderFloat(label, &value, minimum, maximum, format,
-                            ImGuiSliderFlags_AlwaysClamp)) return false;
+    if (!ImGui::SliderFloat(label, &value, minimum, maximum, format, flags)) return false;
     setting.store(value, std::memory_order_relaxed);
     QueueSettingsOverlaySave();
     return true;
@@ -1471,6 +1486,25 @@ void BuildSettingsOverlay() {
         ImGui::Separator();
 
         if (ImGui::BeginTabBar("TMFOXR settings")) {
+            if (ImGui::BeginTabItem("VR")) {
+                OverlaySlider(
+                    "World scale", g_cameraSettings.worldScalePercent,
+                    0.5f, 100.0f, "%.1f%%",
+                    ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
+                ImGui::TextWrapped(
+                    "Lower values make the world and car feel smaller, as if you are larger. "
+                    "This scales stereo depth and positional head movement around your neutral camera position.");
+                ImGui::SeparatorText("Positional tracking");
+                if (OverlayCheckbox("Recenter after a large tracking jump",
+                                    g_cameraSettings.recenterOnTrackingJump)) {
+                    tmoxr::VrBridge::Instance().SetRecenterOnTrackingJump(
+                        g_cameraSettings.recenterOnTrackingJump.load(std::memory_order_relaxed));
+                }
+                ImGui::TextWrapped(
+                    "When enabled, moving more than 0.5 m from the tracking origin is treated as "
+                    "an OpenXR origin jump and snapped back. Disable this to move farther physically.");
+                ImGui::EndTabItem();
+            }
             if (ImGui::BeginTabItem("Camera")) {
                 OverlayCheckbox("Enable cockpit camera offset", g_cameraSettings.cockpitEnabled);
                 OverlaySlider("Near clip", g_cameraSettings.cockpitNearClip,
@@ -2801,10 +2835,16 @@ Matrix4 HeadViewMatrix(float eyeOffsetMeters) {
             rotation[row][column] = reflection[row] * rightHanded[row][column] * reflection[column];
         }
     }
+    const float worldScalePercent = std::clamp(
+        g_cameraSettings.worldScalePercent.load(std::memory_order_relaxed), 0.5f, 100.0f);
+    const float inverseWorldScale = 100.0f / worldScalePercent;
+    // Leave the configured camera/seat anchor unchanged, but enlarge physical
+    // head travel and IPD relative to the game world. This is equivalent to
+    // shrinking the world around the neutral tracked-head position.
     float cameraPosition[3] = {
-        g_stereo.haveHeadPose ? -g_stereo.headPose.position[0] : 0.0f,
-        g_stereo.haveHeadPose ? g_stereo.headPose.position[1] : 0.0f,
-        g_stereo.haveHeadPose ? -g_stereo.headPose.position[2] : 0.0f};
+        g_stereo.haveHeadPose ? -g_stereo.headPose.position[0] * inverseWorldScale : 0.0f,
+        g_stereo.haveHeadPose ? g_stereo.headPose.position[1] * inverseWorldScale : 0.0f,
+        g_stereo.haveHeadPose ? -g_stereo.headPose.position[2] * inverseWorldScale : 0.0f};
     if (CockpitCameraActive()) {
         const VehicleProfile activeProfile =
             g_cameraSettings.activeVehicleProfile.load(std::memory_order_relaxed);
@@ -2836,7 +2876,7 @@ Matrix4 HeadViewMatrix(float eyeOffsetMeters) {
     // Apply IPD only after horizon correction. Including it in the correction
     // pivot holds each eye at a different world-space point and distorts the
     // stereo baseline as the car pitches or rolls.
-    correctedView[3] -= eyeOffsetMeters;
+    correctedView[3] -= eyeOffsetMeters * inverseWorldScale;
     return correctedView;
 }
 
@@ -2848,7 +2888,11 @@ Matrix4 ApplyHeadPoseToCombinedMatrix(const Matrix4& original, float eyeOffsetMe
         Matrix4 inverseProjection{};
         if (!InvertMatrix(projection, inverseProjection)) {
             Matrix4 fallback = original;
-            fallback[3] += -eyeOffsetMeters * g_stereo.projection._11;
+            const float worldScalePercent = std::clamp(
+                g_cameraSettings.worldScalePercent.load(std::memory_order_relaxed),
+                0.5f, 100.0f);
+            fallback[3] += -eyeOffsetMeters * (100.0f / worldScalePercent) *
+                           g_stereo.projection._11;
             return fallback;
         }
         g_stereo.eyeClipAdjustments[eye] = MultiplyMatrix(
@@ -3414,7 +3458,10 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
         g_stereo.stereoReplayCpuMaxMilliseconds,
         g_stereo.stereoReplayCpuThisFrame);
     if (g_stereo.presentedFrames % 180 == 0) {
-        if (g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed) &&
+        const bool verboseDiagnostics =
+            g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed);
+        if (verboseDiagnostics &&
+            g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed) &&
             g_executableLayout) {
         std::ostringstream clippingCallSites;
         for (size_t i = 0; i < g_stereo.clippingPlaneBuildsByCallSite.size(); ++i) {
@@ -3446,7 +3493,7 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
                 likelyRegister = registerIndex;
             }
         }
-        if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed)) {
+        if (verboseDiagnostics) {
             tmoxr::log::Info("Native stereo replay diagnostic: perspective candidates=" + std::to_string(g_stereo.perspectiveDrawCandidates) +
                 ", vertex-shader candidates=" + std::to_string(g_stereo.shaderPerspectiveCandidates) +
                 ", projection-constant matches=" + std::to_string(g_stereo.shaderProjectionConstantMatches) +
@@ -3474,7 +3521,7 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
                 ", shaders analyzed/mapped=" + std::to_string(g_stereo.analyzedShaders.size()) + "/" +
                 std::to_string(g_stereo.shaderPositionInfo.size()) + ".");
         }
-        if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed) && g_stereo.haveHeadPose) {
+        if (verboseDiagnostics && g_stereo.haveHeadPose) {
             tmoxr::log::Info("Tracked camera pose sample " + std::to_string(g_stereo.headPose.sample) +
                 ": position=(" + std::to_string(g_stereo.headPose.position[0]) + "," +
                 std::to_string(g_stereo.headPose.position[1]) + "," + std::to_string(g_stereo.headPose.position[2]) +
@@ -3483,17 +3530,19 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
                 "," + std::to_string(g_stereo.headPose.orientation[3]) + ").");
         }
         constexpr double diagnosticFrames = 180.0;
-        tmoxr::log::Info("Stereo workload: replay draws/frame=" +
-            std::to_string(static_cast<double>(g_stereo.replayedDraws) / diagnosticFrames) +
-            " (max=" + std::to_string(g_stereo.replayedDrawsMax) + ")" +
-            ", primitives/frame=" +
-            std::to_string(static_cast<double>(g_stereo.replayedPrimitives) / diagnosticFrames) +
-            ", replay CPU=" +
-            std::to_string(g_stereo.stereoReplayCpuMilliseconds / diagnosticFrames) +
-            " ms/frame (max=" + std::to_string(g_stereo.stereoReplayCpuMaxMilliseconds) +
-            "), desktop Present=" +
-            std::to_string(g_stereo.desktopPresentSamples ? g_stereo.desktopPresentMilliseconds /
-                static_cast<double>(g_stereo.desktopPresentSamples) : 0.0) + " ms.");
+        if (verboseDiagnostics) {
+            tmoxr::log::Info("Stereo workload: replay draws/frame=" +
+                std::to_string(static_cast<double>(g_stereo.replayedDraws) / diagnosticFrames) +
+                " (max=" + std::to_string(g_stereo.replayedDrawsMax) + ")" +
+                ", primitives/frame=" +
+                std::to_string(static_cast<double>(g_stereo.replayedPrimitives) / diagnosticFrames) +
+                ", replay CPU=" +
+                std::to_string(g_stereo.stereoReplayCpuMilliseconds / diagnosticFrames) +
+                " ms/frame (max=" + std::to_string(g_stereo.stereoReplayCpuMaxMilliseconds) +
+                "), desktop Present=" +
+                std::to_string(g_stereo.desktopPresentSamples ? g_stereo.desktopPresentMilliseconds /
+                    static_cast<double>(g_stereo.desktopPresentSamples) : 0.0) + " ms.");
+        }
         g_stereo.perspectiveDrawCandidates = 0;
         g_stereo.shaderPerspectiveCandidates = 0;
         g_stereo.shaderProjectionConstantMatches = 0;
