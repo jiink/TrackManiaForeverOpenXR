@@ -20,6 +20,8 @@ Download the latest release [from the releases page](https://github.com/jiink/Tr
 
 <img width="1064" height="490" alt="image" src="https://github.com/user-attachments/assets/83a78e11-3e29-4c07-8a37-f8dc205d3120" />
 
+Also, you need to set your OpenXR runtime correctly. If you're using Virtual Desktop, set it to use VDXR. If you're using Meta Horizon Link, go in the settings and press the button that sets OpenXR to use its thingy. If you're using SteamVR, you probably can't play this mod, since its OpenXR thing doesn't support 32-bit games as far as I can tell.
+
 You can install this mod manually, or with a mod loader. The manual method takes less steps, but the mod loader lets you disable/enable the mod with one click. If you use the mod loader, 
 
 ### No mod loader
