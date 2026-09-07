@@ -2,7 +2,11 @@
 
 A VR mod for [TrackMania Nations Forever](https://store.steampowered.com/app/11020/TrackMania_Nations_Forever/) and [TrackMania United Forever](https://store.steampowered.com/app/7200/Trackmania_United_Forever/)
 
-https://github.com/user-attachments/assets/5b76c802-7499-458f-a74e-979e9e26bcc3
+https://github.com/user-attachments/assets/a480d2e1-3934-44b0-a53c-918aacd992b3
+
+Installation video tutorial:
+
+[![installation video](https://img.youtube.com/vi/xMwuuWqYHf8/0.jpg)](https://www.youtube.com/watch?v=xMwuuWqYHf8)
 
 > [!WARNING]
 > ## AI made it.
