@@ -8,11 +8,50 @@ https://github.com/user-attachments/assets/5b76c802-7499-458f-a74e-979e9e26bcc3
 > ## AI made it.
 > This repo's code is 100% LLM-generated. I didn't write any of this code, just the readme. All I did was sit with my VR headset on and launch the game whenever AI finished its turn.
 
-BTW, **you have to disable fullscreen and anti aliasing in the Trackmania options, and the complete game window must fit within the monitor's usable area.** Current builds detect these incompatible conditions, show a warning, and continue on the desktop without initializing VR.
+## Usage
+
+Download the latest release [from the releases page](https://github.com/jiink/TrackManiaForeverOpenXR/releases)
+
+### Important settings
+
+**you have to disable fullscreen and anti aliasing in the Trackmania options, and the complete game window must fit within the monitor's usable area.** Current builds detect these incompatible conditions, show a warning, and continue on the desktop without initializing VR.
 
 <img width="351" height="189" alt="image" src="https://github.com/user-attachments/assets/e39cf512-4586-4187-8dbd-8bc588ce553e" />
 
 <img width="1064" height="490" alt="image" src="https://github.com/user-attachments/assets/83a78e11-3e29-4c07-8a37-f8dc205d3120" />
+
+You can install this mod manually, or with a mod loader. The manual method takes less steps, but the mod loader lets you disable/enable the mod with one click. If you use the mod loader, 
+
+### No mod loader
+
+1. Download the relevant attached zip
+2. Unzip all its contents into the game directory next to the Trackmania executable (right click the game in Steam, click "Manage", then "Browse local files")
+3. Have your VR headset connected to your PC
+4. Run TmForeverLauncher.exe (or launch "TrackMania United Forever Settings" in Steam), go to "configure", UNCHECK FULLSCREEN, click "advanced", and **set "antialiasing" to "none"**, then hit "ok", "save", then "play"
+5. You should see the game show up in your headset - seeing a proper 3D globe behind the UI
+
+### With mod loader
+
+1. Get [Tomashu's TrackMania ModLoader](https://tomashu.dev/software/tmloader/)
+1. Make sure it works, launch the game once using it.
+1. Close the mod loader.
+1. Download the relevant attached zip (different than the one for no mod loader)
+1. Unzip its contents to `%LOCALAPPDATA%\TMLoader\database\TmForever\products`
+1. Open the mod loader.
+1. Enable the TMFOXR mod
+1. Have your VR headset connected to your PC
+1. Run TmForeverLauncher.exe (or launch "TrackMania Nations/United Forever Settings" in Steam), go to "configure", UNCHECK FULLSCREEN, click "advanced", and **set "antialiasing" to "none"**, then hit "ok", "save", then "play"
+1. You should see the game show up in your headset - seeing a proper 3D globe behind the UI
+
+### Note on computing shadows
+
+<img width="551" height="379" alt="computing shadows small" src="https://github.com/user-attachments/assets/35671029-0197-4592-be9b-a83474a8e741" />
+
+Some tracks will try to compute shadows. This takes SO LONG! So when you see it, just cancel it after a couple seconds. If you try to cancel it too quickly, it won't cancel.
+
+If you use CoreMod (which comes included in TrackMania ModLoader) the shadow baking is much faster.
+
+## Building & more
 
 For more details, see [the AI generated readme](AI-GENERATED-README.md). I cannot vouch for its accuracy.
 
