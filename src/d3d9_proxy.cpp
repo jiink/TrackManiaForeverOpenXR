@@ -690,6 +690,7 @@ struct CameraOffsetProfile {
 
 struct CameraSettings {
     std::atomic<float> worldScalePercent{100.0f};
+    std::atomic<bool> recenterOnTrackingJump{true};
     std::atomic<bool> cockpitEnabled{true};
     // User-facing axes: positive X is right, positive Y is up, and positive Z
     // is forward. TrackMania's reflected projection requires X to be negated
@@ -1129,6 +1130,8 @@ void ReadCameraSettings(bool reloaded) {
     const auto& path = g_cameraSettings.configurationPath;
     const float worldScalePercent = std::clamp(
         ReadIniFloat(path, L"WorldScalePercent", 100.0f, L"VR"), 0.5f, 100.0f);
+    const bool recenterOnTrackingJump =
+        GetPrivateProfileIntW(L"VR", L"RecenterOnTrackingJump", 1, path.c_str()) != 0;
     const bool enabled = GetPrivateProfileIntW(L"Camera", L"CockpitEnabled", 1, path.c_str()) != 0;
     // Keep the original Camera keys as the fallback so an existing installation
     // retains its Stadium calibration until the new named sections are added.
@@ -1172,6 +1175,7 @@ void ReadCameraSettings(bool reloaded) {
         settingsToggleKey = VK_F10;
     }
     g_cameraSettings.worldScalePercent.store(worldScalePercent, std::memory_order_relaxed);
+    g_cameraSettings.recenterOnTrackingJump.store(recenterOnTrackingJump, std::memory_order_relaxed);
     g_cameraSettings.cockpitEnabled.store(enabled, std::memory_order_relaxed);
     g_cameraSettings.cockpitNearClip.store(nearClip, std::memory_order_relaxed);
     g_cameraSettings.horizonLock.store(horizonLock, std::memory_order_relaxed);
@@ -1183,12 +1187,14 @@ void ReadCameraSettings(bool reloaded) {
     g_cameraSettings.videoMemoryMB.store(videoMemoryMB, std::memory_order_relaxed);
     g_cameraSettings.verboseDiagnostics.store(verboseDiagnostics, std::memory_order_relaxed);
     g_settingsOverlayToggleKey.store(settingsToggleKey, std::memory_order_relaxed);
+    tmoxr::VrBridge::Instance().SetRecenterOnTrackingJump(recenterOnTrackingJump);
     tmoxr::VrBridge::Instance().SetVerboseDiagnostics(verboseDiagnostics);
     const auto activeProfile = g_cameraSettings.activeVehicleProfile.load(std::memory_order_relaxed);
     const auto& activeOffset = g_cameraSettings.vehicleProfiles[static_cast<size_t>(activeProfile)];
     tmoxr::log::Info(std::string(reloaded ? "Reloaded" : "Loaded") +
         " VR configuration: world scale=" + std::to_string(worldScalePercent) +
-        "%, cockpit camera enabled=" + std::to_string(enabled) +
+        "%, recenter on tracking jump=" + std::to_string(recenterOnTrackingJump) +
+        ", cockpit camera enabled=" + std::to_string(enabled) +
         ", active vehicle=" + kVehicleProfileNames[static_cast<size_t>(activeProfile)] +
         ", right/up/forward=(" + std::to_string(activeOffset.right.load(std::memory_order_relaxed)) + "," +
         std::to_string(activeOffset.up.load(std::memory_order_relaxed)) + "," +
@@ -1278,6 +1284,8 @@ bool SaveSettingsOverlayConfiguration() {
 
     writeFloat(L"VR", L"WorldScalePercent",
                g_cameraSettings.worldScalePercent.load(std::memory_order_relaxed));
+    writeBool(L"VR", L"RecenterOnTrackingJump",
+              g_cameraSettings.recenterOnTrackingJump.load(std::memory_order_relaxed));
     writeBool(L"Camera", L"CockpitEnabled",
               g_cameraSettings.cockpitEnabled.load(std::memory_order_relaxed));
     writeFloat(L"Camera", L"CockpitNearClip",
@@ -1486,6 +1494,15 @@ void BuildSettingsOverlay() {
                 ImGui::TextWrapped(
                     "Lower values make the world and car feel smaller, as if you are larger. "
                     "This scales stereo depth and positional head movement around your neutral camera position.");
+                ImGui::SeparatorText("Positional tracking");
+                if (OverlayCheckbox("Recenter after a large tracking jump",
+                                    g_cameraSettings.recenterOnTrackingJump)) {
+                    tmoxr::VrBridge::Instance().SetRecenterOnTrackingJump(
+                        g_cameraSettings.recenterOnTrackingJump.load(std::memory_order_relaxed));
+                }
+                ImGui::TextWrapped(
+                    "When enabled, moving more than 0.5 m from the tracking origin is treated as "
+                    "an OpenXR origin jump and snapped back. Disable this to move farther physically.");
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Camera")) {

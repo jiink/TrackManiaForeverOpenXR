@@ -336,6 +336,7 @@ struct VrBridge::Impl {
     bool haveLastPresentComplete = false;
     bool currentBetweenFrameValid = false;
     bool sceneSubmissionActive = false;
+    bool recenterOnTrackingJump = true;
     bool verboseDiagnostics = false;
     uint32_t viewTransformsThisFrame = 0;
     uint32_t projectionTransformsThisFrame = 0;
@@ -699,7 +700,8 @@ struct VrBridge::Impl {
                               center.position.y - baseHeadPose.position.y,
                               center.position.z - baseHeadPose.position.z};
         XrVector3f relativePosition = Rotate(inverseBase, delta);
-        if (std::sqrt(relativePosition.x * relativePosition.x + relativePosition.y * relativePosition.y +
+        if (recenterOnTrackingJump &&
+            std::sqrt(relativePosition.x * relativePosition.x + relativePosition.y * relativePosition.y +
                       relativePosition.z * relativePosition.z) > 0.5f) {
             // Some runtimes briefly report a valid zero position before switching
             // to their local-space headset height. Treat that as an origin update,
@@ -1724,6 +1726,12 @@ bool VrBridge::GetRenderConfiguration(RenderConfiguration& configuration) {
     if (!impl_->haveRenderConfiguration) return false;
     configuration = impl_->renderConfiguration;
     return true;
+}
+
+void VrBridge::SetRecenterOnTrackingJump(bool enabled) {
+    if (!impl_) impl_ = new Impl;
+    std::scoped_lock lock(impl_->mutex);
+    impl_->recenterOnTrackingJump = enabled;
 }
 
 void VrBridge::SetVerboseDiagnostics(bool enabled) {

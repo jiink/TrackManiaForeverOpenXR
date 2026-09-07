@@ -43,6 +43,7 @@ public:
     void SetUiSurface(IDirect3DSurface9* surface, HANDLE sharedHandle = nullptr);
     bool GetHeadPose(HeadPose& pose);
     bool GetRenderConfiguration(RenderConfiguration& configuration);
+    void SetRecenterOnTrackingJump(bool enabled);
     void SetVerboseDiagnostics(bool enabled);
     void Shutdown();
 

@@ -138,6 +138,8 @@ World-scale, camera, cockpit-position, frustum-culling, desktop-mirror, diagnost
 
 The **VR → World scale** slider ranges from 100% down to 0.5% and defaults to 100%. Lower values increase stereo depth and positional head movement relative to the game, making the car and surrounding world feel miniature while keeping the neutral camera position anchored in the configured seat. The same value can be edited as `WorldScalePercent` under `[VR]`.
 
+**VR → Recenter after a large tracking jump** preserves the default safeguard that treats movement beyond 0.5 metres as an OpenXR origin change and snaps the tracked position back. Disable it to walk farther from the initial headset position without being recentered. The same option is `RecenterOnTrackingJump` under `[VR]`.
+
 ## Cockpit camera
 
 Press camera key **3** (the numeric keypad key used by TrackMania, or a top-row 3 binding) to enable the VR driver-seat offset. Pressing camera keys 1, 2, or 4–7 disables it. The seat transform affects only the two headset views. The native-car visibility override is game-wide, so the monitor may also show parts of the car while camera 3 is selected.
