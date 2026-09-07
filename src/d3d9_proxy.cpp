@@ -3458,7 +3458,10 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
         g_stereo.stereoReplayCpuMaxMilliseconds,
         g_stereo.stereoReplayCpuThisFrame);
     if (g_stereo.presentedFrames % 180 == 0) {
-        if (g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed) &&
+        const bool verboseDiagnostics =
+            g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed);
+        if (verboseDiagnostics &&
+            g_cameraSettings.frustumCullingFix.load(std::memory_order_relaxed) &&
             g_executableLayout) {
         std::ostringstream clippingCallSites;
         for (size_t i = 0; i < g_stereo.clippingPlaneBuildsByCallSite.size(); ++i) {
@@ -3490,7 +3493,7 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
                 likelyRegister = registerIndex;
             }
         }
-        if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed)) {
+        if (verboseDiagnostics) {
             tmoxr::log::Info("Native stereo replay diagnostic: perspective candidates=" + std::to_string(g_stereo.perspectiveDrawCandidates) +
                 ", vertex-shader candidates=" + std::to_string(g_stereo.shaderPerspectiveCandidates) +
                 ", projection-constant matches=" + std::to_string(g_stereo.shaderProjectionConstantMatches) +
@@ -3518,7 +3521,7 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
                 ", shaders analyzed/mapped=" + std::to_string(g_stereo.analyzedShaders.size()) + "/" +
                 std::to_string(g_stereo.shaderPositionInfo.size()) + ".");
         }
-        if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed) && g_stereo.haveHeadPose) {
+        if (verboseDiagnostics && g_stereo.haveHeadPose) {
             tmoxr::log::Info("Tracked camera pose sample " + std::to_string(g_stereo.headPose.sample) +
                 ": position=(" + std::to_string(g_stereo.headPose.position[0]) + "," +
                 std::to_string(g_stereo.headPose.position[1]) + "," + std::to_string(g_stereo.headPose.position[2]) +
@@ -3527,17 +3530,19 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
                 "," + std::to_string(g_stereo.headPose.orientation[3]) + ").");
         }
         constexpr double diagnosticFrames = 180.0;
-        tmoxr::log::Info("Stereo workload: replay draws/frame=" +
-            std::to_string(static_cast<double>(g_stereo.replayedDraws) / diagnosticFrames) +
-            " (max=" + std::to_string(g_stereo.replayedDrawsMax) + ")" +
-            ", primitives/frame=" +
-            std::to_string(static_cast<double>(g_stereo.replayedPrimitives) / diagnosticFrames) +
-            ", replay CPU=" +
-            std::to_string(g_stereo.stereoReplayCpuMilliseconds / diagnosticFrames) +
-            " ms/frame (max=" + std::to_string(g_stereo.stereoReplayCpuMaxMilliseconds) +
-            "), desktop Present=" +
-            std::to_string(g_stereo.desktopPresentSamples ? g_stereo.desktopPresentMilliseconds /
-                static_cast<double>(g_stereo.desktopPresentSamples) : 0.0) + " ms.");
+        if (verboseDiagnostics) {
+            tmoxr::log::Info("Stereo workload: replay draws/frame=" +
+                std::to_string(static_cast<double>(g_stereo.replayedDraws) / diagnosticFrames) +
+                " (max=" + std::to_string(g_stereo.replayedDrawsMax) + ")" +
+                ", primitives/frame=" +
+                std::to_string(static_cast<double>(g_stereo.replayedPrimitives) / diagnosticFrames) +
+                ", replay CPU=" +
+                std::to_string(g_stereo.stereoReplayCpuMilliseconds / diagnosticFrames) +
+                " ms/frame (max=" + std::to_string(g_stereo.stereoReplayCpuMaxMilliseconds) +
+                "), desktop Present=" +
+                std::to_string(g_stereo.desktopPresentSamples ? g_stereo.desktopPresentMilliseconds /
+                    static_cast<double>(g_stereo.desktopPresentSamples) : 0.0) + " ms.");
+        }
         g_stereo.perspectiveDrawCandidates = 0;
         g_stereo.shaderPerspectiveCandidates = 0;
         g_stereo.shaderProjectionConstantMatches = 0;

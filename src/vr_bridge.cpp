@@ -1215,37 +1215,39 @@ struct VrBridge::Impl {
             }
             if (transferSamples) {
                 const double divisor = static_cast<double>(transferSamples);
-                log::Info("OpenXR performance: Present=" + std::to_string(applicationRate) +
-                    " Hz, runtime period=" +
-                    std::to_string(frameBegun ? static_cast<double>(activeFrameState.predictedDisplayPeriod) / 1000000.0 : 0.0) +
-                    " ms, transfer=" + std::to_string(transferMilliseconds / divisor) +
-                    " ms (eye readback L/R=" + std::to_string(eyeReadbackMilliseconds[0] / divisor) + "/" +
-                    std::to_string(eyeReadbackMilliseconds[1] / divisor) +
-                    ", eye XR wait=" + std::to_string(eyeAcquireWaitMilliseconds / divisor) +
-                    ", eye upload=" + std::to_string(eyeUploadMilliseconds / divisor) +
-                    ", UI=" + std::to_string(uiTransferMilliseconds / divisor) +
-                    ", sync/release=" + std::to_string(syncReleaseMilliseconds / divisor) +
-                    "), xrEndFrame=" + std::to_string(endFrameSamples ?
-                        endFrameMilliseconds / static_cast<double>(endFrameSamples) : 0.0) +
-                    "/" + std::to_string(endFrameMaxMilliseconds) + " ms avg/max, runtime wait=" +
-                    std::to_string(runtimeWaitSamples ?
-                        runtimeWaitMilliseconds / static_cast<double>(runtimeWaitSamples) : 0.0) +
-                    "/" + std::to_string(runtimeWaitMaxMilliseconds) + " ms avg/max, scene submit=" +
-                    std::to_string(sceneSubmissionSamples ?
-                        sceneSubmissionMilliseconds / static_cast<double>(sceneSubmissionSamples) : 0.0) +
-                    "/" + std::to_string(sceneSubmissionMaxMilliseconds) +
-                    " ms avg/max, transfer max=" + std::to_string(transferMaxMilliseconds) +
-                    " ms, active app work=" + std::to_string(activeApplicationSamples ?
-                        activeApplicationMilliseconds / static_cast<double>(activeApplicationSamples) : 0.0) +
-                    "/" + std::to_string(activeApplicationMaxMilliseconds) +
-                    " ms avg/max (between frames=" + std::to_string(activeApplicationSamples ?
-                        betweenFrameMilliseconds / static_cast<double>(activeApplicationSamples) : 0.0) +
-                    " ms, XR setup excluding wait=" + std::to_string(activeApplicationSamples ?
-                        frameSetupMilliseconds / static_cast<double>(activeApplicationSamples) : 0.0) +
-                    " ms), D3D9On12 wrappers reused/created=" +
-                    std::to_string(d3d9On12WrapperCacheHits) + "/" +
-                    std::to_string(d3d9On12WrapperCacheMisses) + " across " +
-                    std::to_string(transferSamples) + " frames.");
+                if (verboseDiagnostics) {
+                    log::Info("OpenXR performance: Present=" + std::to_string(applicationRate) +
+                        " Hz, runtime period=" +
+                        std::to_string(frameBegun ? static_cast<double>(activeFrameState.predictedDisplayPeriod) / 1000000.0 : 0.0) +
+                        " ms, transfer=" + std::to_string(transferMilliseconds / divisor) +
+                        " ms (eye readback L/R=" + std::to_string(eyeReadbackMilliseconds[0] / divisor) + "/" +
+                        std::to_string(eyeReadbackMilliseconds[1] / divisor) +
+                        ", eye XR wait=" + std::to_string(eyeAcquireWaitMilliseconds / divisor) +
+                        ", eye upload=" + std::to_string(eyeUploadMilliseconds / divisor) +
+                        ", UI=" + std::to_string(uiTransferMilliseconds / divisor) +
+                        ", sync/release=" + std::to_string(syncReleaseMilliseconds / divisor) +
+                        "), xrEndFrame=" + std::to_string(endFrameSamples ?
+                            endFrameMilliseconds / static_cast<double>(endFrameSamples) : 0.0) +
+                        "/" + std::to_string(endFrameMaxMilliseconds) + " ms avg/max, runtime wait=" +
+                        std::to_string(runtimeWaitSamples ?
+                            runtimeWaitMilliseconds / static_cast<double>(runtimeWaitSamples) : 0.0) +
+                        "/" + std::to_string(runtimeWaitMaxMilliseconds) + " ms avg/max, scene submit=" +
+                        std::to_string(sceneSubmissionSamples ?
+                            sceneSubmissionMilliseconds / static_cast<double>(sceneSubmissionSamples) : 0.0) +
+                        "/" + std::to_string(sceneSubmissionMaxMilliseconds) +
+                        " ms avg/max, transfer max=" + std::to_string(transferMaxMilliseconds) +
+                        " ms, active app work=" + std::to_string(activeApplicationSamples ?
+                            activeApplicationMilliseconds / static_cast<double>(activeApplicationSamples) : 0.0) +
+                        "/" + std::to_string(activeApplicationMaxMilliseconds) +
+                        " ms avg/max (between frames=" + std::to_string(activeApplicationSamples ?
+                            betweenFrameMilliseconds / static_cast<double>(activeApplicationSamples) : 0.0) +
+                        " ms, XR setup excluding wait=" + std::to_string(activeApplicationSamples ?
+                            frameSetupMilliseconds / static_cast<double>(activeApplicationSamples) : 0.0) +
+                        " ms), D3D9On12 wrappers reused/created=" +
+                        std::to_string(d3d9On12WrapperCacheHits) + "/" +
+                        std::to_string(d3d9On12WrapperCacheMisses) + " across " +
+                        std::to_string(transferSamples) + " frames.");
+                }
                 transferMilliseconds = 0.0;
                 eyeReadbackMilliseconds = {};
                 eyeAcquireWaitMilliseconds = 0.0;
