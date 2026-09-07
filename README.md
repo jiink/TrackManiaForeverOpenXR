@@ -51,7 +51,13 @@ To enter first person mode, press 3 on your keyboard (going by default controls)
 
 ### HD car interiors
 
+This only applies to TrackMania United Forever, not Nations.
+
 In TrackMania United Forever, there are lots of cars, but they don't look good from the first person view. To fix this, you can get the HD car skins from the [Unofficial Visual and Musical Extension (UVME)](https://strangeplanet.fr/work/trackmania-uvme/) installer
+
+<img width="986" height="388" alt="image" src="https://github.com/user-attachments/assets/e1977cde-84de-4bdd-8def-6db8554c69ef" />
+
+Note that after installing this, you have to actually equip the HD skins in the Profile menu.
 
 ### In-VR settings
 
