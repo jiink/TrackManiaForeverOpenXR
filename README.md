@@ -43,6 +43,20 @@ You can install this mod manually, or with a mod loader. The manual method takes
 1. Run TmForeverLauncher.exe (or launch "TrackMania Nations/United Forever Settings" in Steam), go to "configure", UNCHECK FULLSCREEN, click "advanced", and **set "antialiasing" to "none"**, then hit "ok", "save", then "play"
 1. You should see the game show up in your headset - seeing a proper 3D globe behind the UI
 
+## Things U gotta know
+
+### First person mode
+
+To enter first person mode, press 3 on your keyboard (going by default controls)
+
+### HD car interiors
+
+In TrackMania United Forever, there are lots of cars, but they don't look good from the first person view. To fix this, you can get the HD car skins from the [Unofficial Visual and Musical Extension (UVME)](https://strangeplanet.fr/work/trackmania-uvme/) installer
+
+### In-VR settings
+
+By default, press F10 while in-game to open the VR settings menu.
+
 ### Note on computing shadows
 
 <img width="551" height="379" alt="computing shadows small" src="https://github.com/user-attachments/assets/35671029-0197-4592-be9b-a83474a8e741" />
