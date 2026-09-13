@@ -24,7 +24,7 @@ Download the latest release [from the releases page](https://github.com/jiink/Tr
 
 <img width="1064" height="490" alt="image" src="https://github.com/user-attachments/assets/83a78e11-3e29-4c07-8a37-f8dc205d3120" />
 
-Also, you need to set your OpenXR runtime correctly. If you're using Virtual Desktop, set it to use VDXR. If you're using Meta Horizon Link, go in the settings and press the button that sets OpenXR to use its thingy. If you're using SteamVR, go to its settings, go to the OpenXR section, and set OpenXR to use SteamVR's runtime.
+Also, you need to set your OpenXR runtime correctly. If you're using Virtual Desktop, set it to use VDXR. ~~If you're using Meta Horizon Link, go in the settings and press the button that sets OpenXR to use its thingy.~~ (As of v8, the mod crashes with Meta Horizon Link. Try Steam Link or Virtual Desktop instead.) If you're using SteamVR, go to its settings, go to the OpenXR section, and set OpenXR to use SteamVR's runtime.
 
 <img width="1102" height="424" alt="image" src="https://github.com/user-attachments/assets/ed552f71-fa60-40fb-a839-7601fd8c59db" />
 
