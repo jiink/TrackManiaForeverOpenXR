@@ -4549,8 +4549,10 @@ void DisableVrForIncompatibleGraphics(HWND owner, bool fullscreen, D3DMULTISAMPL
 // (D3D9On12) is not the one TMVS patched, so TMVS would never see the device (no F8 menu, no effects).
 // Called before any hook of ours is written into the device's method table, so TMVS hooks the
 // device's code first and our table hooks sit on top.
-// [Compatibility] AttachVibrantShaders in TMFOXR.ini: 0 = off, 1 = TMVS only watches (default),
-// 2 = TMVS runs with all its render target / depth changes (experimental, may break VR rendering).
+// [Compatibility] AttachVibrantShaders in TMFOXR.ini: 0 = off, 1 = TMVS's own setting decides
+// (Effects in VR in its menu; off: it only watches and draws its menu, the default), 2 = TMVS shades
+// the eyes whatever its setting says (experimental, may break VR rendering). The eye provider and the
+// scene callbacks are handed over in both cases: TMVS only calls them when it shades the eyes.
 void AttachVibrantShaders(IDirect3DDevice9* device) {
     const auto configurationPath = tmoxr::UserDataFilePath(L"TMFOXR.ini");
     const int mode = configurationPath.empty() ? 1 :
@@ -4566,7 +4568,7 @@ void AttachVibrantShaders(IDirect3DDevice9* device) {
     }
     const int attached = attach(device, mode >= 2 ? 2 : 1);
     g_vibrantAttached = attached != 0;
-    if (attached && mode >= 2) {
+    if (attached) {
         using SetEyeProviderFn = void(__cdecl*)(int(__cdecl*)(int, float*, float*, int*));
         if (const auto setProvider = reinterpret_cast<SetEyeProviderFn>(GetProcAddress(module, "TMVS_SetEyeProvider"))) {
             setProvider(&VibrantEyeProvider);
@@ -4574,13 +4576,13 @@ void AttachVibrantShaders(IDirect3DDevice9* device) {
             if (const auto setCallbacks = reinterpret_cast<SetSceneCallbacksFn>(GetProcAddress(module, "TMVS_SetSceneCallbacks"))) {
                 setCallbacks(&VibrantSceneBegin, &VibrantSceneEnd);
             }
-            tmoxr::log::Info("TM Vibrant Shaders will shade each eye as its own camera.");
+            tmoxr::log::Info("TM Vibrant Shaders can shade each eye as its own camera.");
         } else {
             tmoxr::log::Warn("TMVibrantShaders.dll has no TMVS_SetEyeProvider export: effects will only reach one eye.");
         }
     }
     tmoxr::log::Info(std::string("Handed the game device to TM Vibrant Shaders (mode ") + std::to_string(mode >= 2 ? 2 : 1) +
-        (mode >= 2 ? ", full" : ", watch only") + "): " + (attached ? "attached." : "it declined."));
+        (mode >= 2 ? ", full" : ", its Effects in VR setting decides") + "): " + (attached ? "attached." : "it declined."));
 }
 
 class D3D9Proxy final : public IDirect3D9 {

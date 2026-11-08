@@ -76,7 +76,7 @@ By default, press F10 while in-game to open the VR settings menu.
 
 ### TM Vibrant Shaders
 
-[TM Vibrant Shaders](https://github.com/cheatoskar/TM-Vibrant-Shaders) can run together with this mod when both are installed with the mod loader (a version with the VR hand-over). By default its menu (F8) shows in the headset and its effects stay off. Set `AttachVibrantShaders=2` under `[Compatibility]` in `Documents\TrackMania\TMFOXR.ini` to have it shade each eye (experimental); `0` turns the hand-over off.
+[TM Vibrant Shaders](https://github.com/cheatoskar/TM-Vibrant-Shaders) can run together with this mod when both are installed with the mod loader (a version with the VR hand-over). By default its menu (F8) shows in the headset and its effects stay off; turn on *Effects in VR* in its menu and restart the game to have it shade each eye (experimental). `AttachVibrantShaders=0` under `[Compatibility]` in `Documents\TrackMania\TMFOXR.ini` turns the hand-over off, `2` turns the effects on whatever TM Vibrant Shaders' setting says.
 
 ### Note on computing shadows
 
