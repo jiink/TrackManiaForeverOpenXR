@@ -437,6 +437,7 @@ int g_settingsOverlayVehicleProfile = 0;
 RECT g_settingsOverlayPreviousClip{};
 bool g_settingsOverlayHadCursorClip = false;
 bool g_renderingSettingsOverlay = false;
+bool g_vibrantAttached = false; // TM Vibrant Shaders accepted the device hand-over
 std::atomic<UINT> g_settingsOverlayToggleKey{VK_F10};
 bool g_settingsOverlayCapturingKey = false;
 ULONGLONG g_settingsOverlayHintUntil = 0;
@@ -2455,11 +2456,25 @@ bool EnsureStereoEyeDepth(IDirect3DDevice9* device) {
     g_stereo.rightDepth = nullptr;
     g_stereo.trackedLeftDepth = nullptr;
     D3DSURFACE_DESC depth{};
-    if (FAILED(g_stereo.activeDepth->GetDesc(&depth)) ||
-        FAILED(device->CreateDepthStencilSurface(
-            g_stereo.renderWidth * 2u,
-            g_stereo.renderHeight, depth.Format, D3DMULTISAMPLE_NONE, 0, TRUE,
-            &g_stereo.trackedLeftDepth, nullptr))) {
+    bool depthCreated = false;
+    if (SUCCEEDED(g_stereo.activeDepth->GetDesc(&depth))) {
+        if (depth.Format == static_cast<D3DFORMAT>(MAKEFOURCC('I', 'N', 'T', 'Z'))) {
+            // A readable depth texture (TM Vibrant Shaders' INTZ): cannot be a plain surface, so make
+            // the packed stereo depth as an INTZ texture and keep its top-level surface.
+            IDirect3DTexture9* intz = nullptr;
+            if (SUCCEEDED(device->CreateTexture(g_stereo.renderWidth * 2u, g_stereo.renderHeight, 1,
+                    D3DUSAGE_DEPTHSTENCIL, depth.Format, D3DPOOL_DEFAULT, &intz, nullptr)) && intz) {
+                depthCreated = SUCCEEDED(intz->GetSurfaceLevel(0, &g_stereo.trackedLeftDepth));
+                intz->Release(); // the surface keeps its texture alive
+                if (depthCreated) tmoxr::log::Info("Packed stereo depth allocated as an INTZ texture (readable depth).");
+            }
+        } else {
+            depthCreated = SUCCEEDED(device->CreateDepthStencilSurface(
+                g_stereo.renderWidth * 2u, g_stereo.renderHeight, depth.Format, D3DMULTISAMPLE_NONE, 0, TRUE,
+                &g_stereo.trackedLeftDepth, nullptr));
+        }
+    }
+    if (!depthCreated) {
         tmoxr::log::Warn("Native stereo skipped: could not allocate private eye depth surfaces.");
         if (g_stereo.trackedLeftDepth) g_stereo.trackedLeftDepth->Release();
         if (g_stereo.rightDepth) g_stereo.rightDepth->Release();
@@ -3307,6 +3322,144 @@ void RenderSettingsOverlay(IDirect3DDevice9* device, HWND window) {
     if (beginTemporaryScene) g_originalEndScene(device);
 }
 
+// TM Vibrant Shaders shades each eye as its own camera: this hands it the eye's view and projection
+// (as SetTransform takes them) and its rectangle in the packed stereo target.
+int __cdecl VibrantEyeProvider(int eye, float* view, float* projection, int* rect) {
+    if (eye < 0 || eye > 1 || !view || !projection || !rect) return 0;
+    if (!g_stereo.ready || !g_stereo.packedEyesActive || !g_stereo.haveView || !g_stereo.renderWidth ||
+        !g_stereo.renderHeight) return 0;
+    const bool rightEye = eye == 1;
+    const Matrix4 projectionColumn = EyeProjection(rightEye);
+    for (UINT row = 0; row < 4; ++row) {
+        for (UINT column = 0; column < 4; ++column) projection[row * 4 + column] = projectionColumn[column * 4 + row];
+    }
+    const Matrix4 headColumn = HeadViewMatrix(rightEye ? -0.064f : 0.0f);
+    D3DMATRIX headRow{};
+    float* output = &headRow._11;
+    for (UINT row = 0; row < 4; ++row) {
+        for (UINT column = 0; column < 4; ++column) output[row * 4 + column] = headColumn[column * 4 + row];
+    }
+    const D3DMATRIX trackedView = MultiplyD3DMatrix(g_stereo.view, headRow);
+    std::memcpy(view, &trackedView._11, sizeof(float) * 16);
+    rect[0] = rightEye ? static_cast<int>(g_stereo.renderWidth) : 0;
+    rect[1] = 0;
+    rect[2] = static_cast<int>(g_stereo.renderWidth);
+    rect[3] = static_cast<int>(g_stereo.renderHeight);
+    return 1;
+}
+
+// Around TM Vibrant Shaders' shading of a stereo frame: its own render-target changes must not leave the
+// game's logical target pointing at an eye target (the HUD would then be drawn into one eye instead of the
+// UI layer), and the desktop mirror has to be taken from the shaded eye.
+struct VibrantSceneSave {
+    IDirect3DSurface9* color = nullptr;
+    IDirect3DSurface9* depth = nullptr;
+    bool valid = false;
+} g_vibrantSceneSave;
+
+void __cdecl VibrantSceneBegin(IDirect3DDevice9* device) {
+    RestoreDeferredShaderEyeState(device); // the game's vertex shader constants back before TMVS draws
+    g_vibrantSceneSave.color = g_stereo.activeColor;
+    g_vibrantSceneSave.depth = g_stereo.activeDepth;
+    g_vibrantSceneSave.valid = true;
+    // TMVS's own passes (targets, transforms, draws) go straight to the device: they are not the game's
+    // scene, so no stereo replay, target caching or mirror flushes belong to them.
+    g_renderingSettingsOverlay = true;
+}
+
+void __cdecl VibrantSceneEnd(IDirect3DDevice9* device) {
+    if (!g_vibrantSceneSave.valid) return;
+    g_vibrantSceneSave.valid = false;
+    g_renderingSettingsOverlay = false;
+    g_stereo.activeColor = g_vibrantSceneSave.color;
+    g_stereo.activeDepth = g_vibrantSceneSave.depth;
+    g_stereo.trackedEyeTargetBound = false;
+    g_originalSetDepthStencilSurface(device, nullptr);
+    g_originalSetRenderTarget(device, 0, g_stereo.activeColor);
+    g_originalSetDepthStencilSurface(device, g_stereo.activeDepth);
+    if (g_stereo.haveGameViewport) g_originalSetViewport(device, &g_stereo.gameViewport);
+    g_stereo.eyeViewportActive = false;
+    g_stereo.desktopMirrorDirty = true; // the left eye is shaded now: mirror it to the desktop again
+    FlushDesktopEyeMirror(device);
+}
+
+// TM Vibrant Shaders' F8 menu, drawn by TMVS itself (TMVS_DrawOverlay) into the headset interface
+// layer and the desktop mirror, so the menu is visible in VR. TMVS asks us to set each target up.
+struct VibrantOverlayContext {
+    IDirect3DDevice9* device = nullptr;
+    IDirect3DStateBlock9* state = nullptr;
+    bool temporaryScene = false;
+    bool failed = false;
+};
+using VibrantDrawOverlayFn = int(__cdecl*)(IDirect3DDevice9*, int(__cdecl*)(void*, int), void(__cdecl*)(void*, int), void*);
+
+int __cdecl VibrantOverlayPrepare(void* user, int pass) {
+    auto* ctx = static_cast<VibrantOverlayContext*>(user);
+    IDirect3DDevice9* device = ctx->device;
+    if (ctx->failed) return 0;
+    // Pass 1 is the desktop window's own back buffer (the game's logical target can be an eye target here).
+    IDirect3DSurface9* target = pass == 0 ? g_stereo.uiSurface : g_stereo.leftColor;
+    if (!target) return 0;
+    if (!ctx->state) {
+        if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &ctx->state))) { ctx->failed = true; return 0; }
+        ctx->temporaryScene = !g_stereo.sceneActive;
+        if (ctx->temporaryScene && FAILED(g_originalBeginScene(device))) {
+            ctx->temporaryScene = false;
+            ctx->failed = true;
+            return 0;
+        }
+        g_renderingSettingsOverlay = true;
+    }
+    g_originalSetDepthStencilSurface(device, nullptr);
+    if (FAILED(g_originalSetRenderTarget(device, 0, target))) return 0;
+    if (pass == 0 && !g_stereo.uiOverlayClearedThisFrame) {
+        g_originalClear(device, 0, nullptr, D3DCLEAR_TARGET, 0x00000000u, 1.0f, 0);
+        g_stereo.uiOverlayClearedThisFrame = true;
+    }
+    D3DSURFACE_DESC targetDesc{};
+    if (SUCCEEDED(target->GetDesc(&targetDesc))) {
+        const D3DVIEWPORT9 viewport{0, 0, targetDesc.Width, targetDesc.Height, 0.0f, 1.0f};
+        g_originalSetViewport(device, &viewport);
+    }
+    return 1;
+}
+
+void __cdecl VibrantOverlayFinish(void* user, int pass) {
+    if (pass == 0) {
+        ++g_stereo.uiDrawsThisFrame;
+        ++g_stereo.capturedUiDraws;
+    }
+}
+
+void RenderVibrantShadersOverlay(IDirect3DDevice9* device) {
+    static VibrantDrawOverlayFn drawOverlay = nullptr;
+    static bool looked = false;
+    if (!looked) {
+        looked = true;
+        if (HMODULE module = GetModuleHandleW(L"TMVibrantShaders.dll")) {
+            drawOverlay = reinterpret_cast<VibrantDrawOverlayFn>(GetProcAddress(module, "TMVS_DrawOverlay"));
+        }
+        tmoxr::log::Info(drawOverlay ? "TM Vibrant Shaders menu will be drawn into the headset UI layer."
+                                     : "TM Vibrant Shaders menu export not found; its menu stays on the desktop window only.");
+    }
+    if (!drawOverlay || !device || !g_stereo.ready || !g_stereo.uiSurface ||
+        !g_stereo.primaryWidth || !g_stereo.primaryHeight || g_settingsOverlayOpen || !g_vibrantAttached) return;
+    // Only once TMVS has been handed the device (otherwise it has no menu to draw).
+    VibrantOverlayContext ctx;
+    ctx.device = device;
+    drawOverlay(device, VibrantOverlayPrepare, VibrantOverlayFinish, &ctx);
+    if (ctx.state) {
+        g_renderingSettingsOverlay = false;
+        ctx.state->Apply();
+        ctx.state->Release();
+        g_originalSetDepthStencilSurface(device, nullptr);
+        g_originalSetRenderTarget(device, 0, g_stereo.activeColor);
+        g_originalSetDepthStencilSurface(device, g_stereo.activeDepth);
+        if (g_stereo.haveGameViewport) g_originalSetViewport(device, &g_stereo.gameViewport);
+        if (ctx.temporaryScene) g_originalEndScene(device);
+    }
+}
+
 bool IsDesktopSpaceAdditiveSprite(IDirect3DDevice9* device) {
     if (g_stereo.vertexShader) return false;
     bool pretransformed = false;
@@ -3442,6 +3595,7 @@ HRESULT STDMETHODCALLTYPE PresentHook(IDirect3DDevice9* device, const RECT* sour
     HWND cursorWindow = window;
     if (!cursorWindow && SUCCEEDED(device->GetCreationParameters(&creation))) cursorWindow = creation.hFocusWindow;
     RenderSettingsOverlay(device, cursorWindow);
+    RenderVibrantShadersOverlay(device);
     if (!g_settingsOverlayOpen) CaptureMouseCursor(device, cursorWindow);
     tmoxr::VrBridge::Instance().SetLeftEyeSurface(
         g_stereo.trackedLeftColor, g_stereo.trackedLeftSharedHandle, 0);
@@ -4389,6 +4543,46 @@ void DisableVrForIncompatibleGraphics(HWND owner, bool fullscreen, D3DMULTISAMPL
     }
 }
 
+// Optional hand-over of the freshly created game device to TM Vibrant Shaders (TMVS), when its DLL
+// is loaded in this process. TMVS normally finds the device through its own Direct3DCreate9 import
+// patch, but this proxy replaces that import after TMVS patched it, and the factory this proxy wraps
+// (D3D9On12) is not the one TMVS patched, so TMVS would never see the device (no F8 menu, no effects).
+// Called before any hook of ours is written into the device's method table, so TMVS hooks the
+// device's code first and our table hooks sit on top.
+// [Compatibility] AttachVibrantShaders in TMFOXR.ini: 0 = off, 1 = TMVS only watches (default),
+// 2 = TMVS runs with all its render target / depth changes (experimental, may break VR rendering).
+void AttachVibrantShaders(IDirect3DDevice9* device) {
+    const auto configurationPath = tmoxr::UserDataFilePath(L"TMFOXR.ini");
+    const int mode = configurationPath.empty() ? 1 :
+        static_cast<int>(GetPrivateProfileIntW(L"Compatibility", L"AttachVibrantShaders", 1, configurationPath.c_str()));
+    if (mode <= 0) return;
+    const HMODULE module = GetModuleHandleW(L"TMVibrantShaders.dll");
+    if (!module) return; // TM Vibrant Shaders is not loaded: nothing to do
+    using AttachFn = int(__cdecl*)(IDirect3DDevice9*, int);
+    const auto attach = reinterpret_cast<AttachFn>(GetProcAddress(module, "TMVS_AttachDevice"));
+    if (!attach) {
+        tmoxr::log::Warn("TMVibrantShaders.dll is loaded but has no TMVS_AttachDevice export (needs a build with the VR hand-over); it will not see the VR device.");
+        return;
+    }
+    const int attached = attach(device, mode >= 2 ? 2 : 1);
+    g_vibrantAttached = attached != 0;
+    if (attached && mode >= 2) {
+        using SetEyeProviderFn = void(__cdecl*)(int(__cdecl*)(int, float*, float*, int*));
+        if (const auto setProvider = reinterpret_cast<SetEyeProviderFn>(GetProcAddress(module, "TMVS_SetEyeProvider"))) {
+            setProvider(&VibrantEyeProvider);
+            using SetSceneCallbacksFn = void(__cdecl*)(void(__cdecl*)(IDirect3DDevice9*), void(__cdecl*)(IDirect3DDevice9*));
+            if (const auto setCallbacks = reinterpret_cast<SetSceneCallbacksFn>(GetProcAddress(module, "TMVS_SetSceneCallbacks"))) {
+                setCallbacks(&VibrantSceneBegin, &VibrantSceneEnd);
+            }
+            tmoxr::log::Info("TM Vibrant Shaders will shade each eye as its own camera.");
+        } else {
+            tmoxr::log::Warn("TMVibrantShaders.dll has no TMVS_SetEyeProvider export: effects will only reach one eye.");
+        }
+    }
+    tmoxr::log::Info(std::string("Handed the game device to TM Vibrant Shaders (mode ") + std::to_string(mode >= 2 ? 2 : 1) +
+        (mode >= 2 ? ", full" : ", watch only") + "): " + (attached ? "attached." : "it declined."));
+}
+
 class D3D9Proxy final : public IDirect3D9 {
 public:
     explicit D3D9Proxy(IDirect3D9* real, IDirect3D9* nativeFallback = nullptr,
@@ -4480,6 +4674,7 @@ public:
             tmoxr::log::Info("D3D9 device created: " + std::to_string(parameters->BackBufferWidth) + "x" +
                 std::to_string(parameters->BackBufferHeight) + ", windowed=" + std::to_string(parameters->Windowed != FALSE) +
                 ", presentation interval=" + std::to_string(parameters->PresentationInterval) + ".");
+            AttachVibrantShaders(*device);
             tmoxr::VrBridge::Instance().OnDeviceCreated(*device, *parameters);
             if (!tmoxr::VrBridge::Instance().TryInitialize()) {
                 tmoxr::VrBridge::Instance().Shutdown();
