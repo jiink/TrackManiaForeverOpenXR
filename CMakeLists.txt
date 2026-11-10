@@ -45,6 +45,9 @@ target_include_directories(d3d9 PRIVATE
   "${dear_imgui_SOURCE_DIR}/backends"
 )
 target_link_libraries(d3d9 PRIVATE dxguid d3d11 dxgi)
+# openxr.h is generated from the registry by the OpenXR SDK's "headers" target;
+# without this, a clean "cmake --build build --target d3d9" cannot find it.
+add_dependencies(d3d9 headers)
 
 add_executable(d3d9on12_compat_smoke EXCLUDE_FROM_ALL tests/d3d9on12_compat_smoke.cpp)
 target_compile_features(d3d9on12_compat_smoke PRIVATE cxx_std_20)
