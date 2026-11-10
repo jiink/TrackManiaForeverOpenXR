@@ -1,0 +1,144 @@
+# Builds TMFOXR and packages the two release zips (see scripts/package-release.ps1).
+#
+#   push to master  -> updates the rolling "nightly" pre-release
+#   push a vN tag   -> creates a draft release vN for you to review and publish
+#   pull request    -> build and package only; zips are attached to the workflow run
+name: Build and release
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags are needed to number nightly builds
+
+      - name: Set up MSVC (x86)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Ensure Ninja
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja -y --no-progress
+          }
+          ninja --version
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --target d3d9
+
+      - name: Work out release name and TMLoader version
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          $sha = (git rev-parse --short HEAD).Trim()
+          if ($env:REF_TYPE -eq 'tag') {
+            if ($env:REF_NAME -notmatch '^v(\d+)(?:\.(\d+))?(?:\.(\d+))?$') {
+              throw "Tag '$($env:REF_NAME)' is not of the form v9, v9.1 or v9.1.2."
+            }
+            $major = $Matches[1]
+            $minor = if ($Matches[2]) { $Matches[2] } else { '0' }
+            $patch = if ($Matches[3]) { $Matches[3] } else { '0' }
+            $name = $env:REF_NAME
+            $tmloaderVersion = "$major.$minor.$patch"
+            $changelog = "TMFOXR $name"
+          }
+          else {
+            # Nightly builds are numbered as pre-releases of the next major version.
+            $latest = git tag --list 'v*' --sort=-v:refname |
+              Where-Object { $_ -match '^v(\d+)' } | Select-Object -First 1
+            $nextMajor = if ($latest -and $latest -match '^v(\d+)') { [int]$Matches[1] + 1 } else { 1 }
+            $name = 'nightly'
+            $tmloaderVersion = "$nextMajor.0.0-dev.$($env:RUN_NUMBER)"
+            $changelog = "Nightly build $sha"
+          }
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "tmloader_version=$tmloaderVersion" >> $env:GITHUB_OUTPUT
+          "changelog=$changelog" >> $env:GITHUB_OUTPUT
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          Write-Host "Release name: $name, TMLoader version: $tmloaderVersion"
+
+      - name: Package
+        env:
+          NAME: ${{ steps.version.outputs.name }}
+          TMLOADER_VERSION: ${{ steps.version.outputs.tmloader_version }}
+          CHANGELOG: ${{ steps.version.outputs.changelog }}
+        run: |
+          ./scripts/package-release.ps1 -Name $env:NAME -TMLoaderVersion $env:TMLOADER_VERSION `
+            -Changelog $env:CHANGELOG -OutputDir dist
+          Get-ChildItem dist | ForEach-Object {
+            "$($_.Name)  $((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())"
+          }
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TMFOXR-${{ steps.version.outputs.name }}
+          path: dist/*.zip
+
+      - name: Publish nightly pre-release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.version.outputs.sha }}
+          TMLOADER_VERSION: ${{ steps.version.outputs.tmloader_version }}
+        run: |
+          # Move the nightly tag to this commit, then refresh the release in place.
+          git tag -f nightly $env:GITHUB_SHA
+          git push -f origin refs/tags/nightly
+          $notes = @"
+          Automatic build of master at $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/commit/$env:GITHUB_SHA ($env:SHA).
+          This is untested; use the latest numbered release unless you want the newest changes.
+
+          - ``TMFOXR-nightly.zip``: unzip next to ``TmForever.exe``.
+          - ``TMFOXR-nightly-for-TMLoader.zip``: unzip into ``%LOCALAPPDATA%\TMLoader\database\TmForever\products`` (TMLoader version $env:TMLOADER_VERSION).
+          "@
+          gh release view nightly *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release edit nightly --prerelease --title 'Nightly build' --notes $notes
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            gh release upload nightly (Get-ChildItem dist/*.zip).FullName --clobber
+          }
+          else {
+            gh release create nightly --prerelease --latest=false --title 'Nightly build' --notes $notes (Get-ChildItem dist/*.zip).FullName
+          }
+          exit $LASTEXITCODE
+
+      - name: Create draft release
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG (Get-ChildItem dist/*.zip).FullName --clobber
+          }
+          else {
+            gh release create $env:TAG --draft --verify-tag --title $env:TAG --generate-notes (Get-ChildItem dist/*.zip).FullName
+          }
+          exit $LASTEXITCODE

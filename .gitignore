@@ -2,3 +2,4 @@
 /dlls/
 *.log
 /build-profile
+/dist/
