@@ -51,7 +51,7 @@ You can install this mod manually, or with a mod loader. The manual method takes
 1. Open the mod loader.
 1. Enable the TMFOXR mod
 1. Have your VR headset connected to your PC
-1. Run TmForeverLauncher.exe (or launch "TrackMania Nations/United Forever Settings" in Steam), go to "configure", UNCHECK FULLSCREEN, click "advanced", and **set "antialiasing" to "none"**, then hit "ok", "save", then "play"
+1. If you haven't already, disable AA: Run TmForeverLauncher.exe (or launch "TrackMania Nations/United Forever Settings" in Steam), go to "configure", UNCHECK FULLSCREEN, click "advanced", and **set "antialiasing" to "none"**, then hit "ok", "save", then "play"
 1. You should see the game show up in your headset - seeing a proper 3D globe behind the UI
 
 ## Things U gotta know
@@ -74,10 +74,6 @@ Note that after installing this, you have to actually equip the HD skins in the 
 
 By default, press F10 while in-game to open the VR settings menu.
 
-### TM Vibrant Shaders
-
-[TM Vibrant Shaders](https://github.com/cheatoskar/TM-Vibrant-Shaders) can run together with this mod when both are installed with the mod loader (a version with the VR hand-over). By default its menu (F8) shows in the headset and its effects stay off; turn on *Effects in VR* in its menu and restart the game to have it shade each eye (experimental). `AttachVibrantShaders=0` under `[Compatibility]` in `Documents\TrackMania\TMFOXR.ini` turns the hand-over off, `2` turns the effects on whatever TM Vibrant Shaders' setting says.
-
 ### Note on computing shadows
 
 <img width="551" height="379" alt="computing shadows small" src="https://github.com/user-attachments/assets/35671029-0197-4592-be9b-a83474a8e741" />
@@ -85,6 +81,12 @@ By default, press F10 while in-game to open the VR settings menu.
 Some tracks will try to compute shadows. This takes SO LONG! So when you see it, just cancel it after a couple seconds. If you try to cancel it too quickly, it won't cancel.
 
 If you use CoreMod (which comes included in TrackMania ModLoader) the shadow baking is much faster.
+
+### TM Vibrant Shaders
+
+https://github.com/user-attachments/assets/64f3f73d-20e7-4fac-b4ec-4686b429f05d
+
+[TM Vibrant Shaders](https://github.com/cheatoskar/TM-Vibrant-Shaders) can run together with this mod when both are installed with the mod loader (a version with the VR hand-over). By default its menu (F8) shows in the headset and its effects stay off; turn on *Effects in VR* in its menu and restart the game to have it shade each eye (experimental). `AttachVibrantShaders=0` under `[Compatibility]` in `Documents\TrackMania\TMFOXR.ini` turns the hand-over off, while `2` forces the effects on regardless of TM Vibrant Shaders' setting.
 
 ## Building & more
 
