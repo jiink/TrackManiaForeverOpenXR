@@ -60,24 +60,9 @@ $productPath = Join-Path $databasePath 'products\TMFOXR'
 $versionPath = Join-Path $productPath $Version
 New-Item -ItemType Directory -Path $versionPath -Force | Out-Null
 
-$productDescription = @'
-name: TrackMania Forever OpenXR
-author: jiink
-type: modification
-description: Native stereoscopic OpenXR rendering and headset tracking for TrackMania United Forever. Settings are stored in Documents\TrackMania\TMFOXR.ini.
-'@
-$versionDescription = @"
-executable: TMFOXR.dll
-priority: 1000000000
-dependencies:
-  - id: CoreMod
-    version: ^1.0.11
-changelog: Local development build with TrackMania ModLoader support
-"@
-[System.IO.File]::WriteAllText(
-    (Join-Path $productPath 'description.yaml'), $productDescription.Trim() + "`r`n")
-[System.IO.File]::WriteAllText(
-    (Join-Path $versionPath 'description.yaml'), $versionDescription.Trim() + "`r`n")
+. (Join-Path $scriptRoot 'tmloader-description.ps1')
+Write-TMFOXRTMLoaderDescriptions -ProductPath $productPath -VersionPath $versionPath `
+    -Changelog 'Local development build with TrackMania ModLoader support'
 
 Copy-Item -LiteralPath $resolvedModDll -Destination (Join-Path $versionPath 'TMFOXR.dll') -Force
 Copy-Item -LiteralPath $resolvedOpenXrLoader -Destination (Join-Path $versionPath 'openxr_loader.dll') -Force

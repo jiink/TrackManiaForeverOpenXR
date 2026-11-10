@@ -91,6 +91,33 @@ game's existing Direct3D 9 imports when injected, while the normal installation
 continues to use the same binary as a `d3d9.dll` proxy. Both TMLoader 2.12.0
 and its 2.12.0-compat executable layouts are supported.
 
+## Releases
+
+The `Build and release` GitHub Actions workflow (`.github/workflows/release.yml`)
+builds the mod and packages `TMFOXR-<name>.zip` and
+`TMFOXR-<name>-for-TMLoader.zip` with `scripts/package-release.ps1`:
+
+- Every push to `master` refreshes the **Nightly build** pre-release (tag
+  `nightly`). Its TMLoader version is `<next major>.0.0-dev.<run number>`.
+- Pushing a tag such as `v9` creates a **draft** release `v9` with
+  TMLoader version `9.0.0`. Edit the notes and publish it on GitHub:
+
+  ```powershell
+  git tag v9
+  git push origin v9
+  ```
+
+- Pull requests only build and package; the zips are attached to the workflow run.
+
+To produce the same zips locally after building:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1 -Name v9 -TMLoaderVersion 9.0.0
+```
+
+They are written to `dist\`. The script downloads the pinned Khronos Win32
+OpenXR loader unless `-OpenXrLoader` points at one.
+
 ## Manual install
 
 1. Back up any existing `d3d9.dll` in the TrackMania folder.
