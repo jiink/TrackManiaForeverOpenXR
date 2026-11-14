@@ -369,6 +369,8 @@ struct VrBridge::Impl {
     RenderConfiguration renderConfiguration{};
     bool haveBaseHeadPose = false;
     bool haveHeadPose = false;
+    bool referenceSpaceChangePending = false;
+    XrTime referenceSpaceChangeTime = 0;
     bool haveRenderConfiguration = false;
     bool perspectiveProjectionActive = false;
     D3DSURFACE_DESC activeTarget{};
@@ -902,7 +904,30 @@ struct VrBridge::Impl {
             value.z + rotation.w * twiceCross.z + quaternion.x * twiceCross.y - quaternion.y * twiceCross.x};
     }
 
-    void UpdateHeadPose(const std::vector<XrView>& views, XrViewStateFlags flags) {
+    // OpenXR LOCAL space is gravity-aligned (+Y up). Keep only the heading of
+    // the captured origin so a head that was tilted or rolled when tracking
+    // started does not become the "level" reference for the whole session.
+    static XrQuaternionf YawOnly(const XrQuaternionf& orientation) {
+        XrVector3f forward = Rotate(orientation, {0.0f, 0.0f, -1.0f});
+        float horizontal = std::sqrt(forward.x * forward.x + forward.z * forward.z);
+        if (horizontal < 0.1f) {
+            // Looking nearly straight up/down: the head's up vector points along
+            // (or against) the facing direction instead.
+            const XrVector3f up = Rotate(orientation, {0.0f, 1.0f, 0.0f});
+            const float sign = forward.y < 0.0f ? 1.0f : -1.0f;
+            forward = {up.x * sign, 0.0f, up.z * sign};
+            horizontal = std::sqrt(forward.x * forward.x + forward.z * forward.z);
+            if (horizontal < 0.000001f) return {0.0f, 0.0f, 0.0f, 1.0f};
+        }
+        const float yaw = std::atan2(-forward.x, -forward.z);
+        return {0.0f, std::sin(yaw * 0.5f), 0.0f, std::cos(yaw * 0.5f)};
+    }
+
+    void UpdateHeadPose(const std::vector<XrView>& views, XrViewStateFlags flags, XrTime displayTime) {
+        if (referenceSpaceChangePending && displayTime >= referenceSpaceChangeTime) {
+            referenceSpaceChangePending = false;
+            haveBaseHeadPose = false;
+        }
         constexpr XrViewStateFlags requiredTracking =
             XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
         if (views.size() < 2 || (flags & requiredTracking) != requiredTracking) return;
@@ -912,7 +937,8 @@ struct VrBridge::Impl {
         center.position.y = (views[0].pose.position.y + views[1].pose.position.y) * 0.5f;
         center.position.z = (views[0].pose.position.z + views[1].pose.position.z) * 0.5f;
         if (!haveBaseHeadPose) {
-            baseHeadPose = center;
+            baseHeadPose.position = center.position;
+            baseHeadPose.orientation = YawOnly(center.orientation);
             haveBaseHeadPose = true;
             log::Info("OpenXR head-pose origin captured; headset motion will now drive the stereo camera.");
         }
@@ -1006,6 +1032,7 @@ struct VrBridge::Impl {
         sessionRunning = false;
         haveBaseHeadPose = false;
         haveHeadPose = false;
+        referenceSpaceChangePending = false;
         haveRenderConfiguration = false;
         haveLastPresentComplete = false;
         currentBetweenFrameValid = false;
@@ -1380,6 +1407,15 @@ struct VrBridge::Impl {
                     sessionRunning = false;
                     log::Warn("OpenXR runtime requested session exit/loss; presentation is paused until restart.");
                 }
+            } else if (event.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
+                const auto* changed = reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(&event);
+                if (changed->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL) {
+                    // The user recentered from the runtime/headset menu. Recapture
+                    // the origin once the new LOCAL space takes effect.
+                    referenceSpaceChangePending = true;
+                    referenceSpaceChangeTime = changed->changeTime;
+                    log::Info("OpenXR LOCAL space recentered by the runtime; head-pose origin will be recaptured.");
+                }
             }
             event = XrEventDataBuffer{XR_TYPE_EVENT_DATA_BUFFER};
         }
@@ -1417,7 +1453,7 @@ struct VrBridge::Impl {
                               &viewCount, activeViews.data()), "xrLocateViews") &&
             viewCount == swapchains.size()) {
             activeViewsLocated = true;
-            UpdateHeadPose(activeViews, viewState.viewStateFlags);
+            UpdateHeadPose(activeViews, viewState.viewStateFlags, activeFrameState.predictedDisplayTime);
             UpdateRenderConfiguration(activeViews);
         }
     }
