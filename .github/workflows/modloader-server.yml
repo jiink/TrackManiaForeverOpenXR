@@ -1,0 +1,68 @@
+# Publishes the TrackMania ModLoader (TMLoader) update server on GitHub Pages:
+#
+#   https://<owner>.github.io/<repo>/modloader/        numbered releases
+#   https://<owner>.github.io/<repo>/modloader/beta/   numbered releases + the nightly build
+#
+# People add one of those URLs under `servers:` in %LOCALAPPDATA%\TMLoader\config.yaml and the
+# ModLoader then updates TMFOXR by itself. The site is rebuilt whole from the GitHub releases'
+# TMFOXR-<tag>-for-TMLoader.zip files (scripts/modloader-server.py):
+#
+#   release published/edited/deleted   -> a numbered release appeared or changed
+#   "Build and release" finished on master -> the nightly release was refreshed
+#   workflow_dispatch                   -> rebuild by hand
+#
+# One-time setup: after the first run, Settings -> Pages -> Build and deployment ->
+# Deploy from a branch -> gh-pages, / (root).
+name: ModLoader server
+
+on:
+  release:
+    types: [published, edited, unpublished, deleted]
+  workflow_run:
+    workflows: [Build and release]
+    types: [completed]
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write # push the gh-pages branch
+
+concurrency:
+  group: modloader-server
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # From workflow_run only after a successful push build (that is what refreshed the nightly).
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build index
+        run: |
+          python3 scripts/modloader-server.py build --out-dir site/modloader
+          python3 scripts/modloader-server.py check site/modloader/index.json site/modloader/beta/index.json \
+            --out-dir site/modloader
+          touch site/.nojekyll
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          repo="${GITHUB_REPOSITORY#*/}"
+          for dir in modloader modloader/beta; do
+            printf '<!doctype html><meta charset="utf-8"><title>TMFOXR ModLoader server</title><p>TrackMania ModLoader update server for <a href="https://github.com/%s">TrackMania Forever OpenXR</a>. Add <code>%s</code> under <code>servers:</code> in <code>%%LOCALAPPDATA%%\\TMLoader\\config.yaml</code>. Versions: <a href="index.json">index.json</a>.</p>\n' \
+              "$GITHUB_REPOSITORY" "https://$owner.github.io/$repo/$dir/" > "site/$dir/index.html"
+          done
+
+      # The site is generated whole each time: one fresh commit, force-pushed.
+      - name: Publish to gh-pages
+        run: |
+          cd site
+          git init -q -b gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "ModLoader server for ${GITHUB_SHA::7} (${GITHUB_EVENT_NAME})"
+          git push -f -q "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages

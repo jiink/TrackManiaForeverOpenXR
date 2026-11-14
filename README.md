@@ -41,7 +41,22 @@ You can install this mod manually, or with a mod loader. The manual method takes
 4. Run TmForeverLauncher.exe (or launch "TrackMania United Forever Settings" in Steam), go to "configure", UNCHECK FULLSCREEN, click "advanced", and **set "antialiasing" to "none"**, then hit "ok", "save", then "play"
 5. You should see the game show up in your headset - seeing a proper 3D globe behind the UI
 
-### With mod loader
+### With mod loader (updates itself)
+
+1. Get [Tomashu's TrackMania ModLoader](https://tomashu.dev/software/tmloader/), make sure it works, and launch the game once using it.
+1. Close the mod loader.
+1. Open `%LOCALAPPDATA%\TMLoader\config.yaml` with Notepad and add this line under `servers:`
+
+   ```yaml
+     - 'https://jiink.github.io/TrackManiaForeverOpenXR/modloader/'
+   ```
+
+   (or `https://jiink.github.io/TrackManiaForeverOpenXR/modloader/beta/` to also get the untested nightly builds)
+1. Open the mod loader and enable the TMFOXR mod in your profile. New versions arrive on their own from then on.
+1. Have your VR headset connected to your PC
+1. If you haven't already, disable AA: Run TmForeverLauncher.exe (or launch "TrackMania Nations/United Forever Settings" in Steam), go to "configure", UNCHECK FULLSCREEN, click "advanced", and **set "antialiasing" to "none"**, then hit "ok", "save", then "play"
+
+### With mod loader (manual zip)
 
 1. Get [Tomashu's TrackMania ModLoader](https://tomashu.dev/software/tmloader/)
 1. Make sure it works, launch the game once using it.
