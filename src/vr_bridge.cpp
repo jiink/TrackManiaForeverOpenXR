@@ -9,6 +9,7 @@
 #include <d3d12.h>
 #include <d3d9on12.h>
 #include <dxgi.h>
+#include <dxgi1_4.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/openxr_reflection.h>
@@ -288,6 +289,16 @@ struct VrBridge::Impl {
     std::vector<CachedD3D9On12Wrapper> cachedD3D9On12Wrappers;
     uint64_t d3d9On12WrapperCacheHits = 0;
     uint64_t d3d9On12WrapperCacheMisses = 0;
+    // Private presentation of the game's backbuffer to the desktop window.
+    IDXGISwapChain3* desktopSwapChain = nullptr;
+    std::array<ID3D11Texture2D*, 2> desktopSwapChainBuffers{};
+    HWND desktopPresentWindow = nullptr;
+    bool desktopPresentOwnsWindow = false;
+    SIZE desktopPresentWindowSize{};
+    IDirect3DSurface9* desktopSource9 = nullptr;
+    ID3D12Resource* desktopSource12 = nullptr;
+    ID3D11Texture2D* desktopSourceWrapped = nullptr;
+    bool desktopPresentDisabled = false;
     ID3D11Texture2D* leftEyeSharedTexture = nullptr;
     ID3D11Texture2D* rightEyeSharedTexture = nullptr;
     ID3D11Texture2D* uiSharedTexture = nullptr;
@@ -456,8 +467,217 @@ struct VrBridge::Impl {
         cachedD3D9On12Wrappers.clear();
     }
 
+    void ReleaseDesktopSource() {
+        if (desktopSourceWrapped) {
+            desktopSourceWrapped->Release();
+            // D3D11On12 destroys a wrapper only when its context is flushed, which
+            // has to happen before the underlying resource reference is dropped.
+            if (d3d11Context) d3d11Context->Flush();
+        }
+        desktopSourceWrapped = nullptr;
+        if (desktopSource12) desktopSource12->Release();
+        desktopSource12 = nullptr;
+        if (desktopSource9) desktopSource9->Release();
+        desktopSource9 = nullptr;
+    }
+
+    void ReleaseDesktopPresenter() {
+        ReleaseDesktopSource();
+        bool releasedBuffer = false;
+        for (auto*& buffer : desktopSwapChainBuffers) {
+            if (buffer) {
+                buffer->Release();
+                releasedBuffer = true;
+            }
+            buffer = nullptr;
+        }
+        if (releasedBuffer && d3d11Context) d3d11Context->Flush();
+        if (desktopSwapChain) desktopSwapChain->Release();
+        desktopSwapChain = nullptr;
+        if (desktopPresentWindow && desktopPresentOwnsWindow && !DestroyWindow(desktopPresentWindow)) {
+            PostMessageW(desktopPresentWindow, WM_CLOSE, 0, 0);
+        }
+        desktopPresentWindow = nullptr;
+        desktopPresentOwnsWindow = false;
+        desktopPresentWindowSize = {};
+    }
+
+    void DisableDesktopPresenter(const char* stage, HRESULT result) {
+        log::Warn(std::string("Private desktop-window presentation failed during ") + stage +
+            "; the window is left to D3D9On12's own presentation. HRESULT=" +
+            std::to_string(static_cast<long>(result)) + ".");
+        ReleaseDesktopPresenter();
+        desktopPresentDisabled = true;
+    }
+
+    bool CreateDesktopPresenter(IDirect3DSurface9* backBuffer) {
+        D3DSURFACE_DESC description{};
+        HRESULT result = backBuffer->GetDesc(&description);
+        if (FAILED(result) || description.Format != D3DFMT_A8R8G8B8 ||
+            description.MultiSampleType != D3DMULTISAMPLE_NONE) {
+            DisableDesktopPresenter("backbuffer inspection (an A8R8G8B8 backbuffer is required)",
+                FAILED(result) ? result : E_NOTIMPL);
+            return false;
+        }
+        HWND gameWindow = present.hDeviceWindow;
+        D3DDEVICE_CREATION_PARAMETERS creation{};
+        if (!gameWindow && SUCCEEDED(device->GetCreationParameters(&creation))) gameWindow = creation.hFocusWindow;
+        if (!gameWindow || !IsWindow(gameWindow)) {
+            DisableDesktopPresenter("game window lookup", E_HANDLE);
+            return false;
+        }
+        // Present into a disabled child that covers the client area: mouse input
+        // still reaches the game window, and destroying the child hands the window
+        // back untouched. A child needs the window's own thread to pump its
+        // messages; from any other thread the swapchain goes on the game window.
+        desktopPresentWindow = gameWindow;
+        desktopPresentOwnsWindow = false;
+        RECT client{};
+        GetClientRect(gameWindow, &client);
+        if (GetWindowThreadProcessId(gameWindow, nullptr) == GetCurrentThreadId()) {
+            const HWND child = CreateWindowExW(WS_EX_NOPARENTNOTIFY, L"STATIC", nullptr,
+                WS_CHILD | WS_VISIBLE | WS_DISABLED, 0, 0, client.right, client.bottom,
+                gameWindow, nullptr, GetModuleHandleW(nullptr), nullptr);
+            if (child) {
+                desktopPresentWindow = child;
+                desktopPresentOwnsWindow = true;
+                desktopPresentWindowSize = {client.right, client.bottom};
+            }
+        }
+        IDXGIFactory2* factory = nullptr;
+        result = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+        IDXGISwapChain1* swapChain = nullptr;
+        if (SUCCEEDED(result)) {
+            DXGI_SWAP_CHAIN_DESC1 swapChainDescription{};
+            swapChainDescription.Width = description.Width;
+            swapChainDescription.Height = description.Height;
+            swapChainDescription.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            swapChainDescription.SampleDesc.Count = 1;
+            swapChainDescription.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+            swapChainDescription.BufferCount = static_cast<UINT>(desktopSwapChainBuffers.size());
+            swapChainDescription.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+            swapChainDescription.Scaling = DXGI_SCALING_STRETCH;
+            swapChainDescription.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+            result = factory->CreateSwapChainForHwnd(d3d12TransferQueue, desktopPresentWindow,
+                &swapChainDescription, nullptr, nullptr, &swapChain);
+        }
+        if (SUCCEEDED(result)) {
+            factory->MakeWindowAssociation(desktopPresentWindow,
+                DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER);
+            result = swapChain->QueryInterface(IID_PPV_ARGS(&desktopSwapChain));
+        }
+        if (swapChain) swapChain->Release();
+        if (factory) factory->Release();
+        for (UINT index = 0; SUCCEEDED(result) && index < desktopSwapChainBuffers.size(); ++index) {
+            ID3D12Resource* buffer = nullptr;
+            result = desktopSwapChain->GetBuffer(index, IID_PPV_ARGS(&buffer));
+            if (SUCCEEDED(result)) {
+                D3D11_RESOURCE_FLAGS flags{};
+                flags.BindFlags = D3D11_BIND_RENDER_TARGET;
+                result = d3d11On12Device->CreateWrappedResource(buffer, &flags,
+                    D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PRESENT,
+                    IID_PPV_ARGS(&desktopSwapChainBuffers[index]));
+            }
+            if (SUCCEEDED(result)) {
+                // A new wrapper starts acquired; hand it back until a frame needs it.
+                ID3D11Resource* resources[]{desktopSwapChainBuffers[index]};
+                d3d11On12Device->ReleaseWrappedResources(resources, 1);
+            }
+            if (buffer) buffer->Release();
+        }
+        if (FAILED(result)) {
+            DisableDesktopPresenter("swapchain creation", result);
+            return false;
+        }
+        d3d11Context->Flush();
+        log::Info("Presenting the desktop window through a private DXGI swapchain (" +
+            std::to_string(description.Width) + "x" + std::to_string(description.Height) +
+            (desktopPresentOwnsWindow ? ", child window" : ", game window") +
+            "); D3D9On12's own window presentation can leave the window blank.");
+        return true;
+    }
+
+    // Windows' D3D9On12 can report successful Presents while the window stays
+    // blank (seen on Windows 10 after the October 2026 updates), so the finished
+    // backbuffer is also shown through a swapchain on the D3D12 device beneath it.
+    void PresentDesktop() {
+        if (desktopPresentDisabled || !device || !d3d9On12Device || !d3d11On12Device ||
+            !d3d11Context || !d3d12TransferQueue || !d3d12TransferFence) return;
+        IDirect3DSurface9* backBuffer = nullptr;
+        if (FAILED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer))) return;
+        if (!desktopSwapChain && !CreateDesktopPresenter(backBuffer)) {
+            backBuffer->Release();
+            return;
+        }
+        if (desktopPresentOwnsWindow) {
+            RECT client{};
+            if (GetClientRect(GetParent(desktopPresentWindow), &client) &&
+                (client.right != desktopPresentWindowSize.cx || client.bottom != desktopPresentWindowSize.cy)) {
+                MoveWindow(desktopPresentWindow, 0, 0, client.right, client.bottom, FALSE);
+                desktopPresentWindowSize = {client.right, client.bottom};
+            }
+        }
+        ID3D12Resource* resource12 = nullptr;
+        HRESULT result = d3d9On12Device->UnwrapUnderlyingResource(
+            backBuffer, d3d12TransferQueue, IID_PPV_ARGS(&resource12));
+        if (FAILED(result)) {
+            backBuffer->Release();
+            DisableDesktopPresenter("backbuffer unwrap", result);
+            return;
+        }
+        if (desktopSourceWrapped && (desktopSource9 != backBuffer || desktopSource12 != resource12)) {
+            ReleaseDesktopSource();
+        }
+        if (desktopSourceWrapped) {
+            ID3D11Resource* resources[]{desktopSourceWrapped};
+            d3d11On12Device->AcquireWrappedResources(resources, 1);
+        } else {
+            D3D11_RESOURCE_FLAGS flags{};
+            flags.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            result = d3d11On12Device->CreateWrappedResource(resource12, &flags,
+                D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON,
+                IID_PPV_ARGS(&desktopSourceWrapped));
+            if (SUCCEEDED(result)) {
+                desktopSource9 = backBuffer;
+                desktopSource9->AddRef();
+                desktopSource12 = resource12;
+                desktopSource12->AddRef();
+            }
+        }
+        if (SUCCEEDED(result)) {
+            ID3D11Texture2D* target = desktopSwapChainBuffers[desktopSwapChain->GetCurrentBackBufferIndex()];
+            ID3D11Resource* targets[]{target};
+            d3d11On12Device->AcquireWrappedResources(targets, 1);
+            d3d11Context->CopyResource(target, desktopSourceWrapped);
+            d3d11On12Device->ReleaseWrappedResources(targets, 1);
+            ID3D11Resource* sources[]{desktopSourceWrapped};
+            d3d11On12Device->ReleaseWrappedResources(sources, 1);
+        }
+        // The backbuffer goes back to D3D9On12 whatever happened above, gated on
+        // the fence so D3D9 cannot touch it before the copy has executed.
+        d3d11Context->Flush();
+        ++d3d12TransferFenceValue;
+        const HRESULT signaled = d3d12TransferQueue->Signal(d3d12TransferFence, d3d12TransferFenceValue);
+        ID3D12Fence* fences[]{d3d12TransferFence};
+        UINT64 values[]{d3d12TransferFenceValue};
+        const HRESULT returned = SUCCEEDED(signaled)
+            ? d3d9On12Device->ReturnUnderlyingResource(backBuffer, 1, values, fences)
+            : d3d9On12Device->ReturnUnderlyingResource(backBuffer, 0, nullptr, nullptr);
+        resource12->Release();
+        backBuffer->Release();
+        if (SUCCEEDED(result)) result = FAILED(signaled) ? signaled : returned;
+        if (FAILED(result)) {
+            DisableDesktopPresenter("backbuffer copy", result);
+            return;
+        }
+        result = desktopSwapChain->Present(0, 0);
+        if (FAILED(result)) DisableDesktopPresenter("swapchain Present", result);
+    }
+
     void ReleaseD3D9On12Bridge() {
         if (!pendingD3D9On12Copies.empty()) FinalizeD3D9On12Copies();
+        ReleaseDesktopPresenter();
+        desktopPresentDisabled = false;
         ReleaseCachedD3D9On12Wrappers();
         if (d3d11On12Device) d3d11On12Device->Release();
         d3d11On12Device = nullptr;
@@ -1615,6 +1835,7 @@ void VrBridge::OnBeforePresent(IDirect3DDevice9*) {
     if (!impl_) return;
     std::scoped_lock lock(impl_->mutex);
     impl_->Present();
+    impl_->PresentDesktop();
 }
 
 void VrBridge::OnBeforeReset() {

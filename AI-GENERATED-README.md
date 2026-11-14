@@ -160,6 +160,7 @@ All installation methods read `Documents\TrackMania\TMFOXR.ini`. The install scr
 - `CockpitOffsetUp`: positive moves it upward.
 - `CockpitOffsetForward`: positive moves it toward the front of the car; negative moves it toward the seat.
 - `CockpitNearClip`: nearest visible distance; the 0.05 m default keeps nearby cockpit geometry from being clipped.
+- `FarClipOverride` / `FarClip`: set `FarClipOverride=1` to replace TrackMania's far plane in the headset with `FarClip` metres (50 to 50000) for every camera; `0` keeps the game's own far plane. Both are also in the Camera tab of the settings panel.
 - `HorizonLock`: keeps the headset view level with the world while preserving the car's yaw. It releases smoothly between `HorizonLockReleaseStart` and `HorizonLockReleaseEnd` degrees of car tilt, follows the car through loops and inverted sections, then restores stabilization after the car returns upright.
 
 Each supplied profile has its own starting position. Tune the seven sections for their car interiors; saving `TMFOXR.ini` reloads every profile automatically while the game is running. Keys under `[Camera]` remain supported as fallbacks when a named section is absent. While camera 3 is selected, the mod also overrides TrackMania's request to hide the native player-vehicle model. Set `CockpitEnabled=0` to turn the feature off.

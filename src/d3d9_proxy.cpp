@@ -699,6 +699,8 @@ struct CameraSettings {
     std::array<CameraOffsetProfile, kVehicleProfileCount> vehicleProfiles;
     std::atomic<VehicleProfile> activeVehicleProfile{VehicleProfile::Stadium};
     std::atomic<float> cockpitNearClip{0.05f};
+    std::atomic<bool> farClipOverride{false};
+    std::atomic<float> farClip{5000.0f};
     std::atomic<bool> horizonLock{true};
     std::atomic<float> horizonLockReleaseStart{35.0f};
     std::atomic<float> horizonLockReleaseEnd{70.0f};
@@ -1149,6 +1151,9 @@ void ReadCameraSettings(bool reloaded) {
             kVehicleProfileSections[index]), std::memory_order_relaxed);
     }
     const float nearClip = std::clamp(ReadIniFloat(path, L"CockpitNearClip", 0.05f), 0.01f, 0.5f);
+    const bool farClipOverride =
+        GetPrivateProfileIntW(L"Camera", L"FarClipOverride", 0, path.c_str()) != 0;
+    const float farClip = std::clamp(ReadIniFloat(path, L"FarClip", 5000.0f), 50.0f, 50000.0f);
     const bool horizonLock = GetPrivateProfileIntW(L"Camera", L"HorizonLock", 1, path.c_str()) != 0;
     const float horizonReleaseStart =
         std::clamp(ReadIniFloat(path, L"HorizonLockReleaseStart", 35.0f), 0.0f, 80.0f);
@@ -1179,6 +1184,8 @@ void ReadCameraSettings(bool reloaded) {
     g_cameraSettings.recenterOnTrackingJump.store(recenterOnTrackingJump, std::memory_order_relaxed);
     g_cameraSettings.cockpitEnabled.store(enabled, std::memory_order_relaxed);
     g_cameraSettings.cockpitNearClip.store(nearClip, std::memory_order_relaxed);
+    g_cameraSettings.farClipOverride.store(farClipOverride, std::memory_order_relaxed);
+    g_cameraSettings.farClip.store(farClip, std::memory_order_relaxed);
     g_cameraSettings.horizonLock.store(horizonLock, std::memory_order_relaxed);
     g_cameraSettings.horizonLockReleaseStart.store(horizonReleaseStart, std::memory_order_relaxed);
     g_cameraSettings.horizonLockReleaseEnd.store(horizonReleaseEnd, std::memory_order_relaxed);
@@ -1201,7 +1208,8 @@ void ReadCameraSettings(bool reloaded) {
         std::to_string(activeOffset.up.load(std::memory_order_relaxed)) + "," +
         std::to_string(activeOffset.forward.load(std::memory_order_relaxed)) +
         ") metres, near clip=" + std::to_string(nearClip) +
-        " metres, horizon lock=" + std::to_string(horizonLock) +
+        " metres, far clip=" + (farClipOverride ? std::to_string(farClip) + " metres" : std::string("game default")) +
+        ", horizon lock=" + std::to_string(horizonLock) +
         ", adaptive release=" + std::to_string(horizonReleaseStart) + "-" +
         std::to_string(horizonReleaseEnd) + " degrees, mirror eye to desktop=" +
         std::to_string(mirrorEyeToDesktop) + ", D3D9On12=" + std::to_string(d3d9On12) +
@@ -1291,6 +1299,10 @@ bool SaveSettingsOverlayConfiguration() {
               g_cameraSettings.cockpitEnabled.load(std::memory_order_relaxed));
     writeFloat(L"Camera", L"CockpitNearClip",
                g_cameraSettings.cockpitNearClip.load(std::memory_order_relaxed));
+    writeBool(L"Camera", L"FarClipOverride",
+              g_cameraSettings.farClipOverride.load(std::memory_order_relaxed));
+    writeFloat(L"Camera", L"FarClip",
+               g_cameraSettings.farClip.load(std::memory_order_relaxed));
     writeBool(L"Camera", L"HorizonLock",
               g_cameraSettings.horizonLock.load(std::memory_order_relaxed));
     writeFloat(L"Camera", L"HorizonLockReleaseStart",
@@ -1508,8 +1520,17 @@ void BuildSettingsOverlay() {
             }
             if (ImGui::BeginTabItem("Camera")) {
                 OverlayCheckbox("Enable cockpit camera offset", g_cameraSettings.cockpitEnabled);
+                ImGui::SeparatorText("Clipping planes");
                 OverlaySlider("Near clip", g_cameraSettings.cockpitNearClip,
                               0.01f, 0.50f, "%.3f m");
+                ImGui::TextWrapped("Nearest visible distance while the cockpit camera (camera 3) is active.");
+                OverlayCheckbox("Override far clip", g_cameraSettings.farClipOverride);
+                ImGui::BeginDisabled(!g_cameraSettings.farClipOverride.load(std::memory_order_relaxed));
+                OverlaySlider("Far clip", g_cameraSettings.farClip, 50.0f, 50000.0f, "%.0f m",
+                              ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_Logarithmic);
+                ImGui::EndDisabled();
+                ImGui::TextWrapped("Farthest visible distance in the headset, for every camera. "
+                                   "When off, TrackMania's own far plane is used.");
                 ImGui::SeparatorText("Horizon lock");
                 OverlayCheckbox("Enable horizon lock", g_cameraSettings.horizonLock);
                 float releaseStart = g_cameraSettings.horizonLockReleaseStart.load(std::memory_order_relaxed);
@@ -2711,9 +2732,17 @@ Matrix4 EyeProjection(bool rightEye) {
     // Retain TrackMania's near/far depth mapping while replacing only FOV.
     projection[10] = gameProjection[10];
     projection[11] = gameProjection[11];
-    if (CockpitCameraActive() && gameProjection[10] > 1.0f && gameProjection[11] < 0.0f) {
-        const float farClip = -gameProjection[11] / (gameProjection[10] - 1.0f);
-        const float nearClip = g_cameraSettings.cockpitNearClip.load(std::memory_order_relaxed);
+    const bool cockpitNearClip = CockpitCameraActive();
+    const bool farClipOverride = g_cameraSettings.farClipOverride.load(std::memory_order_relaxed);
+    if ((cockpitNearClip || farClipOverride) && gameProjection[10] > 1.0f && gameProjection[11] < 0.0f) {
+        // D3D's projection stores far/(far-near) and -near*far/(far-near): recover
+        // TrackMania's planes so each override leaves the other plane as the game set it.
+        const float farClip = farClipOverride
+            ? g_cameraSettings.farClip.load(std::memory_order_relaxed)
+            : -gameProjection[11] / (gameProjection[10] - 1.0f);
+        const float nearClip = cockpitNearClip
+            ? g_cameraSettings.cockpitNearClip.load(std::memory_order_relaxed)
+            : -gameProjection[11] / gameProjection[10];
         if (std::isfinite(farClip) && farClip > nearClip) {
             projection[10] = farClip / (farClip - nearClip);
             projection[11] = -nearClip * projection[10];
@@ -4547,8 +4576,12 @@ void DisableVrForIncompatibleGraphics(HWND owner, bool fullscreen, D3DMULTISAMPL
 // is loaded in this process. TMVS normally finds the device through its own Direct3DCreate9 import
 // patch, but this proxy replaces that import after TMVS patched it, and the factory this proxy wraps
 // (D3D9On12) is not the one TMVS patched, so TMVS would never see the device (no F8 menu, no effects).
-// Called before any hook of ours is written into the device's method table, so TMVS hooks the
-// device's code first and our table hooks sit on top.
+// Called once our own hooks are in the device's method table. TMVS 1.6 also hooks CreateDevice on
+// this proxy's factory and hooks, at its entry, whatever each device method slot points to when our
+// CreateDevice returns. Handing the device over before our hooks made it hook d3d9's functions and
+// then ours as well; it finds a method's original by the slot's current value, so the two layers
+// called each other until the stack overflowed. Attached after our hooks, every slot is hooked once
+// (ours where we replaced it, d3d9's elsewhere) and its later pass finds them all already hooked.
 // [Compatibility] AttachVibrantShaders in TMFOXR.ini: 0 = off, 1 = TMVS's own setting decides
 // (Effects in VR in its menu; off: it only watches and draws its menu, the default), 2 = TMVS shades
 // the eyes whatever its setting says (experimental, may break VR rendering). The eye provider and the
@@ -4676,7 +4709,6 @@ public:
             tmoxr::log::Info("D3D9 device created: " + std::to_string(parameters->BackBufferWidth) + "x" +
                 std::to_string(parameters->BackBufferHeight) + ", windowed=" + std::to_string(parameters->Windowed != FALSE) +
                 ", presentation interval=" + std::to_string(parameters->PresentationInterval) + ".");
-            AttachVibrantShaders(*device);
             tmoxr::VrBridge::Instance().OnDeviceCreated(*device, *parameters);
             if (!tmoxr::VrBridge::Instance().TryInitialize()) {
                 tmoxr::VrBridge::Instance().Shutdown();
@@ -4708,7 +4740,10 @@ public:
             }
 
             InstallVideoMemoryHook(*device);
-            if (InstallDeviceHooks(*device)) {
+            const bool deviceHooksInstalled = InstallDeviceHooks(*device);
+            // Before the stereo resources: TMVS swaps in its readable depth buffer while attaching.
+            AttachVibrantShaders(*device);
+            if (deviceHooksInstalled) {
                 const HWND gameWindow = parameters->hDeviceWindow ? parameters->hDeviceWindow : window;
                 LockGameWindowSize(gameWindow);
                 if (CreateStereoResources(*device)) InitializeSettingsOverlay(*device, gameWindow);
