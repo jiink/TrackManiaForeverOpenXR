@@ -25,6 +25,7 @@ add_library(d3d9 SHARED
   src/d3d9_proxy.cpp
   src/large_address_aware.cpp
   src/log.cpp
+  src/meta_runtime_workaround.cpp
   src/runtime_paths.cpp
   src/vr_bridge.cpp
   src/d3d9_proxy.def
@@ -53,6 +54,22 @@ add_executable(d3d9on12_compat_smoke EXCLUDE_FROM_ALL tests/d3d9on12_compat_smok
 target_compile_features(d3d9on12_compat_smoke PRIVATE cxx_std_20)
 target_compile_definitions(d3d9on12_compat_smoke PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(d3d9on12_compat_smoke PRIVATE dxguid d3d11 d3d12)
+
+# Creates an OpenXR session outside the game; "nofix" reproduces the Meta
+# 32-bit runtime crash that src/meta_runtime_workaround.cpp avoids.
+add_executable(openxr_session_probe EXCLUDE_FROM_ALL
+  tests/openxr_session_probe.cpp
+  src/meta_runtime_workaround.cpp
+)
+target_compile_features(openxr_session_probe PRIVATE cxx_std_20)
+target_compile_definitions(openxr_session_probe PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(openxr_session_probe PRIVATE
+  src
+  "${openxr_headers_SOURCE_DIR}/src"
+  "${openxr_headers_BINARY_DIR}/include"
+)
+target_link_libraries(openxr_session_probe PRIVATE dxguid d3d11 d3d12 dxgi)
+add_dependencies(openxr_session_probe headers)
 
 add_executable(tmloader_iat_smoke EXCLUDE_FROM_ALL tests/tmloader_iat_smoke.cpp)
 target_compile_features(tmloader_iat_smoke PRIVATE cxx_std_20)

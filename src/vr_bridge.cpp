@@ -1,6 +1,7 @@
 #include "vr_bridge.h"
 
 #include "log.h"
+#include "meta_runtime_workaround.h"
 #include "runtime_paths.h"
 
 #include <Windows.h>
@@ -310,6 +311,7 @@ struct VrBridge::Impl {
     bool initialized = false;
     bool permanentlyDisabled = false;
     bool startupFailureShown = false;
+    bool metaRuntimeWorkaroundLogged = false;
     std::vector<std::string> enabledImplicitApiLayers;
     bool sessionRunning = false;
     bool copyFailureLogged = false;
@@ -1010,6 +1012,17 @@ struct VrBridge::Impl {
         activeFrameState = XrFrameState{XR_TYPE_FRAME_STATE};
     }
 
+    // Without this, Meta's 32-bit runtime crashes the process from a worker
+    // thread during xrCreateSession; see meta_runtime_workaround.h.
+    void ApplyMetaRuntimeWorkaround() {
+        const unsigned redirected = HideThreadDescriptionFromMetaRuntime();
+        if (!redirected || metaRuntimeWorkaroundLogged) return;
+        metaRuntimeWorkaroundLogged = true;
+        log::Info("Meta 32-bit OpenXR runtime detected; hid SetThreadDescription from " +
+            std::to_string(redirected) +
+            " runtime import slots to avoid its calling-convention crash in xrCreateSession.");
+    }
+
     bool LoadFunctions() {
         const bool required = LoadProc(getProc, instance, "xrDestroyInstance", destroyInstance) &&
             LoadProc(getProc, instance, "xrGetInstanceProperties", getInstanceProperties) &&
@@ -1278,6 +1291,7 @@ struct VrBridge::Impl {
             return DisableAfterStartupFailure("creating the OpenXR instance", Result(instanceResult),
                 "Check that the selected Win32 OpenXR runtime is installed and running correctly.");
         }
+        ApplyMetaRuntimeWorkaround();
         if (!LoadFunctions()) {
             return DisableAfterStartupFailure("loading OpenXR runtime functions", "a required OpenXR function is unavailable",
                 "The selected runtime may be incompatible. See TMFOXR.log for the missing function.");
@@ -1324,6 +1338,8 @@ struct VrBridge::Impl {
         XrSessionCreateInfo sessionInfo{XR_TYPE_SESSION_CREATE_INFO};
         sessionInfo.next = &binding;
         sessionInfo.systemId = system;
+        // Again, for runtime modules loaded since the instance was created.
+        ApplyMetaRuntimeWorkaround();
         const XrResult sessionResult = createSession(instance, &sessionInfo, &session);
         if (!Check(sessionResult, "xrCreateSession")) {
             return DisableAfterStartupFailure("creating the OpenXR headset session", Result(sessionResult),
