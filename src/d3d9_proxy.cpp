@@ -1813,7 +1813,10 @@ struct StereoResources {
     tmoxr::RenderConfiguration renderConfiguration{};
     std::array<Matrix4, 2> eyeClipAdjustments{};
     std::array<bool, 2> eyeClipAdjustmentValid{};
-    bool haveView = false;
+    // Rotation-only clip adjustments for far-plane-locked (sky) draws.
+    std::array<Matrix4, 2> farClipAdjustments{};
+    std::array<bool, 2> farClipAdjustmentValid{};
+    bool farPlaneLockedLogWritten = false;    bool haveView = false;
     bool haveGameViewport = false;
     bool haveHeadPose = false;
     bool haveRenderConfiguration = false;
@@ -2947,6 +2950,116 @@ Matrix4 ApplyHeadPoseToCombinedMatrix(const Matrix4& original, float eyeOffsetMe
     return MultiplyMatrix(g_stereo.eyeClipAdjustments[eye], original);
 }
 
+// TrackMania draws its sky with a clip-space z row that is a copy of the w row
+// (z/w just below 1), pinning every sky vertex to the far plane. Un-projecting
+// that through the scene projection divides a ~1e-6 float difference by the
+// near-plane term, so the sky lands at a noisy, direction-dependent finite
+// distance: it is far-clipped as the head turns (the gradient appears to follow
+// the gaze) and picks up IPD/seat parallax (each eye sees a different sky when
+// the horizon lock is correcting a banked car). Detect that shape and report the
+// constant depth ratio so the draw can be rotated as a direction at infinity.
+bool IsFarPlaneLockedMatrix(const Matrix4& original, float& depthRatio) {
+    const Matrix4 projection = TransposedProjection();
+    if (std::abs(projection[14] - 1.0f) > 0.001f || std::abs(projection[15]) > 0.001f) {
+        return false;
+    }
+    const float* depthRow = original.data() + 8;
+    const float* wRow = original.data() + 12;
+    const float wLengthSquared = wRow[0] * wRow[0] + wRow[1] * wRow[1] + wRow[2] * wRow[2];
+    if (!(wLengthSquared > 1e-12f)) return false;
+    const float ratio = (depthRow[0] * wRow[0] + depthRow[1] * wRow[1] + depthRow[2] * wRow[2]) /
+        wLengthSquared;
+    // Ordinary geometry has depthRow = A * wRow + (0, 0, 0, B), leaving exactly
+    // the projection's near term B (about -near, i.e. centimetres to metres) in
+    // the translation residual. A far-locked draw has no residual beyond float
+    // noise, which scales with the row's translation magnitude. Do not compare
+    // against the bound D3DTS_PROJECTION: TrackMania binds the sky's own
+    // far-locked projection there (near term exactly 0), which is also why the
+    // generic inverse-projection path cannot place the sky.
+    const float residual = depthRow[3] - ratio * wRow[3];
+    const float noiseTolerance = 0.003f + 4e-7f * std::abs(wRow[3]);
+    const bool accepted = std::isfinite(ratio) && std::isfinite(residual) &&
+        std::abs(ratio - 1.0f) < 0.001f && std::abs(residual) <= noiseTolerance;
+    if (!accepted) return false;
+    depthRatio = std::min(ratio, 1.0f);
+    return true;
+}
+
+bool InvertMatrix3(const float (&input)[3][3], float (&inverse)[3][3]) {
+    const float c00 = input[1][1] * input[2][2] - input[1][2] * input[2][1];
+    const float c01 = input[1][2] * input[2][0] - input[1][0] * input[2][2];
+    const float c02 = input[1][0] * input[2][1] - input[1][1] * input[2][0];
+    const float determinant = input[0][0] * c00 + input[0][1] * c01 + input[0][2] * c02;
+    if (!std::isfinite(determinant) || std::abs(determinant) < 1e-12f) return false;
+    const float scale = 1.0f / determinant;
+    inverse[0][0] = c00 * scale;
+    inverse[1][0] = c01 * scale;
+    inverse[2][0] = c02 * scale;
+    inverse[0][1] = (input[0][2] * input[2][1] - input[0][1] * input[2][2]) * scale;
+    inverse[1][1] = (input[0][0] * input[2][2] - input[0][2] * input[2][0]) * scale;
+    inverse[2][1] = (input[0][1] * input[2][0] - input[0][0] * input[2][1]) * scale;
+    inverse[0][2] = (input[0][1] * input[1][2] - input[0][2] * input[1][1]) * scale;
+    inverse[1][2] = (input[0][2] * input[1][0] - input[0][0] * input[1][2]) * scale;
+    inverse[2][2] = (input[0][0] * input[1][1] - input[0][1] * input[1][0]) * scale;
+    return true;
+}
+
+// Re-aims a far-plane-locked draw using only the headset (plus horizon-lock)
+// rotation. Clip x, y and w are linear in the game-camera-space direction, so
+// recover that direction from those three rows alone, never touching the
+// ill-conditioned depth row, rotate it, and project it with the eye's FOV.
+// Translation (seat offset, head movement, IPD) is deliberately ignored: the
+// sky is infinitely far away, so both eyes must see it identically.
+bool ApplyHeadPoseToFarPlaneMatrix(const Matrix4& original, float depthRatio, bool rightEye,
+                                   Matrix4& result) {
+    const size_t eye = rightEye ? 1u : 0u;
+    if (!g_stereo.farClipAdjustmentValid[eye]) {
+        constexpr UINT clipRows[3] = {0, 1, 3};
+        const Matrix4 projection = TransposedProjection();
+        const Matrix4 eyeProjection = EyeProjection(rightEye);
+        const Matrix4 headView = HeadViewMatrix(0.0f);
+        float gameSub[3][3]{};
+        float eyeSub[3][3]{};
+        for (UINT row = 0; row < 3; ++row) {
+            for (UINT column = 0; column < 3; ++column) {
+                gameSub[row][column] = projection[clipRows[row] * 4 + column];
+                eyeSub[row][column] = eyeProjection[clipRows[row] * 4 + column];
+            }
+        }
+        float clipToDirection[3][3]{};
+        if (!InvertMatrix3(gameSub, clipToDirection)) return false;
+        float rotatedDirection[3][3]{};
+        for (UINT row = 0; row < 3; ++row) {
+            for (UINT column = 0; column < 3; ++column) {
+                for (UINT inner = 0; inner < 3; ++inner) {
+                    rotatedDirection[row][column] +=
+                        headView[row * 4 + inner] * clipToDirection[inner][column];
+                }
+            }
+        }
+        Matrix4 adjustment{};
+        for (UINT row = 0; row < 3; ++row) {
+            for (UINT column = 0; column < 3; ++column) {
+                float value = 0.0f;
+                for (UINT inner = 0; inner < 3; ++inner) {
+                    value += eyeSub[row][inner] * rotatedDirection[inner][column];
+                }
+                adjustment[clipRows[row] * 4 + clipRows[column]] = value;
+            }
+        }
+        g_stereo.farClipAdjustments[eye] = adjustment;
+        g_stereo.farClipAdjustmentValid[eye] = true;
+    }
+    Matrix4 adjustment = g_stereo.farClipAdjustments[eye];
+    // Keep the game's own constant depth just inside the far plane, independent
+    // of the eye projection's near/far planes.
+    for (UINT column = 0; column < 4; ++column) {
+        adjustment[8 + column] = depthRatio * adjustment[12 + column];
+    }
+    result = MultiplyMatrix(adjustment, original);
+    return true;
+}
+
 D3DMATRIX MultiplyD3DMatrix(const D3DMATRIX& a, const D3DMATRIX& b) {
     D3DMATRIX result{};
     const float* left = &a._11;
@@ -3009,7 +3122,18 @@ ShaderEyeState CaptureShaderEyeState(IDirect3DDevice9* device) {
 
 void ApplyShaderEyeState(IDirect3DDevice9* device, const ShaderEyeState& state, float eyeOffsetMeters, bool rightEye) {
     if (!state.active) return;
-    const auto matrix = ApplyHeadPoseToCombinedMatrix(state.original, eyeOffsetMeters, rightEye);
+    float depthRatio = 1.0f;
+    Matrix4 matrix{};
+    if (IsFarPlaneLockedMatrix(state.original, depthRatio) &&
+        ApplyHeadPoseToFarPlaneMatrix(state.original, depthRatio, rightEye, matrix)) {
+        if (!g_stereo.farPlaneLockedLogWritten) {
+            g_stereo.farPlaneLockedLogWritten = true;
+            tmoxr::log::Info("Rendering far-plane-locked shader draw (sky) with rotation-only stereo; depth ratio=" +
+                std::to_string(depthRatio) + ".");
+        }
+    } else {
+        matrix = ApplyHeadPoseToCombinedMatrix(state.original, eyeOffsetMeters, rightEye);
+    }
     g_originalSetVertexShaderConstantF(device, state.baseRegister, matrix.data(), 4);
     if (!g_stereo.shaderPositionLogWritten) {
         g_stereo.shaderPositionLogWritten = true;
@@ -3787,6 +3911,7 @@ HRESULT STDMETHODCALLTYPE BeginSceneHook(IDirect3DDevice9* device) {
     // scene. Rebuild their clip-space adjustments once per eye on demand,
     // instead of repeating the inversions and horizon-lock math for every draw.
     g_stereo.eyeClipAdjustmentValid.fill(false);
+    g_stereo.farClipAdjustmentValid.fill(false);
     UpdateRenderTreeCullingCache();
     const HRESULT result = g_originalBeginScene(device);
     g_stereo.sceneActive = SUCCEEDED(result);
@@ -3840,6 +3965,7 @@ HRESULT STDMETHODCALLTYPE SetTransformHook(IDirect3DDevice9* device, D3DTRANSFOR
     }
     if (state == D3DTS_PROJECTION && matrix) {
         g_stereo.eyeClipAdjustmentValid.fill(false);
+        g_stereo.farClipAdjustmentValid.fill(false);
         const bool nextPerspective = std::abs(matrix->_34) > 0.5f;
         if (g_stereo.perspective && !nextPerspective) FlushDesktopEyeMirror(device);
         g_stereo.projection = *matrix;
