@@ -31,6 +31,7 @@
 #include <intrin.h>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -701,6 +702,7 @@ struct CameraSettings {
     std::atomic<float> cockpitNearClip{0.05f};
     std::atomic<bool> farClipOverride{false};
     std::atomic<float> farClip{5000.0f};
+    std::atomic<bool> disableClouds{false};
     std::atomic<bool> horizonLock{true};
     std::atomic<float> horizonLockReleaseStart{35.0f};
     std::atomic<float> horizonLockReleaseEnd{70.0f};
@@ -1154,6 +1156,8 @@ void ReadCameraSettings(bool reloaded) {
     const bool farClipOverride =
         GetPrivateProfileIntW(L"Camera", L"FarClipOverride", 0, path.c_str()) != 0;
     const float farClip = std::clamp(ReadIniFloat(path, L"FarClip", 5000.0f), 50.0f, 50000.0f);
+    const bool disableClouds =
+        GetPrivateProfileIntW(L"Graphics", L"DisableClouds", 0, path.c_str()) != 0;
     const bool horizonLock = GetPrivateProfileIntW(L"Camera", L"HorizonLock", 1, path.c_str()) != 0;
     const float horizonReleaseStart =
         std::clamp(ReadIniFloat(path, L"HorizonLockReleaseStart", 35.0f), 0.0f, 80.0f);
@@ -1186,6 +1190,7 @@ void ReadCameraSettings(bool reloaded) {
     g_cameraSettings.cockpitNearClip.store(nearClip, std::memory_order_relaxed);
     g_cameraSettings.farClipOverride.store(farClipOverride, std::memory_order_relaxed);
     g_cameraSettings.farClip.store(farClip, std::memory_order_relaxed);
+    g_cameraSettings.disableClouds.store(disableClouds, std::memory_order_relaxed);
     g_cameraSettings.horizonLock.store(horizonLock, std::memory_order_relaxed);
     g_cameraSettings.horizonLockReleaseStart.store(horizonReleaseStart, std::memory_order_relaxed);
     g_cameraSettings.horizonLockReleaseEnd.store(horizonReleaseEnd, std::memory_order_relaxed);
@@ -1209,6 +1214,7 @@ void ReadCameraSettings(bool reloaded) {
         std::to_string(activeOffset.forward.load(std::memory_order_relaxed)) +
         ") metres, near clip=" + std::to_string(nearClip) +
         " metres, far clip=" + (farClipOverride ? std::to_string(farClip) + " metres" : std::string("game default")) +
+        ", clouds disabled=" + std::to_string(disableClouds) +
         ", horizon lock=" + std::to_string(horizonLock) +
         ", adaptive release=" + std::to_string(horizonReleaseStart) + "-" +
         std::to_string(horizonReleaseEnd) + " degrees, mirror eye to desktop=" +
@@ -1303,6 +1309,8 @@ bool SaveSettingsOverlayConfiguration() {
               g_cameraSettings.farClipOverride.load(std::memory_order_relaxed));
     writeFloat(L"Camera", L"FarClip",
                g_cameraSettings.farClip.load(std::memory_order_relaxed));
+    writeBool(L"Graphics", L"DisableClouds",
+              g_cameraSettings.disableClouds.load(std::memory_order_relaxed));
     writeBool(L"Camera", L"HorizonLock",
               g_cameraSettings.horizonLock.load(std::memory_order_relaxed));
     writeFloat(L"Camera", L"HorizonLockReleaseStart",
@@ -1569,6 +1577,12 @@ void BuildSettingsOverlay() {
                 OverlaySlider("Right / left", profile.right, -2.0f, 2.0f, "%.3f m");
                 OverlaySlider("Up / down", profile.up, -2.0f, 2.0f, "%.3f m");
                 OverlaySlider("Forward / back", profile.forward, -2.0f, 2.0f, "%.3f m");
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Graphics")) {
+                OverlayCheckbox("Disable clouds", g_cameraSettings.disableClouds);
+                ImGui::TextWrapped("Skips the alpha-blended cloud layers TrackMania draws on the sky. "
+                                   "The sky itself is still drawn.");
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Performance")) {
@@ -1883,6 +1897,7 @@ struct StereoResources {
     IDirect3DVertexShader9* vertexShader = nullptr;
     std::vector<IDirect3DVertexShader9*> analyzedShaders;
     std::vector<ShaderPositionInfo> shaderPositionInfo;
+    uint64_t skippedCloudDraws = 0;
     bool shaderPositionLogWritten = false;
     UINT primaryWidth = 0;
     UINT primaryHeight = 0;
@@ -3060,6 +3075,37 @@ bool ApplyHeadPoseToFarPlaneMatrix(const Matrix4& original, float depthRatio, bo
     return true;
 }
 
+// TrackMania draws its clouds as alpha-blended layers on top of the opaque
+// sky dome, using the same far-plane-locked projection as the sky. Treat any
+// far-locked draw with conventional (non-additive) alpha blending as a cloud
+// layer; additive far-locked draws (sun glow, flares) and the opaque dome stay.
+bool IsCloudDraw(IDirect3DDevice9* device, const std::array<float, 16>& matrix) {
+    float depthRatio = 1.0f;
+    if (!IsFarPlaneLockedMatrix(matrix, depthRatio)) return false;
+    DWORD alphaBlend = FALSE;
+    DWORD sourceBlend = D3DBLEND_ONE;
+    DWORD destinationBlend = D3DBLEND_ZERO;
+    if (FAILED(device->GetRenderState(D3DRS_ALPHABLENDENABLE, &alphaBlend)) ||
+        FAILED(device->GetRenderState(D3DRS_SRCBLEND, &sourceBlend)) ||
+        FAILED(device->GetRenderState(D3DRS_DESTBLEND, &destinationBlend))) return false;
+    const bool cloud = alphaBlend && destinationBlend != D3DBLEND_ONE &&
+        destinationBlend != D3DBLEND_ZERO;
+    if (g_cameraSettings.verboseDiagnostics.load(std::memory_order_relaxed)) {
+        static std::vector<std::tuple<void*, DWORD, DWORD, DWORD>> logged;
+        const auto key = std::make_tuple(static_cast<void*>(g_stereo.vertexShader),
+                                         alphaBlend, sourceBlend, destinationBlend);
+        if (logged.size() < 64 && std::find(logged.begin(), logged.end(), key) == logged.end()) {
+            logged.push_back(key);
+            std::ostringstream text;
+            text << "Far-plane-locked draw: shader=" << g_stereo.vertexShader
+                 << ", alpha blend=" << alphaBlend << ", src=" << sourceBlend
+                 << ", dest=" << destinationBlend << ", treated as cloud=" << cloud << ".";
+            tmoxr::log::Info(text.str());
+        }
+    }
+    return cloud;
+}
+
 D3DMATRIX MultiplyD3DMatrix(const D3DMATRIX& a, const D3DMATRIX& b) {
     D3DMATRIX result{};
     const float* left = &a._11;
@@ -4099,6 +4145,11 @@ HRESULT STDMETHODCALLTYPE DrawPrimitiveHook(IDirect3DDevice9* device, D3DPRIMITI
     AnalyzeVertexShader(g_stereo.vertexShader);
     const ShaderEyeState shaderEye = CaptureShaderEyeState(device);
     PrepareDeferredShaderEyeState(device, shaderEye);
+    if (shaderEye.active && g_cameraSettings.disableClouds.load(std::memory_order_relaxed) &&
+        IsCloudDraw(device, shaderEye.original)) {
+        ++g_stereo.skippedCloudDraws;
+        return D3D_OK;
+    }
     const D3DVIEWPORT9 gameViewport = g_stereo.gameViewport;
     const bool haveGameViewport = g_stereo.haveGameViewport;
     const bool setEyeViewport = !haveGameViewport || gameViewport.X != 0 || gameViewport.Y != 0 ||
@@ -4174,6 +4225,11 @@ HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveHook(IDirect3DDevice9* device, D3D
     AnalyzeVertexShader(g_stereo.vertexShader);
     const ShaderEyeState shaderEye = CaptureShaderEyeState(device);
     PrepareDeferredShaderEyeState(device, shaderEye);
+    if (shaderEye.active && g_cameraSettings.disableClouds.load(std::memory_order_relaxed) &&
+        IsCloudDraw(device, shaderEye.original)) {
+        ++g_stereo.skippedCloudDraws;
+        return D3D_OK;
+    }
     const D3DVIEWPORT9 gameViewport = g_stereo.gameViewport;
     const bool haveGameViewport = g_stereo.haveGameViewport;
     const bool setEyeViewport = !haveGameViewport || gameViewport.X != 0 || gameViewport.Y != 0 ||
