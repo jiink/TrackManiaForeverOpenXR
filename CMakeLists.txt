@@ -27,6 +27,7 @@ add_library(d3d9 SHARED
   src/log.cpp
   src/meta_runtime_workaround.cpp
   src/runtime_paths.cpp
+  src/virtual_joypad.cpp
   src/vr_bridge.cpp
   src/d3d9_proxy.def
   ${dear_imgui_SOURCE_DIR}/imgui.cpp
@@ -92,6 +93,16 @@ add_executable(large_address_aware_smoke EXCLUDE_FROM_ALL
 target_compile_features(large_address_aware_smoke PRIVATE cxx_std_20)
 target_compile_definitions(large_address_aware_smoke PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(large_address_aware_smoke PRIVATE src)
+
+# Runs the DirectInput wrapper with fake VR controller input, outside the game.
+add_executable(virtual_joypad_smoke EXCLUDE_FROM_ALL
+  tests/virtual_joypad_smoke.cpp
+  src/virtual_joypad.cpp
+)
+target_compile_features(virtual_joypad_smoke PRIVATE cxx_std_20)
+target_compile_definitions(virtual_joypad_smoke PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(virtual_joypad_smoke PRIVATE src)
+target_link_libraries(virtual_joypad_smoke PRIVATE dinput8 dxguid user32)
 
 set_target_properties(d3d9 PROPERTIES
   OUTPUT_NAME "d3d9"

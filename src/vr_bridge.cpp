@@ -1,5 +1,6 @@
 #include "vr_bridge.h"
 
+#include "controller_input.h"
 #include "log.h"
 #include "meta_runtime_workaround.h"
 #include "runtime_paths.h"
@@ -251,6 +252,41 @@ struct VrBridge::Impl {
     PFN_xrAcquireSwapchainImage acquireImage = nullptr;
     PFN_xrWaitSwapchainImage waitImage = nullptr;
     PFN_xrReleaseSwapchainImage releaseImage = nullptr;
+    // VR controller input. Optional: VR still runs without it.
+    PFN_xrStringToPath stringToPath = nullptr;
+    PFN_xrPathToString pathToString = nullptr;
+    PFN_xrCreateActionSet createActionSet = nullptr;
+    PFN_xrCreateAction createAction = nullptr;
+    PFN_xrSuggestInteractionProfileBindings suggestBindings = nullptr;
+    PFN_xrAttachSessionActionSets attachActionSets = nullptr;
+    PFN_xrSyncActions syncActions = nullptr;
+    PFN_xrGetActionStateBoolean getActionBoolean = nullptr;
+    PFN_xrGetActionStateFloat getActionFloat = nullptr;
+    PFN_xrGetActionStateVector2f getActionVector2f = nullptr;
+    PFN_xrGetCurrentInteractionProfile getInteractionProfile = nullptr;
+
+    struct ControllerActions {
+        XrActionSet set = XR_NULL_HANDLE;
+        XrAction leftStick = XR_NULL_HANDLE;
+        XrAction rightStick = XR_NULL_HANDLE;
+        XrAction leftTrigger = XR_NULL_HANDLE;
+        XrAction rightTrigger = XR_NULL_HANDLE;
+        XrAction leftGrip = XR_NULL_HANDLE;
+        XrAction rightGrip = XR_NULL_HANDLE;
+        XrAction a = XR_NULL_HANDLE;
+        XrAction b = XR_NULL_HANDLE;
+        XrAction x = XR_NULL_HANDLE;
+        XrAction y = XR_NULL_HANDLE;
+        XrAction menu = XR_NULL_HANDLE;
+        XrAction leftStickClick = XR_NULL_HANDLE;
+        XrAction rightStickClick = XR_NULL_HANDLE;
+    } controllerActions;
+    bool controllerInputReady = false;
+    bool controllerNeutralPublished = true;
+    bool controllerActiveLogged = false;
+    bool controllerSyncFailureLogged = false;
+    uint32_t controllerButtons = 0;
+    XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
 
     XrInstance instance = XR_NULL_HANDLE;
     XrSystemId system = XR_NULL_SYSTEM_ID;
@@ -1028,6 +1064,11 @@ struct VrBridge::Impl {
         d3d11Context = nullptr;
         if (d3d11Device) d3d11Device->Release();
         d3d11Device = nullptr;
+        // Actions belong to the destroyed instance.
+        controllerActions = ControllerActions{};
+        controllerInputReady = false;
+        PublishNeutralControllers();
+        sessionState = XR_SESSION_STATE_UNKNOWN;
         initialized = false;
         sessionRunning = false;
         haveBaseHeadPose = false;
@@ -1076,6 +1117,243 @@ struct VrBridge::Impl {
             LoadProc(getProc, instance, "xrReleaseSwapchainImage", releaseImage);
         if (!required) return false;
         return true;
+    }
+
+    bool LoadInputFunctions() {
+        return LoadProc(getProc, instance, "xrStringToPath", stringToPath) &&
+            LoadProc(getProc, instance, "xrPathToString", pathToString) &&
+            LoadProc(getProc, instance, "xrCreateActionSet", createActionSet) &&
+            LoadProc(getProc, instance, "xrCreateAction", createAction) &&
+            LoadProc(getProc, instance, "xrSuggestInteractionProfileBindings", suggestBindings) &&
+            LoadProc(getProc, instance, "xrAttachSessionActionSets", attachActionSets) &&
+            LoadProc(getProc, instance, "xrSyncActions", syncActions) &&
+            LoadProc(getProc, instance, "xrGetActionStateBoolean", getActionBoolean) &&
+            LoadProc(getProc, instance, "xrGetActionStateFloat", getActionFloat) &&
+            LoadProc(getProc, instance, "xrGetActionStateVector2f", getActionVector2f) &&
+            LoadProc(getProc, instance, "xrGetCurrentInteractionProfile", getInteractionProfile);
+    }
+
+    using SuggestedBinding = std::pair<XrAction, const char*>;
+
+    // A profile the runtime rejects only loses that profile's bindings.
+    bool SuggestProfile(const char* profile, const std::vector<SuggestedBinding>& bindings) {
+        XrPath profilePath = XR_NULL_PATH;
+        if (!Check(stringToPath(instance, profile, &profilePath), "xrStringToPath")) return false;
+        std::vector<XrActionSuggestedBinding> suggested;
+        for (const auto& [action, path] : bindings) {
+            XrPath inputPath = XR_NULL_PATH;
+            if (!Check(stringToPath(instance, path, &inputPath), "xrStringToPath")) return false;
+            suggested.push_back({action, inputPath});
+        }
+        XrInteractionProfileSuggestedBinding info{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+        info.interactionProfile = profilePath;
+        info.countSuggestedBindings = static_cast<uint32_t>(suggested.size());
+        info.suggestedBindings = suggested.data();
+        const XrResult result = suggestBindings(instance, &info);
+        if (XR_FAILED(result)) {
+            log::Warn(std::string("OpenXR rejected the suggested controller bindings for ") + profile + ": " +
+                Result(result));
+            return false;
+        }
+        return true;
+    }
+
+    void SuggestControllerBindings() {
+        const auto& c = controllerActions;
+        int accepted = 0;
+        accepted += SuggestProfile("/interaction_profiles/oculus/touch_controller", {
+            {c.leftStick, "/user/hand/left/input/thumbstick"},
+            {c.rightStick, "/user/hand/right/input/thumbstick"},
+            {c.leftTrigger, "/user/hand/left/input/trigger/value"},
+            {c.rightTrigger, "/user/hand/right/input/trigger/value"},
+            {c.leftGrip, "/user/hand/left/input/squeeze/value"},
+            {c.rightGrip, "/user/hand/right/input/squeeze/value"},
+            {c.a, "/user/hand/right/input/a/click"},
+            {c.b, "/user/hand/right/input/b/click"},
+            {c.x, "/user/hand/left/input/x/click"},
+            {c.y, "/user/hand/left/input/y/click"},
+            {c.menu, "/user/hand/left/input/menu/click"},
+            {c.leftStickClick, "/user/hand/left/input/thumbstick/click"},
+            {c.rightStickClick, "/user/hand/right/input/thumbstick/click"},
+        });
+        // Index has no menu button: the left B pauses and the left A changes camera.
+        accepted += SuggestProfile("/interaction_profiles/valve/index_controller", {
+            {c.leftStick, "/user/hand/left/input/thumbstick"},
+            {c.rightStick, "/user/hand/right/input/thumbstick"},
+            {c.leftTrigger, "/user/hand/left/input/trigger/value"},
+            {c.rightTrigger, "/user/hand/right/input/trigger/value"},
+            {c.leftGrip, "/user/hand/left/input/squeeze/value"},
+            {c.rightGrip, "/user/hand/right/input/squeeze/value"},
+            {c.a, "/user/hand/right/input/a/click"},
+            {c.b, "/user/hand/right/input/b/click"},
+            {c.y, "/user/hand/left/input/a/click"},
+            {c.menu, "/user/hand/left/input/b/click"},
+            {c.leftStickClick, "/user/hand/left/input/thumbstick/click"},
+            {c.rightStickClick, "/user/hand/right/input/thumbstick/click"},
+        });
+        // Vive wands: trackpads act as sticks, the left grip changes camera.
+        accepted += SuggestProfile("/interaction_profiles/htc/vive_controller", {
+            {c.leftStick, "/user/hand/left/input/trackpad"},
+            {c.rightStick, "/user/hand/right/input/trackpad"},
+            {c.leftTrigger, "/user/hand/left/input/trigger/value"},
+            {c.rightTrigger, "/user/hand/right/input/trigger/value"},
+            {c.rightGrip, "/user/hand/right/input/squeeze/click"},
+            {c.a, "/user/hand/right/input/trackpad/click"},
+            {c.b, "/user/hand/right/input/menu/click"},
+            {c.y, "/user/hand/left/input/squeeze/click"},
+            {c.menu, "/user/hand/left/input/menu/click"},
+            {c.leftStickClick, "/user/hand/left/input/trackpad/click"},
+        });
+        log::Info("Suggested VR controller bindings for " + std::to_string(accepted) + " of 3 interaction profiles.");
+    }
+
+    void CreateControllerActions() {
+        controllerInputReady = false;
+        if (!LoadInputFunctions()) {
+            log::Warn("The OpenXR runtime lacks the action functions; VR controllers will not control the game.");
+            return;
+        }
+        XrActionSetCreateInfo setInfo{XR_TYPE_ACTION_SET_CREATE_INFO};
+        std::strcpy(setInfo.actionSetName, "trackmania");
+        std::strcpy(setInfo.localizedActionSetName, "TrackMania");
+        if (!Check(createActionSet(instance, &setInfo, &controllerActions.set), "xrCreateActionSet")) return;
+        const auto make = [&](XrAction& action, XrActionType type, const char* name, const char* label) {
+            XrActionCreateInfo info{XR_TYPE_ACTION_CREATE_INFO};
+            info.actionType = type;
+            std::strncpy(info.actionName, name, XR_MAX_ACTION_NAME_SIZE - 1);
+            std::strncpy(info.localizedActionName, label, XR_MAX_LOCALIZED_ACTION_NAME_SIZE - 1);
+            return Check(createAction(controllerActions.set, &info, &action), "xrCreateAction");
+        };
+        auto& c = controllerActions;
+        const bool created =
+            make(c.leftStick, XR_ACTION_TYPE_VECTOR2F_INPUT, "left_stick", "Steer / menu navigation") &&
+            make(c.rightStick, XR_ACTION_TYPE_VECTOR2F_INPUT, "right_stick", "Right stick") &&
+            make(c.leftTrigger, XR_ACTION_TYPE_FLOAT_INPUT, "left_trigger", "Brake") &&
+            make(c.rightTrigger, XR_ACTION_TYPE_FLOAT_INPUT, "right_trigger", "Accelerate") &&
+            make(c.leftGrip, XR_ACTION_TYPE_FLOAT_INPUT, "left_grip", "Left grip") &&
+            make(c.rightGrip, XR_ACTION_TYPE_FLOAT_INPUT, "right_grip", "Right grip") &&
+            make(c.a, XR_ACTION_TYPE_BOOLEAN_INPUT, "button_a", "Respawn / confirm") &&
+            make(c.b, XR_ACTION_TYPE_BOOLEAN_INPUT, "button_b", "Restart / back") &&
+            make(c.x, XR_ACTION_TYPE_BOOLEAN_INPUT, "button_x", "Button X") &&
+            make(c.y, XR_ACTION_TYPE_BOOLEAN_INPUT, "button_y", "Change camera") &&
+            make(c.menu, XR_ACTION_TYPE_BOOLEAN_INPUT, "menu", "Pause") &&
+            make(c.leftStickClick, XR_ACTION_TYPE_BOOLEAN_INPUT, "left_stick_click", "Left stick press") &&
+            make(c.rightStickClick, XR_ACTION_TYPE_BOOLEAN_INPUT, "right_stick_click", "Right stick press");
+        if (!created) return;
+        SuggestControllerBindings();
+        XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+        attach.countActionSets = 1;
+        attach.actionSets = &controllerActions.set;
+        if (!Check(attachActionSets(session, &attach), "xrAttachSessionActionSets")) return;
+        controllerInputReady = true;
+        log::Info("VR controller actions are attached to the OpenXR session.");
+    }
+
+    void LogInteractionProfiles() {
+        if (!controllerInputReady) return;
+        for (const char* hand : {"/user/hand/left", "/user/hand/right"}) {
+            XrPath handPath = XR_NULL_PATH;
+            if (XR_FAILED(stringToPath(instance, hand, &handPath))) continue;
+            XrInteractionProfileState state{XR_TYPE_INTERACTION_PROFILE_STATE};
+            if (XR_FAILED(getInteractionProfile(session, handPath, &state))) continue;
+            std::string name = "none";
+            if (state.interactionProfile != XR_NULL_PATH) {
+                char buffer[XR_MAX_PATH_LENGTH]{};
+                uint32_t length = 0;
+                if (XR_SUCCEEDED(pathToString(instance, state.interactionProfile, sizeof(buffer), &length, buffer))) {
+                    name = buffer;
+                }
+            }
+            log::Info(std::string("OpenXR interaction profile for ") + hand + ": " + name + ".");
+        }
+    }
+
+    void PublishNeutralControllers() {
+        controllerButtons = 0;
+        if (controllerNeutralPublished) return;
+        controllerNeutralPublished = true;
+        PublishControllerState({});
+    }
+
+    // Reads the controllers once per frame. OpenXR only delivers input while
+    // the session is focused (not while the runtime's own menu is open).
+    void UpdateControllers() {
+        if (!controllerInputReady || !sessionRunning || sessionState != XR_SESSION_STATE_FOCUSED) {
+            PublishNeutralControllers();
+            return;
+        }
+        XrActiveActionSet active{controllerActions.set, XR_NULL_PATH};
+        XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
+        sync.countActiveActionSets = 1;
+        sync.activeActionSets = &active;
+        const XrResult syncResult = syncActions(session, &sync);
+        if (syncResult != XR_SUCCESS) {
+            if (XR_FAILED(syncResult) && !controllerSyncFailureLogged) {
+                controllerSyncFailureLogged = true;
+                log::Warn("xrSyncActions failed: " + Result(syncResult));
+            }
+            PublishNeutralControllers();
+            return;
+        }
+        ControllerState state{};
+        bool anyActive = false;
+        const auto vector = [&](XrAction action, float (&out)[2]) {
+            XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+            info.action = action;
+            XrActionStateVector2f value{XR_TYPE_ACTION_STATE_VECTOR2F};
+            if (XR_FAILED(getActionVector2f(session, &info, &value)) || !value.isActive) return;
+            anyActive = true;
+            out[0] = std::clamp(value.currentState.x, -1.0f, 1.0f);
+            out[1] = std::clamp(value.currentState.y, -1.0f, 1.0f);
+        };
+        const auto analog = [&](XrAction action) {
+            XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+            info.action = action;
+            XrActionStateFloat value{XR_TYPE_ACTION_STATE_FLOAT};
+            if (XR_FAILED(getActionFloat(session, &info, &value)) || !value.isActive) return 0.0f;
+            anyActive = true;
+            return value.currentState;
+        };
+        const auto pressed = [&](ControllerButton button, XrAction action) {
+            XrActionStateGetInfo info{XR_TYPE_ACTION_STATE_GET_INFO};
+            info.action = action;
+            XrActionStateBoolean value{XR_TYPE_ACTION_STATE_BOOLEAN};
+            if (XR_FAILED(getActionBoolean(session, &info, &value)) || !value.isActive) return;
+            anyActive = true;
+            if (value.currentState) state.buttons |= 1u << button;
+        };
+        // Analog inputs become buttons with hysteresis so a resting finger
+        // near the threshold does not chatter.
+        const auto threshold = [&](ControllerButton button, float value) {
+            const bool wasDown = (controllerButtons >> button) & 1u;
+            if (value >= (wasDown ? 0.25f : 0.4f)) state.buttons |= 1u << button;
+        };
+        const auto& c = controllerActions;
+        vector(c.leftStick, state.leftStick);
+        vector(c.rightStick, state.rightStick);
+        threshold(kLeftTrigger, analog(c.leftTrigger));
+        threshold(kRightTrigger, analog(c.rightTrigger));
+        threshold(kLeftGrip, analog(c.leftGrip));
+        threshold(kRightGrip, analog(c.rightGrip));
+        pressed(kButtonA, c.a);
+        pressed(kButtonB, c.b);
+        pressed(kButtonX, c.x);
+        pressed(kButtonY, c.y);
+        pressed(kLeftMenu, c.menu);
+        pressed(kLeftThumbstickPress, c.leftStickClick);
+        pressed(kRightThumbstickPress, c.rightStickClick);
+        if (!anyActive) {
+            PublishNeutralControllers();
+            return;
+        }
+        controllerButtons = state.buttons;
+        state.connected = true;
+        controllerNeutralPublished = false;
+        PublishControllerState(state);
+        if (!controllerActiveLogged) {
+            controllerActiveLogged = true;
+            log::Info("VR controllers are active and control the game.");
+        }
     }
 
     bool CreateD3D11Device(const XrGraphicsRequirementsD3D11KHR& requirements) {
@@ -1380,6 +1658,7 @@ struct VrBridge::Impl {
             return DisableAfterStartupFailure("creating the OpenXR tracking space", Result(spaceResult),
                 "Restart the headset runtime and try again.");
         }
+        CreateControllerActions();
         if (!CreateSwapchains()) {
             return DisableAfterStartupFailure("creating OpenXR eye images", "OpenXR swapchain creation failed",
                 "See TMFOXR.log for the exact swapchain error and supported image formats.");
@@ -1395,6 +1674,7 @@ struct VrBridge::Impl {
             if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
                 const auto* changed = reinterpret_cast<const XrEventDataSessionStateChanged*>(&event);
                 log::Info("OpenXR session state changed to " + std::to_string(static_cast<int>(changed->state)) + ".");
+                sessionState = changed->state;
                 if (changed->state == XR_SESSION_STATE_READY) {
                     XrSessionBeginInfo begin{XR_TYPE_SESSION_BEGIN_INFO};
                     begin.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -1416,6 +1696,8 @@ struct VrBridge::Impl {
                     referenceSpaceChangeTime = changed->changeTime;
                     log::Info("OpenXR LOCAL space recentered by the runtime; head-pose origin will be recaptured.");
                 }
+            } else if (event.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
+                LogInteractionProfiles();
             }
             event = XrEventDataBuffer{XR_TYPE_EVENT_DATA_BUFFER};
         }
@@ -1426,6 +1708,7 @@ struct VrBridge::Impl {
         currentRuntimeWaitMilliseconds = 0.0;
         if (!Initialize()) return;
         PollEvents();
+        UpdateControllers();
         if (!sessionRunning) return;
         XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
         activeFrameState = XrFrameState{XR_TYPE_FRAME_STATE};

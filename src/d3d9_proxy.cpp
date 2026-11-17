@@ -1,4 +1,5 @@
 #include "log.h"
+#include "controller_input.h"
 #include "large_address_aware.h"
 #include "runtime_paths.h"
 #define Direct3DCreate9 TMFOXR_SDK_DECLARATION_Direct3DCreate9
@@ -901,6 +902,10 @@ std::atomic<bool> g_horizonLockLogged = false;
 std::atomic<bool> g_vrDisabledForIncompatibleGraphics = false;
 std::atomic<bool> g_incompatibleGraphicsWarningShown = false;
 void* g_lastDetectedChallenge = nullptr;
+// The CTrackMania game object, captured by the vehicle visibility hook.
+std::atomic<void*> g_trackManiaApp{nullptr};
+// CGameApp::GetChallenge returns [this+0x198]; see DetectActiveVehicleProfile.
+constexpr size_t kGameAppChallengeOffset = 0x198;
 ULONGLONG g_nextVehicleDetectionAttempt = 0;
 bool g_vehicleDetectionFailureLogged = false;
 
@@ -945,7 +950,7 @@ void DetectActiveVehicleProfile(void* game) {
     // documented by ModTMNF: CGameApp::GetChallenge returns [this+0x198], the
     // challenge's CGameCtnCollection* is +0x90, and its DisplayName StringInt is
     // +0x48. These bounded reads replace the previous unsafe object-graph probe.
-    constexpr size_t challengeOffset = 0x198;
+    constexpr size_t challengeOffset = kGameAppChallengeOffset;
     constexpr size_t collectionOffset = 0x90;
     constexpr size_t displayNameOffset = 0x48;
     void* challenge = nullptr;
@@ -1171,6 +1176,8 @@ void ReadCameraSettings(bool reloaded) {
         0, 2048);
     const bool verboseDiagnostics =
         GetPrivateProfileIntW(L"Diagnostics", L"Verbose", 0, path.c_str()) != 0;
+    tmoxr::SetVrControllersEnabled(
+        GetPrivateProfileIntW(L"Controllers", L"Enabled", 1, path.c_str()) != 0);
     wchar_t settingsKeyText[64]{};
     GetPrivateProfileStringW(L"Interface", L"SettingsToggleKey", L"F10",
                              settingsKeyText, static_cast<DWORD>(std::size(settingsKeyText)),
@@ -1676,21 +1683,43 @@ bool GameHasKeyboardFocus() {
     return processId == GetCurrentProcessId();
 }
 
+void SelectCamera(int camera) {
+    g_cameraSettings.selectedCamera.store(camera, std::memory_order_relaxed);
+    if (camera == 3) {
+        tmoxr::log::Info("Camera 3 selected; applying the VR cockpit seat offset.");
+    } else if (g_cameraSettings.cockpitEnabled.load(std::memory_order_relaxed)) {
+        tmoxr::log::Info("Camera " + std::to_string(camera) + " selected; VR cockpit seat offset disabled.");
+    }
+}
+
 void UpdateSelectedCameraFromKeyboard() {
+    // VR controller camera keys go straight into DirectInput, which
+    // GetAsyncKeyState below cannot see.
+    if (const int camera = tmoxr::ConsumeControllerCameraSelection()) SelectCamera(camera);
     if (!GameHasKeyboardFocus()) return;
     for (int camera = 1; camera <= 7; ++camera) {
         const bool down = (GetAsyncKeyState(VK_NUMPAD0 + camera) & 0x8000) != 0 ||
             (GetAsyncKeyState('0' + camera) & 0x8000) != 0;
         const bool wasDown = g_cameraSettings.cameraKeyDown[camera].exchange(down, std::memory_order_relaxed);
-        if (down && !wasDown) {
-            g_cameraSettings.selectedCamera.store(camera, std::memory_order_relaxed);
-            if (camera == 3) {
-                tmoxr::log::Info("Camera 3 selected; applying the VR cockpit seat offset.");
-            } else if (g_cameraSettings.cockpitEnabled.load(std::memory_order_relaxed)) {
-                tmoxr::log::Info("Camera " + std::to_string(camera) + " selected; VR cockpit seat offset disabled.");
-            }
-        }
+        if (down && !wasDown) SelectCamera(camera);
     }
+}
+
+// Race controls apply while a challenge is loaded (racing, its pause and
+// finish menus); the menu controls apply otherwise.
+void UpdateControllerRaceState() {
+    if (!GetExecutableLayout()) {
+        // No game object on unsupported executables: keep the race controls,
+        // which also work in the pause and finish menus.
+        tmoxr::SetControllerRaceActive(true);
+        return;
+    }
+    void* challenge = nullptr;
+    const auto* const game = static_cast<const uint8_t*>(g_trackManiaApp.load(std::memory_order_relaxed));
+    if (game && IsReadableRange(game + kGameAppChallengeOffset, sizeof(challenge))) {
+        std::memcpy(&challenge, game + kGameAppChallengeOffset, sizeof(challenge));
+    }
+    tmoxr::SetControllerRaceActive(challenge != nullptr);
 }
 
 bool CockpitCameraActive() {
@@ -1712,6 +1741,7 @@ void InitializeCameraFromVehicleVisibility(int visible) {
 
 void __fastcall VehicleSetVisibilityHook(void* game, void*, void* vehicleMobil,
                                          int visible, int context, int recursive) {
+    if (game) g_trackManiaApp.store(game, std::memory_order_relaxed);
     // Camera input is processed before D3D BeginScene, so sample the shortcut
     // here as well or the first camera-3 hide request can arrive one frame
     // before the renderer has recorded the new camera mode.
@@ -3900,6 +3930,7 @@ HRESULT STDMETHODCALLTYPE BeginSceneHook(IDirect3DDevice9* device) {
     else {
         RemoveCullingFrustumHook();
     }
+    UpdateControllerRaceState();
     tmoxr::VrBridge::Instance().OnBeginScene();
     UpdateSelectedCameraFromKeyboard();
     g_stereo.haveHeadPose = tmoxr::VrBridge::Instance().GetHeadPose(g_stereo.headPose);
@@ -5039,6 +5070,7 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
         DisableThreadLibraryCalls(module);
         InstallDirectDrawResolverHook();
         InstallInjectedD3D9ImportHooks(module);
+        if (IsTrackManiaGameProcess()) tmoxr::InstallVirtualJoypad();
     } else if (reason == DLL_PROCESS_DETACH && IsTrackManiaGameProcess()) {
         RemoveCullingFrustumHook();
         RemoveVehicleVisibilityHook();
