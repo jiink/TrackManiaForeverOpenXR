@@ -165,11 +165,10 @@ private:
         if (pressed_[key] == down) return;
         pressed_[key] = down;
         const KeyCode code = kKeyCodes[key];
-        const UINT sent = SendControllerKey(code.virtualKey, code.extended, down);
-        if (down && loggedKeys_ < 12) {
-            ++loggedKeys_;
-            log::Info(std::string("VR controllers: ") + (race_ ? "race" : "menu") + " key " + code.name +
-                " sent (SendInput=" + std::to_string(sent) + ").");
+        if (!SendControllerKey(code.virtualKey, code.extended, down) && !loggedSendFailure_) {
+            loggedSendFailure_ = true;
+            log::Warn(std::string("VR controllers: SendInput refused key ") + code.name + " (error " +
+                std::to_string(GetLastError()) + ").");
         }
     }
 
@@ -182,7 +181,7 @@ private:
     int cameraTap_ = 0;
     int nextCamera_ = 0;
     ULONGLONG cameraTapUntil_ = 0;
-    int loggedKeys_ = 0;
+    bool loggedSendFailure_ = false;
 };
 
 ControllerKeys g_controllerKeys;
@@ -702,10 +701,6 @@ private:
             events_.push_back({DataOffset(object), encoded, now, ++sequence_});
         }
         if (changed && notification_) SetEvent(notification_);
-        if (changed && !loggedFirstInput_) {
-            loggedFirstInput_ = true;
-            log::Info("VR Controllers game controller: first stick input reached TrackMania.");
-        }
     }
 
     volatile LONG references_ = 1;
@@ -721,7 +716,6 @@ private:
     DWORD sequence_ = 0;
     HANDLE notification_ = nullptr;
     std::array<float, 13> current_{};
-    bool loggedFirstInput_ = false;
 };
 
 bool EnumeratesGameControllers(DWORD deviceType) {
