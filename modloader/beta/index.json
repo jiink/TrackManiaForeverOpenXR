@@ -1,0 +1,67 @@
+{
+  "api": 1,
+  "game": "TmForever",
+  "products": {
+    "TMFOXR": {
+      "name": "TrackMania Forever OpenXR",
+      "author": "jiink",
+      "type": "modification",
+      "description": "Native stereoscopic OpenXR rendering and headset tracking for TrackMania United Forever. Settings are stored in Documents\\TrackMania\\TMFOXR.ini.",
+      "homepage": "https://github.com/jiink/TrackManiaForeverOpenXR",
+      "versions": {
+        "7.0.0": {
+          "executable": "TMFOXR.dll",
+          "priority": 1000000000,
+          "dependencies": [
+            {
+              "id": "CoreMod",
+              "version": "^1.0.11"
+            }
+          ],
+          "download_link": "https://jiink.github.io/TrackManiaForeverOpenXR/modloader/files/7.0.0/TMFOXR-modloader.zip",
+          "hash_sha256": "0d0a44bdde56ca565010444c8cb0af849ab1b6fd233a456389a9fdcf772457b8",
+          "changelog": "- Frustum culling fix. It's not perfect, but now you can look around and see everything around you.\n- Now you can see the thingies that connect your stadium car's wheels to the body.\n- Improved performance. It's nothing impressive, but noticeably better than before.\n- In-VR settings menu. By default, you can press F10 to open/close it. You will probably want to use your mouse to control it.\n- Support for TrackMania ModLoader\n- Fixed weird stuff going on with dual-GPU laptops.\n\nOnly tested on Windows 10 with Quest 3 using Virtual Desktop and VDXR OpenXR runtime.\n\nThis works with TrackMania Nations Forever and TrackMania United Forever.\n\nRelease notes: https://github.com/jiink/TrackManiaForeverOpenXR/releases/tag/v7"
+        },
+        "8.0.0": {
+          "executable": "TMFOXR.dll",
+          "priority": 1000000000,
+          "dependencies": [
+            {
+              "id": "CoreMod",
+              "version": "^1.0.11"
+            }
+          ],
+          "download_link": "https://jiink.github.io/TrackManiaForeverOpenXR/modloader/files/8.0.0/TMFOXR-modloader.zip",
+          "hash_sha256": "f918ae58f2057b9bc24b7b86b9c13ea89929676ee89596db62866fdca5971bd0",
+          "changelog": "- Added new VR settings: scaling slider, and whether or not to recenter if your head moves too far from the car\n- Fixed verbose logging not being followed very well\n\nOnly tested on Windows 10 with Quest 3 using Virtual Desktop and VDXR OpenXR runtime.\n\nThis works with TrackMania Nations Forever and TrackMania United Forever.\n\nRelease notes: https://github.com/jiink/TrackManiaForeverOpenXR/releases/tag/v8"
+        },
+        "9.0.0": {
+          "executable": "TMFOXR.dll",
+          "priority": 1000000000,
+          "dependencies": [
+            {
+              "id": "CoreMod",
+              "version": "^1.0.11"
+            }
+          ],
+          "download_link": "https://jiink.github.io/TrackManiaForeverOpenXR/modloader/files/9.0.0/TMFOXR-modloader.zip",
+          "hash_sha256": "b830d9e4b28b46ec132ea17ea5e52f506ced815d0be71ab747fb491d18701c86",
+          "changelog": "What's Changed:\n\n- Compatibility with the TM Vibrant Shaders mod thanks to @wial663 and @cheatoskar\n\nNote:\nIf you want to play these two mods together, I think you'll need to use the TrackMania ModLoader (TMLoader) installation method. I couldnt' get it to work with the manual installation method\n\nRelease notes: https://github.com/jiink/TrackManiaForeverOpenXR/releases/tag/v9"
+        },
+        "10.0.0-dev.13": {
+          "executable": "TMFOXR.dll",
+          "priority": 1000000000,
+          "dependencies": [
+            {
+              "id": "CoreMod",
+              "version": "^1.0.11"
+            }
+          ],
+          "download_link": "https://jiink.github.io/TrackManiaForeverOpenXR/modloader/files/10.0.0-dev.13/TMFOXR-modloader.zip",
+          "hash_sha256": "5a8d8cc89bcf9e6a23f66f50bc47e1179211b15aeb876829bedcc2e9f1601875",
+          "changelog": "Nightly build 2cfef6c\n\nRelease notes: https://github.com/jiink/TrackManiaForeverOpenXR/releases/tag/nightly"
+        }
+      }
+    }
+  }
+}
