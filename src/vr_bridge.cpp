@@ -1160,8 +1160,7 @@ struct VrBridge::Impl {
 
     void SuggestControllerBindings() {
         const auto& c = controllerActions;
-        int accepted = 0;
-        accepted += SuggestProfile("/interaction_profiles/oculus/touch_controller", {
+        SuggestProfile("/interaction_profiles/oculus/touch_controller", {
             {c.leftStick, "/user/hand/left/input/thumbstick"},
             {c.rightStick, "/user/hand/right/input/thumbstick"},
             {c.leftTrigger, "/user/hand/left/input/trigger/value"},
@@ -1177,7 +1176,7 @@ struct VrBridge::Impl {
             {c.rightStickClick, "/user/hand/right/input/thumbstick/click"},
         });
         // Index has no menu button: the left B pauses and the left A changes camera.
-        accepted += SuggestProfile("/interaction_profiles/valve/index_controller", {
+        SuggestProfile("/interaction_profiles/valve/index_controller", {
             {c.leftStick, "/user/hand/left/input/thumbstick"},
             {c.rightStick, "/user/hand/right/input/thumbstick"},
             {c.leftTrigger, "/user/hand/left/input/trigger/value"},
@@ -1192,7 +1191,7 @@ struct VrBridge::Impl {
             {c.rightStickClick, "/user/hand/right/input/thumbstick/click"},
         });
         // Vive wands: trackpads act as sticks, the left grip changes camera.
-        accepted += SuggestProfile("/interaction_profiles/htc/vive_controller", {
+        SuggestProfile("/interaction_profiles/htc/vive_controller", {
             {c.leftStick, "/user/hand/left/input/trackpad"},
             {c.rightStick, "/user/hand/right/input/trackpad"},
             {c.leftTrigger, "/user/hand/left/input/trigger/value"},
@@ -1204,7 +1203,6 @@ struct VrBridge::Impl {
             {c.menu, "/user/hand/left/input/menu/click"},
             {c.leftStickClick, "/user/hand/left/input/trackpad/click"},
         });
-        log::Info("Suggested VR controller bindings for " + std::to_string(accepted) + " of 3 interaction profiles.");
     }
 
     void CreateControllerActions() {
